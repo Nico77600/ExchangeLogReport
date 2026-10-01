@@ -31,7 +31,7 @@
 
 .NOTES
     Author  : Nicolas Fabert
-    Version : 1.3.1
+    Version : 1.4.0
     Part of : Exchange Log Report (repository tool, not in the package)
 #>
 [CmdletBinding()]

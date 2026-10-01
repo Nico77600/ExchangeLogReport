@@ -21,16 +21,31 @@
 
 .NOTES
     Author  : Nicolas Fabert
-    Version : 1.3.1
+    Version : 1.4.0
     History : see CHANGELOG.md
 #>
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
-$script:ToolVersion = '1.3.1'
+$script:ToolVersion = '1.4.0'
 $script:ToolRoot = $PSScriptRoot
 $script:LogWriter = $null
 $script:LogPath = $null
+# Per-server settings of the configuration. Root keys only serve to derive the path keys that are
+# neither in the Servers block nor in the file written by -Mode Discover (PathsFileName).
+$script:ServerRootKeys = @('ExchangePath', 'IisLogPath', 'LoggingPath', 'TransportLogPath')
+$script:ServerPathKeys = @('HttpProxyPath', 'MapiHttpPath', 'ImapLogPath', 'PopLogPath', 'IisFrontEndPath', 'IisBackEndPath',
+    'FrontEndReceivePath', 'FrontEndSendPath', 'HubReceivePath', 'HubSendPath', 'MailboxReceivePath', 'MailboxSendPath', 'MessageTrackingPath')
+$script:PathsFileName = 'ExchangeLogReport.paths.psd1'
+# Sources that Exchange itself writes all the time (health probes hit every web site within minutes):
+# a newest file older than Collection.StaleSourceHours means that logging stopped or that the logs were
+# moved. Not message tracking nor SMTP: a server without mail flow writes nothing there for months.
+$script:AlwaysActiveKinds = @('HttpProxy', 'Iis', 'EasBackEnd')
+# Sources whose folder exists only where the logging is enabled or has been used.
+$script:OptionalKinds = @('SmtpReceive', 'SmtpSend', 'Imap4', 'Pop3', 'MapiBackEnd')
+# IIS sites created by Exchange setup. Any other site hosting Exchange virtual directories (a second
+# OWA/ECP site for instance) is a custom site: found in applicationHost.config and read as well.
+$script:ExchangeSites = [ordered]@{ IisFrontEndPath = 'Default Web Site'; IisBackEndPath = 'Exchange Back End' }
 # ---------------------------------------------------------------------------------------------
 # Console theme (same rules as Purview DLP Report):
 #   - ANSI colours are disabled when the output is redirected (scheduled task) or NO_COLOR is
@@ -303,35 +318,32 @@ function Import-ExlConfiguration {
         return [string[]]$list
     }
 
-    # ---- servers -------------------------------------------------------------------------------
-    $servers = [Collections.Generic.List[object]]::new()
+    # ---- servers (paths are resolved once the sources are known) ----------------------------------
+    $blocks = [Collections.Generic.List[hashtable]]::new()
     $index = 0
+    $allowed = @('Name') + $script:ServerRootKeys + $script:ServerPathKeys
     foreach ($s in @($config.Servers)) {
         $index++
         if ($s -isnot [hashtable]) { $errors.Add("Servers[$index] must be a @{ } block."); continue }
-        $name = [string]$s['Name']
-        if (-not $name) { $errors.Add("Servers[$index].Name is required."); continue }
-        $exchange = [string]$s['ExchangePath']
-        if (-not $exchange) { $exchange = "\\$name\c$\Program Files\Microsoft\Exchange Server\V15" }
-        $iis = [string]$s['IisLogPath']
-        if (-not $iis) { $iis = "\\$name\c$\inetpub\logs\LogFiles" }
-        $servers.Add([pscustomobject][ordered]@{
-                Name                = $name.ToUpperInvariant()
-                ExchangePath        = $exchange.TrimEnd('\')
-                IisLogPath          = $iis.TrimEnd('\')
-                HttpProxyPath       = if ($s['HttpProxyPath']) { [string]$s['HttpProxyPath'] } else { Join-Path $exchange 'Logging\HttpProxy' }
-                LoggingPath         = if ($s['LoggingPath']) { [string]$s['LoggingPath'] } else { Join-Path $exchange 'Logging' }
-                TransportLogPath    = if ($s['TransportLogPath']) { [string]$s['TransportLogPath'] } else { Join-Path $exchange 'TransportRoles\Logs' }
-                MessageTrackingPath = if ($s['MessageTrackingPath']) { [string]$s['MessageTrackingPath'] } else { Join-Path $exchange 'TransportRoles\Logs\MessageTracking' }
-            })
+        if (-not [string]$s['Name']) { $errors.Add("Servers[$index].Name is required."); continue }
+        foreach ($key in $s.Keys) { if ($key -notin $allowed) { $errors.Add("Servers[$index].$key is not a known setting. Allowed: $($allowed -join ', ').") } }
+        $blocks.Add($s)
     }
-    $duplicates = @($servers | Group-Object Name | Where-Object Count -gt 1 | ForEach-Object Name)
+    $duplicates = @($blocks | ForEach-Object { ([string]$_['Name']).ToUpperInvariant() } | Group-Object | Where-Object Count -gt 1 | ForEach-Object Name)
     foreach ($d in $duplicates) { $errors.Add("Server '$d' is listed more than once.") }
+    $pathsFile = Join-Path (Split-Path ([IO.Path]::GetFullPath($Path)) -Parent) $script:PathsFileName
+    $discovery = $null
+    if (Test-Path -LiteralPath $pathsFile -PathType Leaf) {
+        try { $discovery = Import-PowerShellDataFile -LiteralPath $pathsFile }
+        catch { $errors.Add("The paths file written by -Mode Discover is not valid ($pathsFile): $($_.Exception.Message). Run -Mode Discover again.") }
+    }
 
     $src = $config.Sources; $n = $config.Noise; $c = $config.Collection; $st = $config.Storage; $r = $config.Report; $l = $config.Logging
     $settings = [ordered]@{
         ConfigPath = [IO.Path]::GetFullPath($Path)
-        Servers    = $servers.ToArray()
+        PathsFile  = $pathsFile
+        Discovery  = if ($discovery) { [pscustomobject]@{ When = [string]$discovery['Discovered']; By = [string]$discovery['By']; Via = [string]$discovery['Via']; Collector = [string]$discovery['Collector'] } } else { $null }
+        Servers    = @()
         Sources    = [ordered]@{
             HttpProxy       = Test-Bool (Get-Value $src 'Sources' 'HttpProxy' $true) 'Sources.HttpProxy'
             IisFrontEnd     = Test-Bool (Get-Value $src 'Sources' 'IisFrontEnd' $true) 'Sources.IisFrontEnd'
@@ -364,6 +376,7 @@ function Import-ExlConfiguration {
             LongRunningPatterns    = Test-Patterns (Get-Value $c 'Collection' 'LongRunningPatterns' @('^Mapi\|NotificationWait\|', '^Eas\|Ping\|', '^RpcHttp\|', '^Owa\|.*(notificationchannel|/ev\.owa)', '^PowerShell\|', '^Imap4\|IDLE\|')) 'Collection.LongRunningPatterns'
             SessionDetailRequests  = Test-Int (Get-Value $c 'Collection' 'SessionDetailRequests' 40) 'Collection.SessionDetailRequests' 0 100000
             MaxSessionSteps        = Test-Int (Get-Value $c 'Collection' 'MaxSessionSteps' 80) 'Collection.MaxSessionSteps' 10 100000
+            StaleSourceHours       = Test-Int (Get-Value $c 'Collection' 'StaleSourceHours' 24) 'Collection.StaleSourceHours' 0 8760
         }
         Storage    = [ordered]@{
             DatabasePath        = Resolve-ExlPath ([string](Get-Value $st 'Storage' 'DatabasePath' '.\data\ExchangeLogReport.sqlite')) $Root
@@ -397,8 +410,85 @@ function Import-ExlConfiguration {
     if ($settings.Report.CsvDelimiter -notin ';', ',', "`t", '|') { $errors.Add("Report.CsvDelimiter must be ';', ',', '|' or a tab.") }
     if (-not $settings.Report.FilePrefix -or $settings.Report.FilePrefix.IndexOfAny([IO.Path]::GetInvalidFileNameChars()) -ge 0) { $errors.Add('Report.FilePrefix must be a valid file name part.') }
     try { $settings['Zone'] = Get-ExlTimeZone $settings.Report.TimeZone } catch { $errors.Add($_.Exception.Message) }
+    $found = if ($discovery -and $discovery['Servers'] -is [hashtable]) { $discovery['Servers'] } else { @{} }
+    $settings.Servers = @(foreach ($b in $blocks) {
+            $name = ([string]$b['Name']).ToUpperInvariant()
+            $match = @($found.Keys | Where-Object { $_ -eq $name })
+            Resolve-ExlServerPaths -Name $name -Configured $b -Discovered $(if ($match.Count) { $found[$match[0]] }) -Sources $settings.Sources
+        })
     if ($errors.Count) { throw ("Invalid configuration ($Path):`n - " + ($errors -join "`n - ")) }
     return $settings
+}
+
+function Join-ExlPath {
+    <# Joins two path parts as text: unlike Join-Path, the drive does not need to exist on this computer (D:\ of another server). #>
+    param([Parameter(Mandatory)][string]$Path, [Parameter(Mandatory)][AllowEmptyString()][string]$ChildPath)
+    if (-not $ChildPath) { return $Path.TrimEnd('\') }
+    return $Path.TrimEnd('\') + '\' + $ChildPath.TrimStart('\')
+}
+
+function Resolve-ExlServerPaths {
+    <#
+    .SYNOPSIS
+        Folder of each log source of one server, with where it comes from (Origin):
+          Configuration      a path key of the Servers block (always wins)
+          ConfigurationRoot  derived from a root key of the Servers block (ExchangePath, IisLogPath,
+                             LoggingPath, TransportLogPath)
+          Discover           config\ExchangeLogReport.paths.psd1, written by -Mode Discover from the
+                             real Exchange and IIS settings
+          Default            derived from the roots found by Discover, or from the default
+                             installation folders on C:
+          IIS                set during a collection from applicationHost.config (Test-ExlIisSites)
+    #>
+    param([Parameter(Mandatory)][string]$Name, [hashtable]$Configured = @{}, [hashtable]$Discovered, [Parameter(Mandatory)]$Sources)
+    $origin = [ordered]@{}
+    $rootOrigin = @{}
+    $root = {
+        param([string]$Key, [string]$Default, [string]$Parent)
+        if ($Configured[$Key]) { $rootOrigin[$Key] = 'Configuration'; return ([string]$Configured[$Key]).TrimEnd('\') }
+        if ($Discovered -and $Discovered[$Key]) { $rootOrigin[$Key] = 'Discover'; return ([string]$Discovered[$Key]).TrimEnd('\') }
+        $rootOrigin[$Key] = if ($Parent) { $rootOrigin[$Parent] } else { 'Default' }
+        return $Default
+    }
+    $exchange = & $root 'ExchangePath' "\\$Name\c$\Program Files\Microsoft\Exchange Server\V15"
+    $iis = & $root 'IisLogPath' "\\$Name\c$\inetpub\logs\LogFiles"
+    $logging = & $root 'LoggingPath' (Join-ExlPath $exchange 'Logging') 'ExchangePath'
+    $transport = & $root 'TransportLogPath' (Join-ExlPath $exchange 'TransportRoles\Logs') 'ExchangePath'
+    $defaults = [ordered]@{
+        HttpProxyPath       = Join-ExlPath $logging 'HttpProxy'
+        MapiHttpPath        = Join-ExlPath $logging 'MapiHttp\Mailbox'
+        ImapLogPath         = Join-ExlPath $logging 'Imap4'
+        PopLogPath          = Join-ExlPath $logging 'Pop3'
+        IisFrontEndPath     = Join-ExlPath $iis $Sources.IisSite
+        IisBackEndPath      = Join-ExlPath $iis $Sources.IisBackEndSite
+        FrontEndReceivePath = Join-ExlPath $transport 'FrontEnd\ProtocolLog\SmtpReceive'
+        FrontEndSendPath    = Join-ExlPath $transport 'FrontEnd\ProtocolLog\SmtpSend'
+        HubReceivePath      = Join-ExlPath $transport 'Hub\ProtocolLog\SmtpReceive'
+        HubSendPath         = Join-ExlPath $transport 'Hub\ProtocolLog\SmtpSend'
+        MailboxReceivePath  = Join-ExlPath $transport 'Mailbox\ProtocolLog\SmtpReceive'
+        MailboxSendPath     = Join-ExlPath $transport 'Mailbox\ProtocolLog\SmtpSend'
+        MessageTrackingPath = Join-ExlPath $transport 'MessageTracking'
+    }
+    $server = [ordered]@{ Name = $Name; ExchangePath = $exchange; IisLogPath = $iis; Discovered = [bool]$Discovered }
+    foreach ($key in $script:ServerPathKeys) {
+        if ($Configured[$key]) { $server[$key] = ([string]$Configured[$key]).TrimEnd('\'); $origin[$key] = 'Configuration' }
+        elseif ($Discovered -and $Discovered[$key]) { $server[$key] = ([string]$Discovered[$key]).TrimEnd('\'); $origin[$key] = 'Discover' }
+        else {
+            $server[$key] = $defaults[$key]
+            $parent = if ($key -in 'HttpProxyPath', 'MapiHttpPath', 'ImapLogPath', 'PopLogPath') { 'LoggingPath' } elseif ($key -like 'Iis*') { 'IisLogPath' } else { 'TransportLogPath' }
+            $origin[$key] = if ($rootOrigin[$parent] -eq 'Configuration') { 'ConfigurationRoot' } else { 'Default' }
+        }
+    }
+    $server['ImapProtocolLog'] = if ($Discovered -and $Discovered.ContainsKey('ImapProtocolLog')) { [bool]$Discovered['ImapProtocolLog'] } else { $null }
+    $server['PopProtocolLog'] = if ($Discovered -and $Discovered.ContainsKey('PopProtocolLog')) { [bool]$Discovered['PopProtocolLog'] } else { $null }
+    # Other IIS sites hosting Exchange virtual directories (found by -Mode Discover, checked by every collection).
+    $server['IisCustomSites'] = @(if ($Discovered -and $Discovered['IisCustomSites']) {
+            foreach ($c in @($Discovered['IisCustomSites'])) {
+                if ($c -and $c.Name -and $c.Folder) { [pscustomobject]@{ Name = [string]$c.Name; Id = [string]$c.Id; Role = [string]$c.Role; Vdirs = [string]$c.Vdirs; Folder = ([string]$c.Folder).TrimEnd('\') } }
+            }
+        })
+    $server['Origin'] = $origin
+    return [pscustomobject]$server
 }
 
 #endregion
@@ -529,34 +619,49 @@ function Resolve-ExlPeriod {
 function Get-ExlSources {
     <#
     .SYNOPSIS
-        Lists the log folders to read for one server, as (Kind, Role, Label, Folder, Filter, Recurse) entries.
+        Lists the log folders to read for one server, as (Kind, Role, Label, Folder, Filter, Recurse, PathKey, Optional) entries.
           HttpProxy    <HttpProxyPath>\<protocol>\*.log
-          Iis          <IisLogPath>\<IisSite>\*.log (front end: Default Web Site)
-          SmtpReceive  <TransportLogPath>\<role>\ProtocolLog\SmtpReceive (with Mailbox\...\Delivery|Submission)
-          SmtpSend     <TransportLogPath>\<role>\ProtocolLog\SmtpSend
+          Iis          <IisFrontEndPath>\*.log (front end: Default Web Site, W3SVC1 by default)
+                       + the folder of each custom IIS site hosting front-end Exchange virtual directories
+          SmtpReceive  <FrontEnd|Hub|Mailbox>ReceivePath (Mailbox: with the Delivery and Submission sub-folders)
+          SmtpSend     <FrontEnd|Hub|Mailbox>SendPath
           Tracking     <MessageTrackingPath>\MSGTRK*.log (hub, delivery, submission, moderation)
-          MapiBackEnd  <LoggingPath>\MapiHttp\Mailbox\*.log (Outlook MAPI over HTTP, back end)
-          EasBackEnd   <IisLogPath>\<IisBackEndSite>\*.log (Exchange Back End web site: ActiveSync results)
-          Imap4, Pop3  <LoggingPath>\Imap4, <LoggingPath>\Pop3 (optional: protocol logging must be enabled)
+          MapiBackEnd  <MapiHttpPath>\*.log (Outlook MAPI over HTTP, back end)
+          EasBackEnd   <IisBackEndPath>\*.log (Exchange Back End web site: ActiveSync results)
+                       + the folder of each custom back-end IIS site hosting ActiveSync
+          Imap4, Pop3  <ImapLogPath>, <PopLogPath> (optional: protocol logging must be enabled)
+        Optional: the folder may not exist yet (logging off or never used, custom site without traffic).
     #>
     param([Parameter(Mandatory)]$Server, [Parameter(Mandatory)]$Settings)
     $src = $Settings.Sources
     $list = [Collections.Generic.List[object]]::new()
-    $add = { param($Kind, $Role, $Label, $Folder, $Filter, $Recurse) $list.Add([pscustomobject]@{ Kind = $Kind; Role = $Role; Label = $Label; Folder = $Folder; Filter = $Filter; Recurse = $Recurse }) }
-    if ($src.HttpProxy) { & $add 'HttpProxy' $null 'HttpProxy' $Server.HttpProxyPath '*.log' $true }
-    if ($src.IisFrontEnd) { & $add 'Iis' $null 'IIS front end' (Join-Path $Server.IisLogPath $src.IisSite) '*.log' $false }
-    if ($src.MapiBackEnd) { & $add 'MapiBackEnd' $null 'MAPI back end' (Join-Path $Server.LoggingPath 'MapiHttp\Mailbox') '*.log' $false }
-    if ($src.EasBackEnd) { & $add 'EasBackEnd' $null 'EAS back end (IIS)' (Join-Path $Server.IisLogPath $src.IisBackEndSite) '*.log' $false }
+    $add = { param($Kind, $Role, $Label, $Key, $Filter, $Recurse) $list.Add([pscustomobject]@{ Kind = $Kind; Role = $Role; Label = $Label; Folder = $Server.$Key; Filter = $Filter; Recurse = $Recurse; PathKey = $Key; Optional = $Kind -in $script:OptionalKinds }) }
+    $custom = {
+        param($Kind, $Role, [scriptblock]$Where)
+        foreach ($c in @($Server.IisCustomSites | Where-Object { $_ -and $_.Role -eq $Role } | Where-Object $Where)) {
+            $label = 'IIS ' + $(if ($c.Name.Length -gt 15) { $c.Name.Substring(0, 14) + [char]0x2026 } else { $c.Name })
+            $list.Add([pscustomobject]@{ Kind = $Kind; Role = $null; Label = $label; Folder = $c.Folder; Filter = '*.log'; Recurse = $false; PathKey = 'IisCustomSites'; Optional = $true; Site = $c.Name })
+        }
+    }
+    if ($src.HttpProxy) { & $add 'HttpProxy' $null 'HttpProxy' 'HttpProxyPath' '*.log' $true }
+    if ($src.IisFrontEnd) {
+        & $add 'Iis' $null 'IIS front end' 'IisFrontEndPath' '*.log' $false
+        & $custom 'Iis' 'FrontEnd' { $_.Folder -ne $Server.IisFrontEndPath }
+    }
+    if ($src.MapiBackEnd) { & $add 'MapiBackEnd' $null 'MAPI back end' 'MapiHttpPath' '*.log' $false }
+    if ($src.EasBackEnd) {
+        & $add 'EasBackEnd' $null 'EAS back end (IIS)' 'IisBackEndPath' '*.log' $false
+        & $custom 'EasBackEnd' 'BackEnd' { $_.Folder -ne $Server.IisBackEndPath -and $_.Vdirs -match '(^|, )Microsoft-Server-ActiveSync(,|$)' }
+    }
     if ($src.PopImap) {
-        & $add 'Imap4' $null 'IMAP4' (Join-Path $Server.LoggingPath 'Imap4') '*.log' $false
-        & $add 'Pop3' $null 'POP3' (Join-Path $Server.LoggingPath 'Pop3') '*.log' $false
+        & $add 'Imap4' $null 'IMAP4' 'ImapLogPath' '*.log' $false
+        & $add 'Pop3' $null 'POP3' 'PopLogPath' '*.log' $false
     }
     foreach ($role in $src.TransportRoles) {
-        $protocolLog = Join-Path $Server.TransportLogPath "$role\ProtocolLog"
-        if ($src.SmtpReceive) { & $add 'SmtpReceive' $role "SMTP in ($role)" (Join-Path $protocolLog 'SmtpReceive') '*.log' $true }
-        if ($src.SmtpSend) { & $add 'SmtpSend' $role "SMTP out ($role)" (Join-Path $protocolLog 'SmtpSend') '*.log' $true }
+        if ($src.SmtpReceive) { & $add 'SmtpReceive' $role "SMTP in ($role)" "$($role)ReceivePath" '*.log' $true }
+        if ($src.SmtpSend) { & $add 'SmtpSend' $role "SMTP out ($role)" "$($role)SendPath" '*.log' $true }
     }
-    if ($src.MessageTracking) { & $add 'Tracking' $null 'Tracking' $Server.MessageTrackingPath 'MSGTRK*.log' $false }
+    if ($src.MessageTracking) { & $add 'Tracking' $null 'Tracking' 'MessageTrackingPath' 'MSGTRK*.log' $false }
     return $list.ToArray()
 }
 
@@ -571,27 +676,56 @@ function Get-ExlSourceFiles {
              else { Get-ChildItem -LiteralPath $Source.Folder -Filter $Source.Filter -File -ErrorAction SilentlyContinue }
     $todo = [Collections.Generic.List[object]]::new()
     $total = 0
+    $newest = [DateTime]::MinValue
     foreach ($f in @($files)) {
         $total++
+        if ($f.LastWriteTimeUtc -gt $newest) { $newest = $f.LastWriteTimeUtc }
         $key = "$($Source.Kind)|$($f.FullName)"
         $isKnown = $Known.ContainsKey($key)
         if (-not $isKnown -and $f.LastWriteTimeUtc -lt $Since) { continue }
         if ($isKnown -and [long]$Known[$key] -eq $f.Length) { continue }
         $todo.Add($f)
     }
-    [pscustomobject]@{ Total = $total; Files = @($todo | Sort-Object LastWriteTimeUtc, Name) }
+    [pscustomobject]@{ Total = $total; Newest = $newest; Files = @($todo | Sort-Object LastWriteTimeUtc, Name) }
+}
+
+function Test-ExlStaleSource {
+    <#
+    .SYNOPSIS
+        Age of the newest file of a source that Exchange writes all the time (HttpProxy, IIS front and
+        back end), when it is older than Collection.StaleSourceHours: logging stopped, or the logs were
+        moved and the tool still reads the old folder. Returns $null when the source is not stale.
+    #>
+    param([Parameter(Mandatory)]$Source, [Parameter(Mandatory)]$Plan, [Parameter(Mandatory)]$Settings)
+    $hours = $Settings.Collection.StaleSourceHours
+    if ($hours -le 0 -or $Source.Kind -notin $script:AlwaysActiveKinds -or ($Source.PSObject.Properties['Optional'] -and $Source.Optional)) { return $null }
+    if (-not $Plan.Total) { return 'no log file' }
+    $age = [DateTime]::UtcNow - $Plan.Newest
+    if ($age.TotalHours -lt $hours) { return $null }
+    return 'newest file ' + (Format-ExlDuration $age.TotalSeconds) + ' old'
 }
 
 function Test-ExlServerAccess {
-    <# Checks that the log roots of a server can be read; returns the list of problems. #>
+    <# Checks that the log folders of a server can be read; returns the list of problems. #>
     param([Parameter(Mandatory)]$Server, [Parameter(Mandatory)]$Settings)
     $problems = [Collections.Generic.List[string]]::new()
     foreach ($s in Get-ExlSources $Server $Settings) {
-        if (-not (Test-Path -LiteralPath $s.Folder -PathType Container) -and $s.Kind -notin 'SmtpReceive', 'SmtpSend', 'Imap4', 'Pop3', 'MapiBackEnd') {
+        if (-not (Test-Path -LiteralPath $s.Folder -PathType Container) -and -not $s.Optional) {
             $problems.Add("$($s.Label): folder not found or not readable ($($s.Folder))")
         }
     }
     return $problems.ToArray()
+}
+
+function Get-ExlPathOrigin {
+    <# One phrase telling where the log paths of a server come from (shown by the access check). #>
+    param([Parameter(Mandatory)]$Server)
+    $origins = @($Server.Origin.Values)
+    $configured = 'Configuration' -in $origins -or 'ConfigurationRoot' -in $origins
+    if ('Discover' -in $origins) { return 'paths from -Mode Discover' + $(if ($configured) { ' and the configuration' } else { '' }) }
+    if ($configured) { return 'paths set in the configuration' }
+    if ('IIS' -in $origins) { return 'IIS folders from applicationHost.config, other default paths: run -Mode Discover to check them' }
+    return 'default paths: run -Mode Discover to check them'
 }
 
 #endregion
@@ -636,7 +770,7 @@ function Invoke-ExlCollection {
     if (-not $Servers) { $Servers = $Settings.Servers }
     $collector = New-ExlCollector -Store $Store -Settings $Settings -RunId $RunId
     $since = [DateTime]::UtcNow.AddDays(-$Settings.Collection.BackfillDays)
-    $totals = [ordered]@{ Files = 0L; Bytes = 0L; Lines = 0L; Kept = 0L; Noise = 0L; Stored = 0L; Errors = 0L; Recovered = 0L; Seconds = 0.0; Unreachable = [Collections.Generic.List[string]]::new(); NoiseReasons = @{} }
+    $totals = [ordered]@{ Files = 0L; Bytes = 0L; Lines = 0L; Kept = 0L; Noise = 0L; Stored = 0L; Errors = 0L; Recovered = 0L; Seconds = 0.0; Unreachable = [Collections.Generic.List[string]]::new(); Stale = [Collections.Generic.List[string]]::new(); NoiseReasons = @{} }
     $clock = [Diagnostics.Stopwatch]::StartNew()
     Write-ExlTableRow -Header
     foreach ($server in $Servers) {
@@ -644,15 +778,25 @@ function Invoke-ExlCollection {
         foreach ($kv in $Store.KnownOffsets($server.Name).GetEnumerator()) { $known[$kv.Key] = $kv.Value }
         foreach ($source in Get-ExlSources $server $Settings) {
             if (-not (Test-Path -LiteralPath $source.Folder -PathType Container)) {
-                # SMTP, POP and IMAP protocol log folders exist only where protocol logging is enabled.
-                if ($source.Kind -in 'SmtpReceive', 'SmtpSend', 'Imap4', 'Pop3', 'MapiBackEnd') { Write-ExlLog 'INFO' "$($server.Name) $($source.Label): no folder ($($source.Folder))"; continue }
+                # SMTP, MAPI, POP and IMAP protocol log folders exist only where protocol logging is enabled (or has been used);
+                # IIS creates the folder of a site at its first request.
+                if ($source.Optional) {
+                    Write-ExlLog 'INFO' "$($server.Name) $($source.Label): no folder ($($source.Folder))"
+                    $disabled = ($source.Kind -eq 'Imap4' -and $server.ImapProtocolLog -eq $false) -or ($source.Kind -eq 'Pop3' -and $server.PopProtocolLog -eq $false)
+                    if (-not $disabled) { Write-ExlTableRow -Status Skip -Server $server.Name -Source $source.Label -Files '-' -Read '-' -Lines 0 -Kept 0 -Noise '-' -Duration 'no folder' -Rate '' }
+                    continue
+                }
                 Write-ExlTableRow -Status Fail -Server $server.Name -Source $source.Label -Files '-' -Read '-' -Lines 0 -Kept 0 -Noise '-' -Duration 'not found' -Rate ''
                 $totals.Unreachable.Add("$($server.Name) $($source.Label): $($source.Folder)")
                 continue
             }
             $plan = Get-ExlSourceFiles -Source $source -Known $known -Since $since
+            $stale = Test-ExlStaleSource -Source $source -Plan $plan -Settings $Settings
+            if ($stale) { $totals.Stale.Add("$($server.Name) $($source.Label): $stale ($($source.Folder))") }
             if (-not $plan.Files.Count) {
-                if ($plan.Total) { Write-ExlTableRow -Status Skip -Server $server.Name -Source $source.Label -Files "0/$($plan.Total)" -Read '-' -Lines 0 -Kept 0 -Noise '-' -Duration 'up to date' -Rate '' }
+                if ($stale) { Write-ExlTableRow -Status Warn -Server $server.Name -Source $source.Label -Files "0/$($plan.Total)" -Read '-' -Lines 0 -Kept 0 -Noise '-' -Duration 'stale' -Rate '' }
+                elseif ($plan.Total) { Write-ExlTableRow -Status Skip -Server $server.Name -Source $source.Label -Files "0/$($plan.Total)" -Read '-' -Lines 0 -Kept 0 -Noise '-' -Duration 'up to date' -Rate '' }
+                else { Write-ExlTableRow -Status Skip -Server $server.Name -Source $source.Label -Files '0' -Read '-' -Lines 0 -Kept 0 -Noise '-' -Duration 'no file' -Rate '' }
                 continue
             }
             $row = [ordered]@{ Files = 0; Bytes = 0L; Lines = 0L; Kept = 0L; Noise = 0L; Errors = 0; Seconds = 0.0 }
@@ -673,9 +817,14 @@ function Invoke-ExlCollection {
                 if ($r.Reset) { Write-ExlLog 'WARN' "$($file.FullName) was shorter than the position already read: read again from the beginning." }
             }
             Write-Progress -Id 1 -Activity "$($server.Name) - $($source.Label)" -Completed
+            if (-not $row.Files -and -not $row.Errors) {
+                # Only empty files, or files not grown since the listing (IIS writes its buffer every minute).
+                Write-ExlTableRow -Status $(if ($stale) { 'Warn' } else { 'Skip' }) -Server $server.Name -Source $source.Label -Files "0/$($plan.Total)" -Read '-' -Lines 0 -Kept 0 -Noise '-' -Duration $(if ($stale) { 'stale' } else { 'up to date' }) -Rate ''
+                continue
+            }
             $noisePercent = if ($row.Lines) { '{0:0}%' -f (100.0 * $row.Noise / $row.Lines) } else { '-' }
             $rate = if ($row.Seconds -gt 0) { '{0}/s' -f (Format-ExlBytes ($row.Bytes / $row.Seconds)) } else { '' }
-            $status = if ($row.Errors) { 'Warn' } else { 'Ok' }
+            $status = if ($row.Errors -or $stale) { 'Warn' } else { 'Ok' }
             Write-ExlTableRow -Status $status -Server $server.Name -Source $source.Label -Files ("{0}/{1}" -f $row.Files, $plan.Total) -Read (Format-ExlBytes $row.Bytes) `
                 -Lines $row.Lines -Kept $row.Kept -Noise $noisePercent -Duration (Format-ExlDuration $row.Seconds) -Rate $rate
             if ($row.Errors) { Write-ExlItem Warn ("{0} file(s) could not be read on {1} ({2}); see the log file." -f $row.Errors, $server.Name, $source.Label) }
@@ -742,13 +891,19 @@ function Show-ExlStatus {
     if (-not $rows.Count) { Write-ExlItem Warn 'Nothing has been collected yet. Run: .\Invoke-ExchangeLogReport.ps1 -Mode Collect'; return }
     Write-Host ''
     Write-Host ('      {0}{1}{2,-10} {3,-12} {4,7} {5,10} {6,13} {7,11} {8,6}  {9,-33} {10}{11}' -f $K.Dim, ('  ' + $script:IconPad), 'Server', 'Source', 'Files', 'Read', 'Lines', 'Kept', 'Noise', 'Data from - to', 'Last read', $K.Reset)
+    $staleMs = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds() - [long]$Settings.Collection.StaleSourceHours * 3600000
+    $stale = [Collections.Generic.List[string]]::new()
     foreach ($r in $rows) {
         $noise = if ($r[4]) { '{0:0}%' -f (100.0 * $r[6] / $r[4]) } else { '-' }
         $range = if ($r[7]) { '{0} {1} {2}' -f (Format-ExlLocalTime $r[7] $zone 'yyyy-MM-dd HH:mm'), [char]0x2192, (Format-ExlLocalTime $r[8] $zone 'MM-dd HH:mm') } else { '-' }
         $last = if ($r[9]) { Format-ExlLocalTime $r[9] $zone 'yyyy-MM-dd HH:mm' } else { '-' }
-        Write-Host ('      {0}{1}{2}{3,-10} {4,-12} {5,7} {6,10} {7,13} {8,11} {9,6}  {10,-33} {11}' -f $K.Green, (Get-ExlIcon 'Ok'), $K.Reset, $r[0], $r[1], (Format-ExlNumber $r[2]), (Format-ExlBytes ([double]$r[3])), (Format-ExlNumber $r[4]), (Format-ExlNumber $r[5]), $noise, $range, $last)
+        $old = $Settings.Collection.StaleSourceHours -gt 0 -and [string]$r[1] -in $script:AlwaysActiveKinds -and $null -ne $r[8] -and [long]$r[8] -lt $staleMs
+        if ($old) { $stale.Add("$($r[0]) $($r[1])") }
+        $state = if ($old) { 'Warn' } else { 'Ok' }
+        Write-Host ('      {0}{1}{2}{3,-10} {4,-12} {5,7} {6,10} {7,13} {8,11} {9,6}  {10,-33} {11}' -f $(if ($old) { $K.Yellow } else { $K.Green }), (Get-ExlIcon $state), $K.Reset, $r[0], $r[1], (Format-ExlNumber $r[2]), (Format-ExlBytes ([double]$r[3])), (Format-ExlNumber $r[4]), (Format-ExlNumber $r[5]), $noise, $range, $last)
         Write-ExlLog 'INFO' ("Status {0} {1}: {2} files, {3} lines, {4} kept, noise {5}, {6}" -f $r[0], $r[1], $r[2], $r[4], $r[5], $noise, $range)
     }
+    if ($stale.Count) { Write-ExlItem Warn ("No log line newer than {0} h for {1}: the scheduled collection stopped, the logging stopped or the logs were moved (run -Mode Discover)." -f $Settings.Collection.StaleSourceHours, ($stale -join ', ')) }
     $configured = @($Settings.Servers | ForEach-Object Name)
     $collected = @($rows | ForEach-Object { [string]$_[0] } | Select-Object -Unique)
     foreach ($n in $configured) { if ($n -notin $collected) { Write-ExlItem Warn "$n is in the configuration but nothing has been collected from it yet." } }
@@ -798,5 +953,347 @@ function Enter-ExlLock {
 }
 
 function Exit-ExlLock { param($Lock) if ($Lock) { $Lock.Dispose() } }
+
+#endregion
+
+
+#region 9. Discovery of the log paths ------------------------------------------------------------
+
+function ConvertTo-ExlRemotePath {
+    <#
+    .SYNOPSIS
+        Folder of a server as seen from the collector: unchanged on the collector itself (a local path is
+        faster), administrative share of its drive for the other servers (D:\Logs -> \\EXCH01\D$\Logs).
+    #>
+    param([Parameter(Mandatory)][string]$Server, [AllowEmptyString()][AllowNull()][string]$Path, [switch]$Local)
+    if (-not $Path) { return $null }
+    $p = $Path.Trim().TrimEnd('\')
+    if ($Local -or $p.StartsWith('\\')) { return $p }
+    if ($p -match '^([A-Za-z]):(\\.*)?$') { return '\\{0}\{1}${2}' -f $Server, $Matches[1].ToUpperInvariant(), $Matches[2] }
+    return $p
+}
+
+function Get-ExlIisLogFolders {
+    <#
+    .SYNOPSIS
+        Log folder (directory\W3SVC<id>), format, target and Exchange role of each IIS site of a server,
+        read from its applicationHost.config (through \\<server>\ADMIN$: local administrator rights are
+        needed). Returns $null when the file cannot be read.
+        A site is an Exchange site when one of its virtual directories points to the Exchange front end
+        (...\FrontEnd\HttpProxy\...) or back end (...\ClientAccess\...), or runs in an MSExchange* pool:
+        Exchange itself is not queried, so a custom OWA/ECP site is found the same way as the default ones.
+    #>
+    param([Parameter(Mandatory)][string]$Server, [switch]$Local, [string]$File)
+    $drive = 'C:'
+    if (-not $File) {
+        if ($Local) { $File = Join-ExlPath $env:SystemRoot 'System32\inetsrv\config\applicationHost.config'; $drive = $env:SystemDrive }
+        else {
+            $File = "\\$Server\ADMIN`$\System32\inetsrv\config\applicationHost.config"
+            if (-not (Test-Path -LiteralPath $File -PathType Leaf)) { return $null }
+            foreach ($letter in 'C', 'D', 'E', 'F') { if (Test-Path -LiteralPath "\\$Server\$letter`$\Windows\System32\inetsrv" -PathType Container) { $drive = "$($letter):"; break } }
+        }
+    }
+    if (-not (Test-Path -LiteralPath $File -PathType Leaf)) { return $null }
+    $xml = [xml]::new()
+    $stream = [IO.FileStream]::new($File, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::ReadWrite)
+    try { $xml.Load($stream) } finally { $stream.Dispose() }
+    $attribute = { param($Node, [string]$Name, [string]$Default) if ($null -ne $Node -and $Node.GetAttribute($Name)) { $Node.GetAttribute($Name) } else { $Default } }
+    $expand = { param([string]$Directory) ($Directory -replace '(?i)%SystemDrive%', $drive) -replace '(?i)%SystemRoot%', "$drive\Windows" }
+    $defaults = $xml.SelectSingleNode('/configuration/system.applicationHost/sites/siteDefaults/logFile')
+    $directory = & $attribute $defaults 'directory' '%SystemDrive%\inetpub\logs\LogFiles'
+    $format = & $attribute $defaults 'logFormat' 'W3C'
+    $target = & $attribute $defaults 'logTargetW3C' 'File'
+    $enabled = (& $attribute $defaults 'enabled' 'true') -ne 'false'
+    $sites = foreach ($site in @($xml.SelectNodes('/configuration/system.applicationHost/sites/site'))) {
+        $node = $site.SelectSingleNode('logFile')
+        $id = $site.GetAttribute('id')
+        $roles = [Collections.Generic.List[string]]::new()
+        $vdirs = [Collections.Generic.List[string]]::new()
+        foreach ($app in @($site.SelectNodes('application'))) {
+            $path = $app.GetAttribute('path')
+            $physical = & $attribute $app.SelectSingleNode("virtualDirectory[@path='/']") 'physicalPath' ''
+            $role = if ($physical -match '(?i)\\FrontEnd\\HttpProxy(\\|$)') { 'FrontEnd' } elseif ($physical -match '(?i)\\ClientAccess(\\|$)') { 'BackEnd' } elseif ($app.GetAttribute('applicationPool') -like 'MSExchange*') { 'Exchange' }
+            if (-not $role) { continue }
+            $roles.Add($role)
+            $top = $path.Trim('/').Split('/')[0]
+            if ($top -and -not $vdirs.Contains($top)) { $vdirs.Add($top) }
+        }
+        $siteName = $site.GetAttribute('name')
+        $exchangeRole = if ($roles -contains 'FrontEnd') { 'FrontEnd' } elseif ($roles -contains 'BackEnd') { 'BackEnd' } elseif ($vdirs.Count) { if ($siteName -eq $script:ExchangeSites.IisBackEndPath) { 'BackEnd' } else { 'FrontEnd' } }
+        [pscustomobject]@{
+            Name    = $siteName
+            Id      = $id
+            Folder  = Join-ExlPath (& $expand (& $attribute $node 'directory' $directory)) "W3SVC$id"
+            Format  = & $attribute $node 'logFormat' $format
+            Target  = & $attribute $node 'logTargetW3C' $target
+            Enabled = (& $attribute $node 'enabled' $(if ($enabled) { 'true' } else { 'false' })) -ne 'false'
+            Role    = $exchangeRole
+            Vdirs   = $vdirs -join ', '
+        }
+    }
+    [pscustomobject]@{ Central = & $attribute $xml.SelectSingleNode('/configuration/system.applicationHost/log') 'centralLogFileMode' 'Site'; Sites = @($sites) }
+}
+
+function Get-ExlIisSiteMap {
+    <#
+    .SYNOPSIS
+        Exchange IIS sites of a server, from its applicationHost.config: the folders of Default Web Site
+        and Exchange Back End (IisFrontEndPath, IisBackEndPath), the other sites hosting Exchange virtual
+        directories (Custom) and the settings that leave holes in the data (Problems).
+        Folders are as seen from this computer. $null when applicationHost.config cannot be read.
+    #>
+    param([Parameter(Mandatory)][string]$Server, [switch]$Local, [string]$File)
+    $iis = Get-ExlIisLogFolders -Server $Server -Local:$Local -File $File
+    if (-not $iis) { return $null }
+    $map = [ordered]@{ Central = $iis.Central; IisFrontEndPath = $null; IisBackEndPath = $null; Custom = [Collections.Generic.List[object]]::new(); Problems = [Collections.Generic.List[string]]::new() }
+    foreach ($site in @($iis.Sites | Where-Object Role)) {
+        $folder = ConvertTo-ExlRemotePath -Server $Server -Path $site.Folder -Local:$Local
+        $key = @($script:ExchangeSites.Keys | Where-Object { $script:ExchangeSites[$_] -eq $site.Name }) | Select-Object -First 1
+        if ($key) { $map[$key] = $folder }
+        else { $map.Custom.Add([pscustomobject]@{ Name = $site.Name; Id = $site.Id; Role = $site.Role; Vdirs = $site.Vdirs; Folder = $folder }) }
+        $what = "IIS site '$($site.Name)'" + $(if ($key) { '' } else { " ($($site.Vdirs))" })
+        if (-not $site.Enabled) { $map.Problems.Add("$what has logging disabled: its traffic is not in the reports.") }
+        elseif ($site.Target -notmatch 'File') { $map.Problems.Add("$what logs to $($site.Target) only (no log file): its traffic is not in the reports.") }
+        elseif ($site.Format -ne 'W3C') { $map.Problems.Add("$what logs in $($site.Format) format; the tool reads W3C logs only.") }
+    }
+    if ($map.Central -ne 'Site') { $map.Problems.Add("IIS central logging ($($map.Central)) is not supported: the tool reads one log folder per site.") }
+    return [pscustomobject]$map
+}
+
+function Test-ExlIisSites {
+    <#
+    .SYNOPSIS
+        Collection check of the IIS log folders of a server against its applicationHost.config (read
+        at every collection: the IIS settings are the reference). A folder changed since -Mode Discover,
+        a new or removed custom Exchange site: the server object is updated so that the new folders
+        are read by this collection, and the change is reported (Drift: run -Mode Discover again).
+        A folder set in the Servers block of the configuration is kept.
+        Returns the findings as (Status, Text, Drift) entries. -File: an applicationHost.config to check
+        instead of the server's own (tests).
+    #>
+    param([Parameter(Mandatory)]$Server, [switch]$Local, [string]$File)
+    $notes = [Collections.Generic.List[object]]::new()
+    $note = { param($Status, $Text, [bool]$Drift) $notes.Add([pscustomobject]@{ Status = $Status; Text = $Text; Drift = $Drift }) }
+    $map = $null
+    try { $map = Get-ExlIisSiteMap -Server $Server.Name -Local:$Local -File $File } catch { Write-ExlLog 'WARN' "$($Server.Name): applicationHost.config: $($_.Exception.Message)" }
+    if (-not $map) {
+        & $note 'Warn' "IIS settings not readable (\\$($Server.Name)\ADMIN`$\System32\inetsrv\config\applicationHost.config): the IIS log folders could not be checked." $false
+        return $notes.ToArray()
+    }
+    $same = { param($A, $B) [string]::Equals((ConvertTo-ExlRemotePath -Server $Server.Name -Path $A), (ConvertTo-ExlRemotePath -Server $Server.Name -Path $B), [StringComparison]::OrdinalIgnoreCase) }
+    foreach ($key in $script:ExchangeSites.Keys) {
+        $live = $map.$key
+        if (-not $live -or (& $same $live $Server.$key)) { continue }
+        $site = $script:ExchangeSites[$key]
+        switch ($Server.Origin[$key]) {
+            { $_ -in 'Configuration', 'ConfigurationRoot' } { & $note 'Info' "IIS site '$site' logs to $live; the configuration sets $($Server.$key) (kept: the configuration wins)." $false }
+            'Discover' { & $note 'Warn' "IIS logs of '$site' moved to $live (was $($Server.$key)): read from the new folder. Run -Mode Discover to record it." $true }
+            default { Write-ExlLog 'INFO' "$($Server.Name): IIS site '$site' logs to $live (from applicationHost.config)." }
+        }
+        if ($Server.Origin[$key] -notin 'Configuration', 'ConfigurationRoot') { $Server.$key = $live; $Server.Origin[$key] = 'IIS' }
+    }
+    $known = @($Server.IisCustomSites | Where-Object { $_ })
+    foreach ($c in $map.Custom) {
+        $before = @($known | Where-Object Name -eq $c.Name) | Select-Object -First 1
+        $what = "custom IIS site '$($c.Name)' ($($c.Vdirs), $(if ($c.Role -eq 'BackEnd') { 'back end' } else { 'front end' }))"
+        if (-not $before) {
+            if ($Server.Discovered) { & $note 'Warn' "New $what since -Mode Discover: read from now on ($($c.Folder)). Run -Mode Discover to record it." $true }
+            else { & $note 'Info' "$what found in applicationHost.config: its logs are read too ($($c.Folder))." $false }
+        }
+        elseif (-not (& $same $c.Folder $before.Folder)) { & $note 'Warn' "IIS logs of the $what moved to $($c.Folder) (was $($before.Folder)): read from the new folder. Run -Mode Discover to record it." $true }
+    }
+    foreach ($k in $known) {
+        if (-not @($map.Custom | Where-Object Name -eq $k.Name).Count) { & $note 'Warn' "Custom IIS site '$($k.Name)' no longer hosts Exchange virtual directories (or was removed). Run -Mode Discover to record it." $true }
+    }
+    $Server.IisCustomSites = @($map.Custom)
+    foreach ($p in $map.Problems) { & $note 'Warn' $p $false }
+    return $notes.ToArray()
+}
+
+function Get-ExlExchangeSettings {
+    <#
+    .SYNOPSIS
+        Log settings of the Exchange organisation, read by src\Get-ExlExchangeSettings.ps1 in Windows
+        PowerShell 5.1: the Exchange cmdlets are supported in Windows PowerShell only. Exchange
+        Management Shell on an Exchange server, Exchange remote PowerShell (Kerberos) elsewhere.
+    #>
+    param([string[]]$ConnectTo, [pscredential]$Credential)
+    $windowsPowerShell = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
+    if (-not (Test-Path -LiteralPath $windowsPowerShell -PathType Leaf)) { throw "Windows PowerShell 5.1 is needed for -Mode Discover (the Exchange cmdlets run in Windows PowerShell only): $windowsPowerShell not found." }
+    $helper = Join-Path $script:ToolRoot 'src\Get-ExlExchangeSettings.ps1'
+    $out = Join-Path ([IO.Path]::GetTempPath()) ("elr-discover-{0}.json" -f [guid]::NewGuid().ToString('N'))
+    $credentialFile = $null
+    $arguments = @('-NoLogo', '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', $helper, '-OutFile', $out)
+    if ($ConnectTo) { $arguments += @('-ConnectTo', ($ConnectTo -join ',')) }
+    try {
+        if ($Credential) {
+            # DPAPI-protected file: readable only by this account on this computer, deleted right after.
+            $credentialFile = Join-Path ([IO.Path]::GetTempPath()) ("elr-discover-{0}.xml" -f [guid]::NewGuid().ToString('N'))
+            $Credential | Export-Clixml -LiteralPath $credentialFile
+            $arguments += @('-CredentialFile', $credentialFile)
+        }
+        $output = @(& $windowsPowerShell @arguments 2>&1 | ForEach-Object { "$_".Trim() } | Where-Object { $_ })
+        $code = $LASTEXITCODE
+        foreach ($line in $output) { Write-ExlLog 'INFO' "Windows PowerShell: $line" }
+        if ($code -ne 0 -or -not (Test-Path -LiteralPath $out)) { throw ($(if ($output.Count) { $output -join ' ' } else { "Windows PowerShell ended with code $code." })) }
+        return (Get-Content -LiteralPath $out -Raw -Encoding utf8 | ConvertFrom-Json)
+    }
+    finally {
+        foreach ($f in $out, $credentialFile) { if ($f -and (Test-Path -LiteralPath $f)) { Remove-Item -LiteralPath $f -Force -ErrorAction SilentlyContinue } }
+    }
+}
+
+function Invoke-ExlDiscovery {
+    <#
+    .SYNOPSIS
+        -Mode Discover. Reads the real log settings of every Exchange mailbox server (Exchange cmdlets in
+        Windows PowerShell 5.1, View-Only Organization Management is enough) and the IIS log folders
+        (applicationHost.config through \\<server>\ADMIN$), checks every folder from this computer and
+        writes config\ExchangeLogReport.paths.psd1. Changes nothing on the servers.
+    #>
+    [CmdletBinding()]
+    param([Parameter(Mandatory)]$Settings, [string]$ConnectTo, [pscredential]$Credential)
+    $dot = [char]0x00B7
+    $here = [Environment]::MachineName.ToUpperInvariant()
+    $isExchange = [bool]$env:ExchangeInstallPath -or (Test-Path -LiteralPath 'HKLM:\SOFTWARE\Microsoft\ExchangeServer\v15\Setup')
+    $warnings = [Collections.Generic.List[string]]::new()
+    $warn = { param([string]$Text) $warnings.Add($Text); Write-ExlItem Warn $Text }
+    $account = [Security.Principal.WindowsIdentity]::GetCurrent().Name
+    if ([Security.Principal.WindowsIdentity]::GetCurrent().IsSystem -and -not $Credential) {
+        throw 'SYSTEM has no Exchange role: run -Mode Discover with an administrator account that is a member of View-Only Organization Management (or use -Credential). The scheduled collection can keep running as SYSTEM.'
+    }
+    # Exchange Management Shell on an Exchange server; elsewhere remote PowerShell on the first configured server that answers.
+    $targets = if ($ConnectTo) { @($ConnectTo) } elseif ($isExchange -and -not $Credential) { @() } else { @($Settings.Servers | ForEach-Object Name) }
+
+    # ---- 1. Exchange (Windows PowerShell 5.1) --------------------------------------------------------
+    Write-ExlStep 1 4 'Reading the Exchange settings (Windows PowerShell 5.1)' -Icon Server
+    $exchange = Get-ExlExchangeSettings -ConnectTo $targets -Credential $Credential
+    $mailboxServers = @($exchange.Servers)
+    Write-ExlItem Ok ("{0} on {1} {2} {3} {2} {4} Exchange server(s), {5} mailbox server(s)" -f $exchange.Method, $exchange.Via, $dot, $exchange.Account, $exchange.ExchangeCount, $mailboxServers.Count)
+    if (-not $mailboxServers.Count) { throw 'No Exchange mailbox server found in the organisation.' }
+
+    # ---- 2. log folders of each server -----------------------------------------------------------------
+    Write-ExlStep 2 4 'Locating the log folders (Exchange and IIS)' -Icon Plan
+    $labels = [ordered]@{ HttpProxyPath = 'HttpProxy'; MapiHttpPath = 'MAPI back end'; ImapLogPath = 'IMAP4'; PopLogPath = 'POP3'; IisFrontEndPath = 'IIS front end'; IisBackEndPath = 'IIS back end'
+        FrontEndReceivePath = 'SMTP in (FrontEnd)'; FrontEndSendPath = 'SMTP out (FrontEnd)'; HubReceivePath = 'SMTP in (Hub)'; HubSendPath = 'SMTP out (Hub)'
+        MailboxReceivePath = 'SMTP in (Mailbox)'; MailboxSendPath = 'SMTP out (Mailbox)'; MessageTrackingPath = 'Message tracking' }
+    $found = [ordered]@{}
+    foreach ($x in $mailboxServers) {
+        $name = ([string]$x.Name).ToUpperInvariant()
+        $local = $name -eq $here
+        foreach ($w in @($x.Warnings)) { if ($w) { & $warn "${name}: $w" } }
+        $raw = [ordered]@{}
+        if ($x.DataPath) {
+            $install = [IO.Path]::GetDirectoryName(([string]$x.DataPath).TrimEnd('\'))
+            $raw.ExchangePath = $install
+            $raw.HttpProxyPath = Join-ExlPath $install 'Logging\HttpProxy'
+            $raw.MapiHttpPath = Join-ExlPath $install 'Logging\MapiHttp\Mailbox'
+        } else { & $warn "${name}: installation folder unknown (empty DataPath): default HttpProxy and MAPI folders kept." }
+        foreach ($key in 'ImapLogPath', 'PopLogPath', 'FrontEndReceivePath', 'FrontEndSendPath', 'HubReceivePath', 'HubSendPath', 'MailboxReceivePath', 'MailboxSendPath', 'MessageTrackingPath') {
+            if ($x.$key) { $raw[$key] = [string]$x.$key }
+        }
+        $map = $null
+        try { $map = Get-ExlIisSiteMap -Server $name -Local:$local } catch { Write-ExlLog 'WARN' "${name}: applicationHost.config: $($_.Exception.Message)" }
+        if (-not $map) { & $warn "${name}: IIS settings not readable (\\$name\ADMIN`$, local administrator rights are needed): default IIS folders kept." }
+        else {
+            foreach ($key in $script:ExchangeSites.Keys) {
+                if ($map.$key) { $raw[$key] = $map.$key } else { & $warn "${name}: IIS site '$($script:ExchangeSites[$key])' not found: default folder kept." }
+            }
+            foreach ($p in $map.Problems) { & $warn "${name}: $p" }
+        }
+        $e = [ordered]@{ Version = [string]$x.Version; Site = [string]$x.Site }
+        foreach ($key in $raw.Keys) { $e[$key] = ConvertTo-ExlRemotePath -Server $name -Path $raw[$key] -Local:$local }
+        $e.ImapProtocolLog = [bool]$x.ImapProtocolLog
+        $e.PopProtocolLog = [bool]$x.PopProtocolLog
+        if ($map -and $map.Custom.Count) { $e.IisCustomSites = @($map.Custom) }
+
+        # Folders that are not where a default installation puts them (the reason for this mode).
+        $default = Resolve-ExlServerPaths -Name $name -Configured @{ ExchangePath = 'C:\Program Files\Microsoft\Exchange Server\V15'; IisLogPath = 'C:\inetpub\logs\LogFiles' } -Sources $Settings.Sources
+        $moved = @($labels.Keys | Where-Object { $raw.Contains($_) -and -not [string]::Equals((ConvertTo-ExlRemotePath -Server $name -Path $raw[$_]), (ConvertTo-ExlRemotePath -Server $name -Path $default.$_), [StringComparison]::OrdinalIgnoreCase) } | ForEach-Object { $labels[$_] })
+        $where = if ($moved.Count) { 'not in the default folder: ' + ($moved -join ', ') } else { 'default folders' }
+        Write-ExlItem Ok ("{0} {1} {2} {1} site {3} {1} {4}" -f $name, $dot, $e.Version, $e.Site, $where) -Icon Server
+        foreach ($c in @($e['IisCustomSites'] | Where-Object { $_ })) {
+            $read = if ($c.Role -eq 'FrontEnd') { 'read with the IIS front end' } elseif ($c.Vdirs -match '(^|, )Microsoft-Server-ActiveSync(,|$)') { 'read with the EAS back end' } else { 'not read (back end without ActiveSync)' }
+            Write-ExlItem Info ("{0}: custom IIS site '{1}' {2} {3} {2} {4} {2} {5} {2} {6}" -f $name, $c.Name, $dot, $c.Vdirs, $(if ($c.Role -eq 'BackEnd') { 'back end' } else { 'front end' }), $c.Folder, $read) -Icon Folder
+        }
+
+        # Settings that leave holes in the data.
+        if ($Settings.Sources.MessageTracking -and $x.MessageTrackingEnabled -eq $false) { & $warn "${name}: message tracking is disabled (Set-TransportService $name -MessageTrackingLogEnabled `$true)." }
+        if ($Settings.Sources.PopImap) {
+            if (-not $e.ImapProtocolLog) { & $warn "${name}: IMAP4 protocol logging is off (Set-ImapSettings -Server $name -ProtocolLogEnabled `$true, then restart the IMAP4 services)." }
+            if (-not $e.PopProtocolLog) { & $warn "${name}: POP3 protocol logging is off (Set-PopSettings -Server $name -ProtocolLogEnabled `$true, then restart the POP3 services)." }
+        }
+        $off = @($x.LoggingOff | Where-Object { $_ })
+        if (($Settings.Sources.SmtpReceive -or $Settings.Sources.SmtpSend) -and $off.Count) { & $warn ("{0}: SMTP protocol logging is off on {1}: this SMTP traffic is not in the reports." -f $name, ($off -join ', ')) }
+        $found[$name] = $e
+    }
+
+    # ---- 3. folders, as seen by the account running this mode ---------------------------------------
+    Write-ExlStep 3 4 "Checking the folders from $here ($account)" -Icon Folder
+    $configured = @($Settings.Servers | ForEach-Object Name)
+    foreach ($name in $found.Keys) {
+        $current = @($Settings.Servers | Where-Object Name -eq $name) | Select-Object -First 1
+        $explicit = @{}
+        if ($current) { foreach ($k in $current.Origin.Keys) { if ($current.Origin[$k] -eq 'Configuration') { $explicit[$k] = $current.$k } } }
+        $server = Resolve-ExlServerPaths -Name $name -Configured $explicit -Discovered $found[$name] -Sources $Settings.Sources
+        $missing = [Collections.Generic.List[string]]::new(); $notYet = [Collections.Generic.List[string]]::new(); $ok = 0
+        foreach ($s in Get-ExlSources $server $Settings) {
+            if (Test-Path -LiteralPath $s.Folder -PathType Container) { $ok++ }
+            elseif ($s.Optional) { $notYet.Add($s.Label) }
+            else { $missing.Add("$($s.Label) ($($s.Folder))") }
+        }
+        if ($missing.Count) { & $warn ("{0}: not found or not readable by {1}: {2}" -f $name, $account, ($missing -join ', ')) }
+        else { Write-ExlItem Ok ("{0}: {1} folder(s) readable" -f $name, $ok) -Icon Folder }
+        if ($notYet.Count) { Write-ExlItem Info ("{0}: no folder yet for {1} (created once the logging is on and used)" -f $name, ($notYet -join ', ')) }
+    }
+
+    # ---- 4. paths file ------------------------------------------------------------------------------
+    Write-ExlStep 4 4 'Writing the paths file' -Icon File
+    $q = { param($Value) if ($Value -is [bool]) { if ($Value) { '$true' } else { '$false' } } else { "'" + ([string]$Value).Replace("'", "''") + "'" } }
+    $now = Get-Date
+    $lines = [Collections.Generic.List[string]]::new()
+    $lines.Add('#')
+    $lines.Add('#  Exchange Log Report - log paths found by -Mode Discover')
+    $lines.Add('#  --------------------------------------------------------------------------')
+    $lines.Add(("#  Written on {0:yyyy-MM-dd HH:mm} by {1} on {2} ({3} on {4})." -f $now, $account, $here, $exchange.Method, $exchange.Via))
+    $lines.Add('#  Do not edit: run -Mode Discover again after a CU or a change of the log paths.')
+    $lines.Add('#  A path key set in a Servers block of the configuration wins over this file.')
+    $lines.Add("#  Paths are as seen from $here (administrative shares for the other servers).")
+    $lines.Add('#')
+    $lines.Add('@{')
+    $lines.Add(('    Discovered = {0}' -f (& $q $now.ToString('yyyy-MM-ddTHH:mm:sszzz'))))
+    $lines.Add(('    By         = {0}' -f (& $q $account)))
+    $lines.Add(('    Via        = {0}' -f (& $q "$($exchange.Method) on $($exchange.Via)")))
+    $lines.Add(('    Collector  = {0}' -f (& $q $here)))
+    $lines.Add('    Servers    = @{')
+    foreach ($name in $found.Keys) {
+        $lines.Add(('        {0} = @{{' -f (& $q $name)))
+        foreach ($key in $found[$name].Keys) {
+            $value = $found[$name][$key]
+            if ($key -eq 'IisCustomSites') {
+                $lines.Add(('            {0,-19} = @(' -f $key))
+                foreach ($c in @($value)) { $lines.Add(('                @{{ Name = {0}; Id = {1}; Role = {2}; Vdirs = {3}; Folder = {4} }}' -f (& $q $c.Name), (& $q $c.Id), (& $q $c.Role), (& $q $c.Vdirs), (& $q $c.Folder))) }
+                $lines.Add('            )')
+            }
+            else { $lines.Add(('            {0,-19} = {1}' -f $key, (& $q $value))) }
+        }
+        $lines.Add('        }')
+    }
+    $lines.Add('    }')
+    $lines.Add('}')
+    $temp = $Settings.PathsFile + '.tmp'
+    [IO.File]::WriteAllLines($temp, $lines, [Text.UTF8Encoding]::new($true))
+    Move-Item -LiteralPath $temp -Destination $Settings.PathsFile -Force
+    Write-ExlItem Ok $Settings.PathsFile -Icon File
+
+    [pscustomobject]@{
+        Found       = @($found.Keys)
+        NotInConfig = @($found.Keys | Where-Object { $_ -notin $configured })
+        NotFound    = @($configured | Where-Object { $_ -notin $found.Keys })
+        Warnings    = $warnings.ToArray()
+        File        = $Settings.PathsFile
+        Via         = "$($exchange.Method) on $($exchange.Via)"
+    }
+}
 
 #endregion

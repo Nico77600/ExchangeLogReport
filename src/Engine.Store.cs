@@ -2,7 +2,7 @@
 //  Exchange Log Report - engine, part 2: SQLite store
 // -----------------------------------------------------------------------------
 //  Author  : Nicolas Fabert
-//  Version : 1.3.1
+//  Version : 1.4.0
 //
 //  Tables (all times in Unix ms, UTC)
 //    run              one row per execution

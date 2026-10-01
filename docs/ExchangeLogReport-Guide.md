@@ -1,7 +1,7 @@
 ---
 title: Exchange Log Report
 subtitle: Administrator guide
-version: 1.3.1
+version: 1.4.0
 author: Nicolas Fabert
 updated: 2026-10-01
 ---
@@ -20,15 +20,16 @@ file | What it produces | **CSV + HTML** files in a local folder: a usage report
 ## Quick start
 
 ```steps
-Check the prerequisites | PowerShell 7.4+ and read access to the log folders of the Exchange servers (simplest: run as SYSTEM on an Exchange server).
-List the servers | Open `config\ExchangeLogReport.config.psd1` and fill in the `Servers` section.
+Check the prerequisites | PowerShell 7.4+ on the collector, and the account of chapter 4: SYSTEM on an Exchange server, or a domain account that is local administrator of the Exchange servers.
+List the servers | Open `config\ExchangeLogReport.config.psd1` and put the server names in the `Servers` section (names only).
+Find the log folders | `.\Invoke-ExchangeLogReport.ps1 -Mode Discover` with an account of *View-Only Organization Management*: it reads where every server really writes its logs (Windows PowerShell 5.1, Exchange cmdlets).
 Run the first collection | `.\Invoke-ExchangeLogReport.ps1 -Mode Collect` reads the last `BackfillDays` days of logs into the database.
-Schedule the collection | `-Mode Collect` every hour (scheduled task as SYSTEM).
+Schedule the collection | `-Mode Collect` every hour (scheduled task, chapter 7).
 Build a report | `.\Invoke-ExchangeLogReport.ps1 -Range Last30Days` (usage) or `-ReportType Detailed -User alice` (troubleshooting).
 ```
 
 > [!IMPORTANT]
-> The tool is **read-only** for Exchange: it only reads log files, never changes a setting and never sends anything. Reports stay on the local disk.
+> The tool is **read-only** for Exchange: it reads log files and, with `-Mode Discover`, settings (`Get-*` cmdlets and IIS `applicationHost.config`). It never changes a setting and never sends anything. Reports stay on the local disk.
 
 # Part I · Understand
 
@@ -105,19 +106,56 @@ key | Authentication challenges | The anonymous `401` that precedes every NTLM /
 
 | Item | Requirement |
 |---|---|
-| PowerShell | 7.4 or later (`pwsh`). A portable zip is enough: no installation on the Exchange servers. |
-| Access to the logs | Read access to the log folders of every server. Simplest: run the tool **as SYSTEM on an Exchange server**: its computer account is a member of *Exchange Trusted Subsystem*, which is administrator of every Exchange server, so `\\<server>\c$` is readable without any password. Otherwise use a service account with read access to the folders. |
-| Protocol logging | SMTP: `ProtocolLoggingLevel Verbose` on the receive and send connectors whose traffic must be analysed (`Get-ReceiveConnector | ft Name,ProtocolLoggingLevel`). POP/IMAP (optional): `Set-PopSettings` / `Set-ImapSettings -ProtocolLogEnabled $true`, then restart the POP3/IMAP4 services. HttpProxy, IIS (front and back end), MAPI over HTTP and message tracking are on by default. |
+| PowerShell | **7.4 or later** (`pwsh`) for the tool. A portable zip is enough: no installation on the Exchange servers. **Windows PowerShell 5.1** (`powershell.exe`, part of Windows Server) for `-Mode Discover` only: the Exchange cmdlets are not supported in PowerShell 7, so the tool runs them in a Windows PowerShell 5.1 process. |
+| Account | SYSTEM on an Exchange server, or a domain account that is local administrator of every Exchange server (4.1). |
+| Network | SMB (445) from the collector to every Exchange server. On a collector that is not an Exchange server, also HTTP (80) to one Exchange server for `-Mode Discover` (remote PowerShell `http://<server>/PowerShell/`, Kerberos). |
+| Protocol logging | SMTP: `ProtocolLoggingLevel Verbose` on the receive and send connectors whose traffic must be analysed (`Get-ReceiveConnector | ft Name,ProtocolLoggingLevel`). POP/IMAP (optional): `Set-PopSettings` / `Set-ImapSettings -ProtocolLogEnabled $true`, then restart the POP3/IMAP4 services. HttpProxy, IIS (front and back end), MAPI over HTTP and message tracking are on by default. `-Mode Discover` lists the connectors and services whose logging is off. |
 | Disk | The database is small (see chapter 12). Plan 1 GB per server and per month in large environments. |
+
+### 4.1 Where to run it, and with which account
+
+The log folders of Exchange (`Logging`, `TransportRoles\Logs`) can be read only by **Administrators**, SYSTEM and NETWORK SERVICE, and they are not shared: the tool reads them through the administrative shares (`\\<server>\C$`, `D$`...), and the IIS settings through `\\<server>\ADMIN$`. Hence one rule: **the account that collects is local administrator of every Exchange server**. Two ways to get there:
+
+| | **A. On an Exchange server** (simplest) | **B. On an administration server** |
+|---|---|---|
+| Collection (scheduled task) | **SYSTEM**: the computer account is a member of *Exchange Trusted Subsystem*, which is local administrator of every Exchange server. Nothing to configure. | **Domain account** (for example `svc-elr`), member of the local **Administrators** group of every Exchange server, and of the **Log on as a batch job** right on the administration server. |
+| `-Mode Discover` (once, then after a CU or a change of the log paths) | Run it **interactively with your administrator account** (member of *View-Only Organization Management* or above): Exchange Management Shell of the server. SYSTEM has no Exchange role. | The same domain account, member of **View-Only Organization Management**: Exchange remote PowerShell on the first Exchange server that answers. |
+| Network | SMB to the other Exchange servers. | SMB to every Exchange server, HTTP to one of them. |
+
+Set-up of option B, with a group so that the rights follow the account:
+
+```powershell
+# Active Directory: universal security group of the collector accounts
+New-ADGroup -Name 'ELR-Collectors' -GroupScope Universal -GroupCategory Security
+Add-ADGroupMember -Identity 'ELR-Collectors' -Members 'svc-elr'
+
+# Every Exchange server (or a Group Policy: Restricted Groups / local users and groups)
+Add-LocalGroupMember -Group 'Administrators' -Member 'CONTOSO\ELR-Collectors'
+
+# Exchange Management Shell, once: the read-only Exchange role used by -Mode Discover
+Add-RoleGroupMember 'View-Only Organization Management' -Member 'ELR-Collectors'
+```
+
+On the administration server, give `ELR-Collectors` the **Log on as a batch job** right (`secpol.msc` › Local Policies › User Rights Assignment, or a Group Policy) and write access to the `data`, `reports`, `logs` and `bin` folders of the tool.
+
+> [!IMPORTANT]
+> **A domain account, not a local account.** A local account of the administration server, even with the same name and password on every server, is filtered by UAC over the network: it gets no access to the administrative shares.
+
+> [!WARNING]
+> **Local administrator of an Exchange server is a privileged account.** The tool only reads, but treat this account like an Exchange administrator account: password in a vault, no interactive logon (deny *Log on locally* and *Log on through Remote Desktop Services*), administration server hardened like a tier 0/1 server.
+
+> [!NOTE]
+> **Why View-Only Organization Management is enough.** `-Mode Discover` only runs `Get-ExchangeServer`, `Get-TransportService`, `Get-FrontEndTransportService`, `Get-MailboxTransportService`, `Get-ImapSettings`, `Get-PopSettings`, `Get-ReceiveConnector` and `Get-SendConnector` (checked in the lab: all are in the roles of this group). The collection uses no Exchange role at all: it reads files.
 
 <!-- icon: download -->
 ## 5. Installation
 
 ```steps
 Copy the package | Copy the package folder to the collector, for example `E:\Tools\ExchangeLogReport` (no installer, no module to register).
-List the servers | Edit `config\ExchangeLogReport.config.psd1` (chapter 6).
+List the servers | Edit `config\ExchangeLogReport.config.psd1`: the server names are enough (chapter 6).
 Check the configuration and the engine | `pwsh -File .\Invoke-ExchangeLogReport.ps1 -Mode Status` — a new installation answers **Ready for the first collection**.
-Run the first collection | `pwsh -File .\Invoke-ExchangeLogReport.ps1 -Mode Collect` reads `Collection.BackfillDays` days of logs.
+Find the log folders | `pwsh -File .\Invoke-ExchangeLogReport.ps1 -Mode Discover` with an account of *View-Only Organization Management* (6.1). Check the warnings: folder not readable, logging off.
+Run the first collection | `pwsh -File .\Invoke-ExchangeLogReport.ps1 -Mode Collect` (with the account of the scheduled task) reads `Collection.BackfillDays` days of logs.
 Schedule it | Hourly scheduled task (chapter 7), then build the first report (chapter 8).
 ```
 
@@ -126,31 +164,59 @@ Schedule it | Hourly scheduled task (chapter 7), then build the first report (ch
 
 The configuration file is checked at every start; all invalid values are listed at once.
 
-### 6.1 Servers
+### 6.1 Servers and log folders
 
 ```powershell
 Servers = @(
-    @{ Name = 'EXCH01' }                                     # \\EXCH01\c$\Program Files\Microsoft\Exchange Server\V15
-    @{ Name = 'EXCH02'; ExchangePath = '\\EXCH02\d$\Exchange' }
-    @{ Name = 'EXCH03'; MessageTrackingPath = '\\EXCH03\e$\Logs\MessageTracking' }
+    @{ Name = 'EXCH01' }
+    @{ Name = 'EXCH02' }
+    @{ Name = 'EXCH03' }
 )
 ```
 
-Paths can be overridden per server when the logs were moved: `ExchangePath`, `IisLogPath`, `HttpProxyPath`, `LoggingPath` (Exchange `Logging` folder: MapiHttp, Imap4, Pop3), `TransportLogPath`, `MessageTrackingPath`. Check the real paths with `Get-TransportService | fl *LogPath` and `Get-ExchangeServer | fl DataPath`.
+The names are enough: where each server really writes its logs is found by **`-Mode Discover`**. Exchange can be installed on another drive, and every log folder can be moved (`Set-TransportService -MessageTrackingLogPath`, `Set-FrontEndTransportService -ReceiveProtocolLogPath`, IIS log folder of a site...): the default folders are then wrong, and the old folder still exists with old files, so nothing looks broken.
+
+```powershell
+.\Invoke-ExchangeLogReport.ps1 -Mode Discover                     # Exchange Management Shell of this server, or remote PowerShell
+.\Invoke-ExchangeLogReport.ps1 -Mode Discover -ConnectTo EXCH01   # remote PowerShell on this server
+```
+
+| What | Read from |
+|---|---|
+| HttpProxy, MAPI back end | Installation folder (`Get-ExchangeServer` › `DataPath`) |
+| SMTP protocol logs, per role and direction | `*ProtocolLogPath` of `Get-FrontEndTransportService`, `Get-TransportService`, `Get-MailboxTransportService` |
+| Message tracking | `Get-TransportService` › `MessageTrackingLogPath`, `MessageTrackingLogEnabled` |
+| POP3, IMAP4 | `Get-PopSettings` / `Get-ImapSettings` › `LogFileLocation`, `ProtocolLogEnabled` |
+| IIS | `applicationHost.config` of each server (`\\<server>\ADMIN$`): log folder, format and target of *Default Web Site*, *Exchange Back End* and **every other site hosting Exchange virtual directories** (a second OWA/ECP site, for example) |
+| Logging off | Receive and send connectors with `ProtocolLoggingLevel None`, intra-organization, delivery and submission connectors |
+
+The Exchange cmdlets run in **Windows PowerShell 5.1**: the tool starts `powershell.exe` for them (Exchange Management Shell on an Exchange server, Exchange remote PowerShell with Kerberos elsewhere), and does the rest in PowerShell 7. Every folder found is then checked from the collector with the account running the mode; a folder on another drive is read through the administrative share of that drive (`D:\Logs` › `\\EXCH01\D$\Logs`), and a folder of the collector itself with its local path. The result goes to `config\ExchangeLogReport.paths.psd1` (do not edit it). Run the mode again **after a CU, a new server or a change of the log folders**.
+
+A custom IIS site is recognised from its virtual directories alone (an application that points to the Exchange front end `FrontEnd\HttpProxy` or back end `ClientAccess`): Exchange is not queried for it. Its logs are read with the IIS front end (OWA, ECP...) or, for a back-end site with ActiveSync, with the ActiveSync back end.
+
+What every collection checks, without Exchange cmdlets:
+
+```cards
+server | IIS sites | `applicationHost.config` is read again: a moved IIS log folder, a new or removed custom Exchange site are **followed at once** and reported until `-Mode Discover` records them.
+folder | Missing folder | HttpProxy, IIS and message tracking folders must exist (row *not found*). SMTP, MAPI, POP/IMAP and custom sites may have no folder until their logging is on and used (row *no folder*).
+clock | Stale source | HttpProxy and the IIS front and back end are written all the time (health probes). Newest file older than `StaleSourceHours`: logging stopped, or the logs were moved and the old folder is read.
+```
+
+A path set in the `Servers` block wins over the paths file (the setting is kept and the difference is reported). Keys: `HttpProxyPath`, `MapiHttpPath`, `ImapLogPath`, `PopLogPath`, `IisFrontEndPath`, `IisBackEndPath` (the `W3SVCn` folder), `FrontEndReceivePath`, `FrontEndSendPath`, `HubReceivePath`, `HubSendPath`, `MailboxReceivePath`, `MailboxSendPath`, `MessageTrackingPath`, or a root: `ExchangePath`, `IisLogPath`, `LoggingPath`, `TransportLogPath`. Without paths file, the default installation folders on `C:` are used and the console says so.
 
 > [!TIP]
-> For the server that runs the tool, use local paths: they are faster than its own administrative share.
+> The paths file records the collector that wrote it. Copied to another collector, the tool asks to run `-Mode Discover` there: the administrative shares and local paths differ.
 
 ### 6.2 Sources
 
 | Key | Default | Meaning |
 |---|---|---|
 | `HttpProxy` | `$true` | Client access (all protocols). |
-| `IisFrontEnd`, `IisSite` | `$true`, `W3SVC1` | Default Web Site. |
+| `IisFrontEnd`, `IisSite` | `$true`, `W3SVC1` | Default Web Site, and the custom sites hosting front-end Exchange virtual directories (OWA, ECP...). `IisSite` is used only until `-Mode Discover` has run. |
 | `SmtpReceive`, `SmtpSend` | `$true` | SMTP protocol logs of the `TransportRoles` listed (`FrontEnd`, `Hub`, `Mailbox`). A missing folder is not an error (protocol logging not enabled for that role). |
 | `MessageTracking` | `$true` | All `MSGTRK*.log` files (hub, delivery, submission, moderation). |
 | `MapiBackEnd` | `$true` | `Logging\MapiHttp\Mailbox`: Outlook version and mode, MAPI status codes. |
-| `EasBackEnd`, `IisBackEndSite` | `$true`, `W3SVC2` | ActiveSync lines of the Exchange Back End site (the other lines are counted as noise without being parsed). |
+| `EasBackEnd`, `IisBackEndSite` | `$true`, `W3SVC2` | ActiveSync lines of the Exchange Back End site (the other lines are counted as noise without being parsed). `IisBackEndSite` is used only until `-Mode Discover` has run. |
 | `PopImap` | `$false` | POP3 and IMAP4 protocol logs (front end and back end). Often unused: enable it together with the protocol logging. |
 
 ### 6.3 Noise
@@ -189,6 +255,7 @@ Built-in rules that need no configuration:
 | `Collection.MaxSessionSteps` | 80 | Timeline steps written per session and log file; the other successes are folded into batches. |
 | `Collection.SlowRequestMs` | 5000 | Successful requests slower than this are kept as **Slow** (0 = never). Applied at collection: changing it does not recompute the history. |
 | `Collection.LongRunningPatterns` | NotificationWait, Ping, RPC/HTTP, OWA notifications, PowerShell, IMAP IDLE | Long-polling requests (regex on `Protocol|Action|Url`): never slow. |
+| `Collection.StaleSourceHours` | 24 | HttpProxy, IIS front end or back end whose newest file is older than this is **stale** (warning, exit code 2). 0 = no check. SMTP and message tracking are not checked: a server without mail flow writes nothing there. |
 | `Storage.RetentionDays` | **60** | Daily usage, operations, clients and devices, SMTP transactions, message tracking. |
 | `Storage.DetailRetentionDays` | **14** | Failed and slow requests, client sessions and their timeline, SMTP session transcripts. |
 | `Report.DefaultType` | `Usage` | `Usage` or `Detailed`. |
@@ -200,7 +267,9 @@ Built-in rules that need no configuration:
 <!-- icon: clock -->
 ## 7. Scheduled collection
 
-Run the collection every hour (Exchange closes HttpProxy files every hour). Example with the task running as SYSTEM on an Exchange server:
+Run the collection every hour (Exchange closes HttpProxy files every hour), with the account of chapter 4.1.
+
+**A. On an Exchange server**, as SYSTEM:
 
 ```powershell
 $action  = New-ScheduledTaskAction -Execute 'E:\Tools\pwsh\pwsh.exe' `
@@ -210,10 +279,20 @@ $trigger = New-ScheduledTaskTrigger -Once -At (Get-Date).Date.AddHours(1) -Repet
 Register-ScheduledTask -TaskName 'Exchange Log Report - collect' -Action $action -Trigger $trigger -User 'SYSTEM' -RunLevel Highest
 ```
 
+**B. On an administration server**, with the domain account (same `$action` and `$trigger`; the password is kept by the Task Scheduler):
+
+```powershell
+$account = Get-Credential 'CONTOSO\svc-elr'
+Register-ScheduledTask -TaskName 'Exchange Log Report - collect' -Action $action -Trigger $trigger `
+    -User $account.UserName -Password $account.GetNetworkCredential().Password -RunLevel Limited
+```
+
+The account needs the **Log on as a batch job** right on the administration server: without it, the task does not start and its last result is `0xC000015B`.
+
 ```cards
 check | Exit code 0 | Success.
 wrench | Exit code 1 | Failure: see the error and the log file.
-info | Exit code 2 | Finished but incomplete: a server or a file could not be read (see the log file).
+info | Exit code 2 | Finished with warnings: a server, a folder or a file could not be read, a source is stale, or the IIS log folders changed since `-Mode Discover` (see the console and the log file).
 shield | Lock | A lock file prevents two collections at the same time; reports can still be built from the data already collected (-NoCollect).
 ```
 
@@ -239,6 +318,9 @@ shield | Lock | A lock file prevents two collections at the same time; reports c
 
 # What the database contains, and the noise removed by the last collection
 .\Invoke-ExchangeLogReport.ps1 -Mode Status
+
+# After a CU, a new server or a change of the log folders
+.\Invoke-ExchangeLogReport.ps1 -Mode Discover
 ```
 
 ```cards
@@ -442,6 +524,7 @@ Main noise found: Managed Availability probes (1.5 million lines), back-end traf
 | Parsing, a new field, a new status | `src\Engine.Collector.cs` (collection), `src\Engine.Sessions.cs` (sessions, back-end logs, POP/IMAP), `src\Engine.Report.cs` and `src\Engine.ReportSessions.cs` (datasets). The engine is recompiled automatically at the next start (hash of the sources). Add a test. |
 | Database schema | `src\Engine.Store.cs` (`Schema`, `Migrate`). New tables: `CREATE … IF NOT EXISTS`; a new column of an existing table: `ALTER TABLE` in `Migrate` (done at the next collection) and a new `schema_version`. |
 | Console output | `ExchangeLogReport.psm1`, region 1 (same functions as Purview DLP Report). |
+| Log folders (`-Mode Discover`) | `ExchangeLogReport.psm1`, region 9 (IIS sites, paths file) and `src\Get-ExlExchangeSettings.ps1`, the Exchange part, run in **Windows PowerShell 5.1**: keep its syntax 5.1 (no `??`, `?.`, ternary operator); the tests run its functions in `powershell.exe`. |
 | This guide | `docs\ExchangeLogReport-Guide.md`, then `.\tools\Build-Documentation.ps1` (also run by the package tool). |
 | README graphics (GitHub) | `.\tools\New-DocumentationImages.ps1` renders `docs\images\readme-*.png` (light and dark) from the cards and flow blocks of this guide, with its CSS and icons (Microsoft Edge, headless). Run it after `Build-Documentation.ps1` when chapters 1, 2, 3 or 11 change. |
 | Version | `ExchangeLogReport.psd1` (`ModuleVersion`), `$script:ToolVersion` in the module, headers, front matter of this guide, `CHANGELOG.md`. |
@@ -481,6 +564,18 @@ Six test mailboxes spread over the four databases and two sites, traffic sent fr
 
 Result: 20 client sessions (9 with failures), 29 failed or slow requests, 20 messages (6 refused during the SMTP conversation), 3 SMTP clients, every server *In use*. The step commands found the raw lines on the servers (HttpProxy `Execute` on EXCH02, `W3SVC2` `UserDisabledForSync` on EXCH01).
 
+### 14.2 Log folders and accounts
+
+Collector on an administration server (Windows Server 2025, not an Exchange server), domain account member of a universal group that is local administrator of EXCH01 to EXCH04 and member of *View-Only Organization Management*; on EXCH04, message tracking and the Hub SMTP receive logs moved to `E:`, the Default Web Site logs moved to `E:\IISLogs`, and a second web site *OWA External* with OWA and ECP virtual directories:
+
+| Test | Result |
+|---|---|
+| `-Mode Discover` from the administration server | Exchange remote PowerShell (Kerberos) in Windows PowerShell 5.1 on EXCH01; 4 mailbox servers; on EXCH04 *not in the default folder: IIS front end, SMTP in (Hub), Message tracking*, and the custom site *OWA External* (`owa, ecp`, front end); every folder readable through `C$` and `E$`. |
+| Collection with the paths found | The moved folders and the custom site are read (*IIS OWA External* row). |
+| IIS log folder of the custom site moved after `-Mode Discover` | Next collection: *IIS logs of the custom IIS site 'OWA External' moved to \\EXCH04\E$\IISLogs\W3SVC3 (was …\C$\…)*, read from the new folder, exit code 2 until `-Mode Discover` runs again. |
+| Scheduled task without *Log on as a batch job* | Task not started, last result `0xC000015B`. |
+| `-Mode Discover` as SYSTEM on an Exchange server | Refused: SYSTEM has no Exchange role (Exchange Management Shell connection denied). The collection as SYSTEM works. |
+
 # Annexes
 
 <!-- icon: lifebuoy -->
@@ -488,7 +583,14 @@ Result: 20 client sessions (9 with failures), 29 failed or slow requests, 20 mes
 
 | Symptom | Cause and action |
 |---|---|
-| `folder not found or not readable` | Wrong path or no access. Test `Test-Path '\\<server>\c$\Program Files\Microsoft\Exchange Server\V15\Logging\HttpProxy'` as the account of the task. With SYSTEM on an Exchange server, check that the computer account is in *Exchange Trusted Subsystem*. |
+| `folder not found or not readable` | Wrong path or no access. Run `-Mode Discover` again (logs moved, Exchange on another drive), then test `Test-Path '<folder shown>'` as the account of the task. That account must be local administrator of the server (chapter 4.1); with SYSTEM on an Exchange server, check that the computer account is in *Exchange Trusted Subsystem*. |
+| Scheduled task result `0xC000015B` | The account of the task lacks the **Log on as a batch job** right on the collector (`secpol.msc` › User Rights Assignment, or the Group Policy that sets it). |
+| `-Mode Discover`: *Exchange remote PowerShell could not be opened* | HTTP (80) to the server, Kerberos (use the server name, not its address), membership of *View-Only Organization Management* (log off and on, or wait for the Kerberos ticket, after adding the account). Try another server with `-ConnectTo`. |
+| `-Mode Discover`: *SYSTEM has no Exchange role* | Run the mode interactively with an administrator account; the scheduled collection stays as SYSTEM. |
+| `IIS settings not readable (\\<server>\ADMIN$…)` | The account is not local administrator of the server, or the `ADMIN$` share is disabled. The default IIS folders are used meanwhile. |
+| `IIS logs of '…' moved to …` | The IIS log folder of a site changed: the collection already reads the new folder. Run `-Mode Discover` to record it (exit code 2 until then). |
+| A source is **stale** | No new HttpProxy or IIS file for `StaleSourceHours`: the server was stopped, logging was turned off, or the logs were moved and the old folder is read. Check the folder on the server, then run `-Mode Discover`. |
+| `The paths file was written on …` | The paths file comes from another collector: run `-Mode Discover` on this one. |
 | A server is *No real usage* but users say they use it | Check the load balancer (are requests reaching it?) and the noise counters in `-Mode Status`: a too broad `SystemUserPatterns` or `ExcludedClientIps` rule can remove real users. |
 | Every user comes from the same IP | The load balancer uses SNAT. Usage is right; for client addresses enable `X-Forwarded-For` on the load balancer (HttpProxy logs it in `ClientIpAddress`). |
 | No IMAP / POP session | `Sources.PopImap` is `$false`, or protocol logging is off (`Get-ImapSettings | fl ProtocolLogEnabled`): enable it and restart the IMAP4 / POP3 services (front end and back end). |

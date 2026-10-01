@@ -7,3 +7,5 @@ logs/
 *.sqlite-*
 *.lock
 *.zip
+# Written by -Mode Discover: the real log folders of your servers
+config/*.paths.psd1

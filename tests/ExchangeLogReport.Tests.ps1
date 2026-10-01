@@ -3,7 +3,7 @@
 <#
     Exchange Log Report - automated tests (Pester 5 or later).
     Author  : Nicolas Fabert
-    Version : 1.3.1
+    Version : 1.4.0
 
     Run:  Invoke-Pester -Path .\tests\ExchangeLogReport.Tests.ps1 -Output Detailed
 
@@ -255,7 +255,7 @@ BeforeAll {
         $text = [IO.File]::ReadAllText((Join-Path $script:Root 'config\ExchangeLogReport.config.psd1'))
         $servers = "Servers = @(`r`n        @{ Name = 'EXCH01'; ExchangePath = '$($logs.Exchange)'; IisLogPath = '$($logs.Iis)' }`r`n        @{ Name = 'EXCH02'; ExchangePath = '$Directory\missing\EXCH02'; IisLogPath = '$Directory\missing\EXCH02\iis' }`r`n    )"
         $text = [regex]::Replace($text, "(?ms)^    Servers = @\(.*?^    \)", $servers.Replace('$', '$$'))
-        $text = $text.Replace("'.\data\ExchangeLogReport.sqlite'", "'$Directory\data\test.sqlite'").Replace("Path          = '.\logs'", "Path          = '$Directory\toollogs'").Replace("OutputPath            = '.\reports'", "OutputPath            = '$Directory\reports'")
+        $text = $text.Replace("'.\data\ExchangeLogReport.sqlite'", "'$Directory\data\test.sqlite'").Replace("Path          = '.\logs'", "Path          = '$Directory\toollogs'").Replace("OutputPath            = '.\reports'", "OutputPath            = '$Directory\reports'").Replace('StaleSourceHours       = 24', 'StaleSourceHours       = 0')
         foreach ($k in $Replace.Keys) { $text = $text.Replace($k, $Replace[$k]) }
         $path = Join-Path $Directory 'test.config.psd1'
         [IO.File]::WriteAllText($path, $text, [Text.UTF8Encoding]::new($true))
@@ -296,6 +296,307 @@ Describe 'Configuration' {
         $path = Join-Path $TestDrive 'bad.psd1'
         (Get-Content $script:ConfigPath -Raw).Replace('DetailRetentionDays = 14', 'DetailRetentionDays = 90').Replace("DefaultType           = 'Usage'", "DefaultType           = 'Full'") | Set-Content -LiteralPath $path
         { Import-ExlConfiguration -Path $path -Root $script:Root } | Should -Throw -ExpectedMessage '*DetailRetentionDays*DefaultType*'
+    }
+}
+
+Describe 'Log paths' {
+    BeforeAll {
+        $script:PathsDir = Join-Path $TestDrive 'paths'
+        [void][IO.Directory]::CreateDirectory($script:PathsDir)
+        $text = [IO.File]::ReadAllText((Join-Path $script:Root 'config\ExchangeLogReport.config.psd1'))
+        $servers = "Servers = @(`r`n        @{ Name = 'exch01'; MessageTrackingPath = 'E:\Forced\Tracking' }`r`n        @{ Name = 'EXCH02'; ExchangePath = 'D:\Exchange' }`r`n        @{ Name = 'EXCH03' }`r`n    )"
+        $text = [regex]::Replace($text, "(?ms)^    Servers = @\(.*?^    \)", $servers.Replace('$', '$$'))
+        $script:PathsConfig = Join-Path $script:PathsDir 'ExchangeLogReport.config.psd1'
+        [IO.File]::WriteAllText($script:PathsConfig, $text, [Text.UTF8Encoding]::new($true))
+        $paths = @"
+@{
+    Discovered = '2026-10-01T21:30:00+02:00'
+    By         = 'CONTOSO\admin'
+    Via        = 'EXCH01'
+    Collector  = 'COLLECTOR'
+    Servers    = @{
+        'EXCH01' = @{
+            ExchangePath        = '\\EXCH01\D$\Exchange'
+            HttpProxyPath       = '\\EXCH01\D$\Exchange\Logging\HttpProxy'
+            HubReceivePath      = '\\EXCH01\L$\Logs\Hub\Receive'
+            MessageTrackingPath = '\\EXCH01\L$\Logs\Tracking'
+            IisFrontEndPath     = '\\EXCH01\L$\IIS\W3SVC1'
+            ImapProtocolLog     = `$false
+            PopProtocolLog      = `$true
+        }
+        'EXCH02' = @{
+            HubSendPath         = '\\EXCH02\L$\Logs\Hub\Send'
+        }
+    }
+}
+"@
+        [IO.File]::WriteAllText((Join-Path $script:PathsDir 'ExchangeLogReport.paths.psd1'), $paths, [Text.UTF8Encoding]::new($true))
+        $script:Paths = Import-ExlConfiguration -Path $script:PathsConfig -Root $script:Root
+    }
+    It 'takes a folder of the Servers block first, then the paths found by -Mode Discover, then the default folder' {
+        $s = $script:Paths.Servers[0]
+        $s.Name | Should -Be 'EXCH01'
+        $s.MessageTrackingPath | Should -Be 'E:\Forced\Tracking'
+        $s.Origin.MessageTrackingPath | Should -Be 'Configuration'
+        $s.HubReceivePath | Should -Be '\\EXCH01\L$\Logs\Hub\Receive'
+        $s.Origin.HubReceivePath | Should -Be 'Discover'
+        $s.IisFrontEndPath | Should -Be '\\EXCH01\L$\IIS\W3SVC1'
+        $s.MapiHttpPath | Should -Be '\\EXCH01\D$\Exchange\Logging\MapiHttp\Mailbox'
+        $s.HubSendPath | Should -Be '\\EXCH01\D$\Exchange\TransportRoles\Logs\Hub\ProtocolLog\SmtpSend'
+        $s.Origin.HubSendPath | Should -Be 'Default'
+        $s.IisBackEndPath | Should -Be '\\EXCH01\c$\inetpub\logs\LogFiles\W3SVC2'
+        $s.ImapProtocolLog | Should -BeFalse
+        $s.PopProtocolLog | Should -BeTrue
+        $script:Paths.Discovery.Collector | Should -Be 'COLLECTOR'
+    }
+    It 'derives the other folders from a root set in the Servers block, or from the default installation' {
+        $two = $script:Paths.Servers[1]
+        $two.HubSendPath | Should -Be '\\EXCH02\L$\Logs\Hub\Send'
+        $two.HttpProxyPath | Should -Be 'D:\Exchange\Logging\HttpProxy'
+        $two.FrontEndReceivePath | Should -Be 'D:\Exchange\TransportRoles\Logs\FrontEnd\ProtocolLog\SmtpReceive'
+        $three = $script:Paths.Servers[2]
+        $three.Discovered | Should -BeFalse
+        $three.MessageTrackingPath | Should -Be '\\EXCH03\c$\Program Files\Microsoft\Exchange Server\V15\TransportRoles\Logs\MessageTracking'
+        $three.ImapProtocolLog | Should -BeNullOrEmpty
+        (Get-ExlPathOrigin $three) | Should -BeLike 'default paths*'
+        (Get-ExlPathOrigin $script:Paths.Servers[0]) | Should -Be 'paths from -Mode Discover and the configuration'
+    }
+    It 'reads every source from its own folder' {
+        $sources = Get-ExlSources $script:Paths.Servers[0] $script:Paths
+        ($sources | Where-Object { $_.Kind -eq 'SmtpReceive' -and $_.Role -eq 'Hub' }).Folder | Should -Be '\\EXCH01\L$\Logs\Hub\Receive'
+        ($sources | Where-Object Kind -eq 'Tracking').Folder | Should -Be 'E:\Forced\Tracking'
+        ($sources | Where-Object Kind -eq 'Iis').Folder | Should -Be '\\EXCH01\L$\IIS\W3SVC1'
+    }
+    It 'rejects an unknown setting in a Servers block' {
+        $path = Join-Path $script:PathsDir 'unknown.config.psd1'
+        (Get-Content $script:PathsConfig -Raw).Replace("@{ Name = 'EXCH03' }", "@{ Name = 'EXCH03'; TrackingPath = 'X:\' }") | Set-Content -LiteralPath $path
+        { Import-ExlConfiguration -Path $path -Root $script:Root } | Should -Throw -ExpectedMessage '*TrackingPath is not a known setting*'
+    }
+    It 'turns a folder of another server into its administrative share, and keeps local and UNC paths' {
+        & (Get-Module ExchangeLogReport) {
+            ConvertTo-ExlRemotePath -Server 'EXCH02' -Path 'D:\Logs\Hub\' | Should -Be '\\EXCH02\D$\Logs\Hub'
+            ConvertTo-ExlRemotePath -Server 'EXCH02' -Path 'D:\Logs\Hub' -Local | Should -Be 'D:\Logs\Hub'
+            ConvertTo-ExlRemotePath -Server 'EXCH02' -Path '\\NAS\Logs' | Should -Be '\\NAS\Logs'
+        }
+    }
+    It 'reads the Exchange settings with Windows PowerShell 5.1 (the Exchange cmdlets do not run in PowerShell 7)' {
+        $helper = Join-Path $script:Root 'src\Get-ExlExchangeSettings.ps1'
+        $tokens = $null; $parseErrors = $null
+        [void][Management.Automation.Language.Parser]::ParseFile($helper, [ref]$tokens, [ref]$parseErrors)
+        $parseErrors | Should -BeNullOrEmpty
+        $text = Get-Content -LiteralPath $helper -Raw
+        $text | Should -Match '#Requires -Version 5\.1'
+        $text | Should -Not -Match '\?\?|\?\.|\s\?\s.+\s:\s'
+        $windowsPowerShell = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
+        $out = Join-Path $TestDrive 'never.json'
+        $result = & $windowsPowerShell -NoProfile -NonInteractive -ExecutionPolicy Bypass -File $helper -OutFile $out -ConnectTo 'exch-does-not-exist.invalid' 2>&1 | Out-String
+        $LASTEXITCODE | Should -Be 1
+        $result | Should -Match 'Exchange remote PowerShell could not be opened'
+        Test-Path -LiteralPath $out | Should -BeFalse
+        # Its helper functions, run in Windows PowerShell 5.1 (.NET Framework overloads differ from PowerShell 7).
+        $ast = [Management.Automation.Language.Parser]::ParseFile($helper, [ref]$null, [ref]$null)
+        $functions = ($ast.FindAll({ param($n) $n -is [Management.Automation.Language.FunctionDefinitionAst] }, $false) | ForEach-Object { $_.Extent.Text }) -join "`n"
+        $probe = $functions + "`n" + @'
+Get-Leaf 'contoso.com/Configuration/Sites/Paris'
+Get-Leaf ([pscustomobject]@{ Name = 'EXCH01' })
+Get-PathText ([pscustomobject]@{ PathName = 'E:\Logs\Tracking' })
+Get-PathText '  D:\Logs\Hub  '
+Get-VersionText 'Version 15.2 (Build 2562.17)'
+'@
+        $encoded = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($probe))
+        $lines = @(& $windowsPowerShell -NoProfile -NonInteractive -EncodedCommand $encoded 2>&1 | ForEach-Object { "$_" })
+        $lines | Should -Be @('PARIS', 'EXCH01', 'E:\Logs\Tracking', 'D:\Logs\Hub', '15.2.2562.17')
+    }
+    It 'reads the log folder of each IIS site from applicationHost.config' {
+        $file = Join-Path $script:PathsDir 'applicationHost.config'
+        @'
+<?xml version="1.0" encoding="UTF-8"?>
+<configuration>
+  <system.applicationHost>
+    <log centralLogFileMode="Site" />
+    <sites>
+      <site name="Default Web Site" id="1"><logFile directory="L:\IISLogs" /></site>
+      <site name="Exchange Back End" id="2"></site>
+      <siteDefaults><logFile logFormat="W3C" directory="%SystemDrive%\inetpub\logs\LogFiles" /></siteDefaults>
+    </sites>
+  </system.applicationHost>
+</configuration>
+'@ | Set-Content -LiteralPath $file
+        $iis = & (Get-Module ExchangeLogReport) { param($f) Get-ExlIisLogFolders -Server 'EXCH02' -File $f } $file
+        $iis.Central | Should -Be 'Site'
+        ($iis.Sites | Where-Object Name -eq 'Default Web Site').Folder | Should -Be 'L:\IISLogs\W3SVC1'
+        ($iis.Sites | Where-Object Name -eq 'Exchange Back End').Folder | Should -Be 'C:\inetpub\logs\LogFiles\W3SVC2'
+        ($iis.Sites | Where-Object Name -eq 'Exchange Back End').Format | Should -Be 'W3C'
+    }
+    Context 'Exchange IIS sites' {
+        BeforeAll {
+            # Virtual directories as created by Exchange setup, plus a custom OWA/ECP site and a site that is not Exchange.
+            $fe = 'C:\Program Files\Microsoft\Exchange Server\V15\FrontEnd\HttpProxy'
+            $be = 'C:\Program Files\Microsoft\Exchange Server\V15\ClientAccess'
+            $script:AppHost = Join-Path $script:PathsDir 'applicationHost.exchange.config'
+            $script:WriteAppHost = {
+                param([string]$CustomDirectory = 'E:\IISLogs', [switch]$NoCustom, [string]$DefaultDirectory = 'E:\IISLogs')
+                $custom = if ($NoCustom) { '' } else { @"
+      <site name="OWA External" id="3">
+        <application path="/" applicationPool="DefaultAppPool"><virtualDirectory path="/" physicalPath="C:\inetpub\owaext" /></application>
+        <application path="/owa" applicationPool="MSExchangeOWAAppPool"><virtualDirectory path="/" physicalPath="$fe\owa" /></application>
+        <application path="/ecp" applicationPool="MSExchangeECPAppPool"><virtualDirectory path="/" physicalPath="$fe\ecp" /></application>
+        <logFile directory="$CustomDirectory" />
+      </site>
+"@ }
+                @"
+<?xml version="1.0" encoding="UTF-8"?>
+<configuration>
+  <system.applicationHost>
+    <log><centralW3CLogFile enabled="true" directory="%SystemDrive%\inetpub\logs\LogFiles" /></log>
+    <sites>
+      <site name="Default Web Site" id="1">
+        <application path="/" applicationPool="MSExchangeOWAAppPool"><virtualDirectory path="/" physicalPath="%SystemDrive%\inetpub\wwwroot" /></application>
+        <application path="/owa" applicationPool="MSExchangeOWAAppPool"><virtualDirectory path="/" physicalPath="$fe\owa" /></application>
+        <application path="/owa/Calendar" applicationPool="MSExchangeOWACalendarAppPool"><virtualDirectory path="/" physicalPath="$fe\owa" /></application>
+        <application path="/EWS" applicationPool="MSExchangeServicesAppPool"><virtualDirectory path="/" physicalPath="$fe\EWS" /></application>
+        <application path="/Microsoft-Server-ActiveSync" applicationPool="MSExchangeSyncAppPool"><virtualDirectory path="/" physicalPath="$fe\sync" /></application>
+        <application path="/mapi" applicationPool="MSExchangeMapiFrontEndAppPool"><virtualDirectory path="/" physicalPath="$fe\mapi" /></application>
+        <logFile directory="$DefaultDirectory" />
+      </site>
+      <site name="Exchange Back End" id="2">
+        <application path="/"><virtualDirectory path="/" physicalPath="$be" /></application>
+        <application path="/mapi/emsmdb" applicationPool="MSExchangeMapiMailboxAppPool"><virtualDirectory path="/" physicalPath="$be\mapi\emsmdb" /></application>
+        <application path="/Microsoft-Server-ActiveSync" applicationPool="MSExchangeSyncAppPool"><virtualDirectory path="/" physicalPath="$be\sync" /></application>
+        <application path="/Rpc" applicationPool="MSExchangeRpcProxyAppPool"><virtualDirectory path="/" physicalPath="%windir%\System32\RpcProxy" /></application>
+      </site>
+$custom      <site name="Intranet" id="4">
+        <application path="/" applicationPool="DefaultAppPool"><virtualDirectory path="/" physicalPath="C:\inetpub\intranet" /></application>
+        <logFile logFormat="IIS" />
+      </site>
+      <siteDefaults><logFile logFormat="W3C" directory="%SystemDrive%\inetpub\logs\LogFiles" /></siteDefaults>
+    </sites>
+  </system.applicationHost>
+</configuration>
+"@ | Set-Content -LiteralPath $script:AppHost
+            }
+        }
+        It 'finds the Exchange sites from their virtual directories, custom OWA/ECP sites included' {
+            & $script:WriteAppHost
+            $map = & (Get-Module ExchangeLogReport) { param($f) Get-ExlIisSiteMap -Server 'EXCH01' -File $f } $script:AppHost
+            $map.IisFrontEndPath | Should -Be '\\EXCH01\E$\IISLogs\W3SVC1'
+            $map.IisBackEndPath | Should -Be '\\EXCH01\C$\inetpub\logs\LogFiles\W3SVC2'
+            @($map.Custom).Count | Should -Be 1
+            $map.Custom[0].Name | Should -Be 'OWA External'
+            $map.Custom[0].Role | Should -Be 'FrontEnd'
+            $map.Custom[0].Vdirs | Should -Be 'owa, ecp'
+            $map.Custom[0].Folder | Should -Be '\\EXCH01\E$\IISLogs\W3SVC3'
+            $map.Problems | Should -BeNullOrEmpty
+            $iis = & (Get-Module ExchangeLogReport) { param($f) Get-ExlIisLogFolders -Server 'EXCH01' -File $f } $script:AppHost
+            ($iis.Sites | Where-Object Name -eq 'Exchange Back End').Vdirs | Should -Be 'mapi, Microsoft-Server-ActiveSync, Rpc'
+            ($iis.Sites | Where-Object Name -eq 'Intranet').Role | Should -BeNullOrEmpty
+        }
+        It 'reads a custom front-end site with the IIS front end, and writes it to the paths file' {
+            $iis = & (Get-Module ExchangeLogReport) {
+                param($settings)
+                $server = Resolve-ExlServerPaths -Name 'EXCH01' -Discovered @{ IisFrontEndPath = '\\EXCH01\E$\IISLogs\W3SVC1'; IisCustomSites = @(@{ Name = 'OWA External'; Id = '3'; Role = 'FrontEnd'; Vdirs = 'owa, ecp'; Folder = '\\EXCH01\E$\IISLogs\W3SVC3' }) } -Sources $settings.Sources
+                @(Get-ExlSources $server $settings | Where-Object Kind -eq 'Iis')
+            } $script:Paths
+            $iis.Folder | Should -Be @('\\EXCH01\E$\IISLogs\W3SVC1', '\\EXCH01\E$\IISLogs\W3SVC3')
+            $iis[1].Label | Should -Be 'IIS OWA External'
+            $iis[1].Optional | Should -BeTrue
+        }
+        It 'follows an IIS log folder moved since -Mode Discover and reports the change' {
+            & $script:WriteAppHost -DefaultDirectory 'F:\NewIIS' -CustomDirectory 'F:\NewIIS'
+            $r = & (Get-Module ExchangeLogReport) {
+                param($f, $sources)
+                $server = Resolve-ExlServerPaths -Name 'EXCH01' -Discovered @{ IisFrontEndPath = '\\EXCH01\E$\IISLogs\W3SVC1'; IisCustomSites = @(@{ Name = 'OWA External'; Id = '3'; Role = 'FrontEnd'; Vdirs = 'owa, ecp'; Folder = '\\EXCH01\E$\IISLogs\W3SVC3' }, @{ Name = 'Old'; Id = '9'; Role = 'FrontEnd'; Vdirs = 'owa'; Folder = '\\EXCH01\E$\IISLogs\W3SVC9' }) } -Sources $sources
+                [pscustomobject]@{ Notes = @(Test-ExlIisSites -Server $server -File $f); Server = $server }
+            } $script:AppHost $script:Paths.Sources
+            $r.Server.IisFrontEndPath | Should -Be '\\EXCH01\F$\NewIIS\W3SVC1'
+            $r.Server.Origin.IisFrontEndPath | Should -Be 'IIS'
+            $r.Server.IisCustomSites[0].Folder | Should -Be '\\EXCH01\F$\NewIIS\W3SVC3'
+            @($r.Notes | Where-Object Drift).Count | Should -Be 3
+            ($r.Notes.Text -join "`n") | Should -Match '''Default Web Site'' moved to \\\\EXCH01\\F\$\\NewIIS\\W3SVC1'
+            ($r.Notes.Text -join "`n") | Should -Match '''Old'' no longer hosts'
+        }
+        It 'keeps a folder set in the configuration and finds custom sites without -Mode Discover' {
+            & $script:WriteAppHost
+            $r = & (Get-Module ExchangeLogReport) {
+                param($f, $sources)
+                $server = Resolve-ExlServerPaths -Name 'EXCH01' -Configured @{ IisLogPath = 'D:\Copies' } -Sources $sources
+                [pscustomobject]@{ Origin = $server.Origin.IisFrontEndPath; Notes = @(Test-ExlIisSites -Server $server -File $f); Server = $server }
+            } $script:AppHost $script:Paths.Sources
+            $r.Origin | Should -Be 'ConfigurationRoot'
+            $r.Server.IisFrontEndPath | Should -Be 'D:\Copies\W3SVC1'
+            @($r.Notes | Where-Object { $_.Drift -or $_.Status -eq 'Warn' }).Count | Should -Be 0
+            $r.Server.IisCustomSites.Name | Should -Be 'OWA External'
+        }
+        It 'warns about an Exchange site whose logging leaves no W3C file' {
+            & $script:WriteAppHost -NoCustom
+            (Get-Content -LiteralPath $script:AppHost -Raw).Replace('<logFile directory="E:\IISLogs" />', '<logFile directory="E:\IISLogs" logTargetW3C="ETW" />') | Set-Content -LiteralPath $script:AppHost
+            $map = & (Get-Module ExchangeLogReport) { param($f) Get-ExlIisSiteMap -Server 'EXCH01' -File $f } $script:AppHost
+            $map.Problems | Should -HaveCount 1
+            $map.Problems[0] | Should -Match "'Default Web Site' logs to ETW only"
+        }
+    }
+    It 'writes the paths file from the Exchange and IIS settings (-Mode Discover), servers with and without custom sites' {
+        $dir = Join-Path $TestDrive 'discover'
+        [void][IO.Directory]::CreateDirectory($dir)
+        $config = Join-Path $dir 'ExchangeLogReport.config.psd1'
+        $servers = "Servers = @(`r`n        @{ Name = 'EXCH01'; MessageTrackingPath = 'E:\Forced' }`r`n        @{ Name = 'EXCH03' }`r`n    )"
+        [IO.File]::WriteAllText($config, [regex]::Replace([IO.File]::ReadAllText((Join-Path $script:Root 'config\ExchangeLogReport.config.psd1')), "(?ms)^    Servers = @\(.*?^    \)", $servers.Replace('$', '$$')), [Text.UTF8Encoding]::new($true))
+        $before = Import-ExlConfiguration -Path $config -Root $script:Root
+        $before.Servers.Name | Should -Be @('EXCH01', 'EXCH03')
+        Mock -ModuleName ExchangeLogReport Get-ExlExchangeSettings {
+            $default = 'C:\Program Files\Microsoft\Exchange Server\V15'
+            $entry = {
+                param($Name, $Install, $HubReceive, $Tracking, $Off)
+                [pscustomobject]@{ Name = $Name; Version = 'Version 15.2 (Build 2562.17)'; Site = 'PARIS'; DataPath = "$Install\Mailbox"
+                    ImapLogPath = "$Install\Logging\Imap4"; ImapProtocolLog = $false; PopLogPath = "$Install\Logging\Pop3"; PopProtocolLog = $false
+                    FrontEndReceivePath = "$Install\TransportRoles\Logs\FrontEnd\ProtocolLog\SmtpReceive"; FrontEndSendPath = "$Install\TransportRoles\Logs\FrontEnd\ProtocolLog\SmtpSend"
+                    HubReceivePath = $HubReceive; HubSendPath = "$Install\TransportRoles\Logs\Hub\ProtocolLog\SmtpSend"
+                    MailboxReceivePath = "$Install\TransportRoles\Logs\Mailbox\ProtocolLog\SmtpReceive"; MailboxSendPath = "$Install\TransportRoles\Logs\Mailbox\ProtocolLog\SmtpSend"
+                    MessageTrackingPath = $Tracking; MessageTrackingEnabled = $true; LoggingOff = @($Off); Warnings = @() }
+            }
+            [pscustomobject]@{ Method = 'Exchange remote PowerShell (Kerberos)'; Via = 'EXCH01'; Account = 'CONTOSO\svc-elr'; ExchangeCount = 3
+                Servers = @((& $entry 'EXCH01' 'D:\Exchange' 'L:\Logs\Hub\Receive' 'L:\Logs\Tracking' $null),
+                    (& $entry 'EXCH02' $default "$default\TransportRoles\Logs\Hub\ProtocolLog\SmtpReceive" "$default\TransportRoles\Logs\MessageTracking" "receive connector 'Internet'")) }
+        }
+        Mock -ModuleName ExchangeLogReport Get-ExlIisSiteMap {
+            $custom = [Collections.Generic.List[object]]::new()
+            if ($Server -eq 'EXCH01') { $custom.Add([pscustomobject]@{ Name = 'OWA External'; Id = '3'; Role = 'FrontEnd'; Vdirs = 'owa, ecp'; Folder = "\\$Server\E`$\IISLogs\W3SVC3" }) }
+            [pscustomobject]@{ Central = 'Site'; IisFrontEndPath = "\\$Server\E`$\IISLogs\W3SVC1"; IisBackEndPath = "\\$Server\C`$\inetpub\logs\LogFiles\W3SVC2"; Custom = $custom; Problems = [Collections.Generic.List[string]]::new() }
+        }
+        Mock -ModuleName ExchangeLogReport Test-Path { if ($LiteralPath -like '\\EXCH0*') { $false } else { Microsoft.PowerShell.Management\Test-Path @PesterBoundParameters } }
+        $r = Invoke-ExlDiscovery -Settings $before 6>$null
+        $r.Found | Should -Be @('EXCH01', 'EXCH02')
+        $r.NotInConfig | Should -Be @('EXCH02')
+        $r.NotFound | Should -Be @('EXCH03')
+        ($r.Warnings -join "`n") | Should -Match "EXCH02: SMTP protocol logging is off on receive connector 'Internet'"
+        $after = Import-ExlConfiguration -Path $config -Root $script:Root
+        $after.Discovery.By | Should -Be ([Security.Principal.WindowsIdentity]::GetCurrent().Name)
+        $one = $after.Servers[0]
+        $one.ExchangePath | Should -Be '\\EXCH01\D$\Exchange'
+        $one.HttpProxyPath | Should -Be '\\EXCH01\D$\Exchange\Logging\HttpProxy'
+        $one.HubReceivePath | Should -Be '\\EXCH01\L$\Logs\Hub\Receive'
+        $one.Origin.HubReceivePath | Should -Be 'Discover'
+        $one.MessageTrackingPath | Should -Be 'E:\Forced'
+        $one.IisFrontEndPath | Should -Be '\\EXCH01\E$\IISLogs\W3SVC1'
+        $one.IisCustomSites.Name | Should -Be 'OWA External'
+        $one.ImapProtocolLog | Should -BeFalse
+        (Import-PowerShellDataFile -LiteralPath $after.PathsFile).Servers['EXCH02'].Keys | Should -Not -Contain 'IisCustomSites'
+    }
+    It 'flags a source that Exchange writes all the time when its newest file is too old' {
+        & (Get-Module ExchangeLogReport) {
+            param($settings)
+            $proxy = [pscustomobject]@{ Kind = 'HttpProxy' }
+            $tracking = [pscustomobject]@{ Kind = 'Tracking' }
+            $smtp = [pscustomobject]@{ Kind = 'SmtpSend' }
+            $old = [pscustomobject]@{ Total = 3; Newest = [DateTime]::UtcNow.AddDays(-3) }
+            $recent = [pscustomobject]@{ Total = 3; Newest = [DateTime]::UtcNow.AddMinutes(-20) }
+            Test-ExlStaleSource -Source $proxy -Plan $old -Settings $settings | Should -BeLike 'newest file 3 d * old'
+            Test-ExlStaleSource -Source $proxy -Plan $recent -Settings $settings | Should -BeNullOrEmpty
+            Test-ExlStaleSource -Source $proxy -Plan ([pscustomobject]@{ Total = 0; Newest = [DateTime]::MinValue }) -Settings $settings | Should -Be 'no log file'
+            # A server without mail flow writes no SMTP or tracking log for months: not a stale source.
+            Test-ExlStaleSource -Source $tracking -Plan $old -Settings $settings | Should -BeNullOrEmpty
+            Test-ExlStaleSource -Source $smtp -Plan $old -Settings $settings | Should -BeNullOrEmpty
+        } $script:Paths
     }
 }
 

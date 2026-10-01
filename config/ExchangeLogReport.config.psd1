@@ -2,7 +2,7 @@
 #  Exchange Log Report - configuration file
 #  --------------------------------------------------------------------------
 #  Author  : Nicolas Fabert
-#  Version : 1.3.1
+#  Version : 1.4.0
 #
 #  This file is read by Invoke-ExchangeLogReport.ps1. It is a PowerShell data
 #  file: text between quotes, $true / $false, numbers, and @( ) for lists.
@@ -11,17 +11,18 @@
 @{
     # ---------------------------------------------------------------------
     # Exchange servers. One block per server; their data is consolidated in
-    # one database and one report.
-    #   Name          : server name shown in the reports
-    #   ExchangePath  : Exchange installation folder as seen from the collector
-    #                   (default: \\<Name>\c$\Program Files\Microsoft\Exchange Server\V15)
-    #   IisLogPath    : IIS log root (default: \\<Name>\c$\inetpub\logs\LogFiles)
-    # Optional overrides when the logs were moved: HttpProxyPath, LoggingPath (Exchange "Logging"
-    # folder: MapiHttp, Imap4, Pop3), TransportLogPath, MessageTrackingPath (check with
-    # Get-TransportService | fl *LogPath).
-    # The account that runs the tool needs read access to these folders
-    # (members of 'Exchange Trusted Subsystem', such as the computer account of
-    # an Exchange server running the tool as SYSTEM, have it by default).
+    # one database and one report. Usually only Name is needed:
+    #   1. run -Mode Discover once on the collector: it reads the real log folders of
+    #      every server (moved logs, Exchange on another drive...) and writes them to
+    #      ExchangeLogReport.paths.psd1 next to this file;
+    #   2. without that file, the default installation folders on C: are used
+    #      (\\<Name>\c$\Program Files\Microsoft\Exchange Server\V15, \\<Name>\c$\inetpub\logs\LogFiles).
+    # A folder can also be forced here; it wins over Discover:
+    #   HttpProxyPath, MapiHttpPath, ImapLogPath, PopLogPath, IisFrontEndPath, IisBackEndPath (W3SVCn folder),
+    #   FrontEndReceivePath, FrontEndSendPath, HubReceivePath, HubSendPath, MailboxReceivePath,
+    #   MailboxSendPath, MessageTrackingPath; or a root: ExchangePath, IisLogPath, LoggingPath, TransportLogPath.
+    # Account: SYSTEM on an Exchange server, or a domain account that is local administrator of
+    # every Exchange server, plus View-Only Organization Management for -Mode Discover (guide, chapter 4).
     # ---------------------------------------------------------------------
     Servers = @(
         @{ Name = 'EXCH01' }
@@ -34,14 +35,14 @@
     Sources = @{
         HttpProxy       = $true    # Logging\HttpProxy\<protocol>: main source of client access (one line per request)
         IisFrontEnd     = $true    # inetpub\logs\LogFiles\<IisSite>: IIS sub-status/Win32 status of failures, requests rejected before the proxy
-        IisSite         = 'W3SVC1' # Default Web Site (front end). W3SVC2 (Exchange Back End) is server-to-server traffic
+        IisSite         = 'W3SVC1' # Default Web Site (front end) when -Mode Discover has not been run. W3SVC2 (Exchange Back End) is server-to-server traffic
         SmtpReceive     = $true    # TransportRoles\Logs\<role>\ProtocolLog\SmtpReceive (protocol logging must be enabled on the connectors)
         SmtpSend        = $true    # TransportRoles\Logs\<role>\ProtocolLog\SmtpSend
         MessageTracking = $true    # TransportRoles\Logs\MessageTracking\MSGTRK*.log
         TransportRoles  = @('FrontEnd', 'Hub', 'Mailbox')
         MapiBackEnd     = $true    # Logging\MapiHttp\Mailbox: Outlook version and mode, MAPI status codes (an HTTP 200 can hide a MAPI failure)
         EasBackEnd      = $true    # inetpub\logs\LogFiles\<IisBackEndSite>: ActiveSync results hidden behind HTTP 200 (only ActiveSync lines are kept)
-        IisBackEndSite  = 'W3SVC2' # Exchange Back End web site
+        IisBackEndSite  = 'W3SVC2' # Exchange Back End web site when -Mode Discover has not been run
         PopImap         = $false   # Logging\Imap4 and Logging\Pop3 (optional). Needs Set-ImapSettings / Set-PopSettings -ProtocolLogEnabled $true
     }
 
@@ -90,6 +91,10 @@
         # pattern tested on "Protocol|Action|Url" (Outlook NotificationWait, ActiveSync Ping, RPC/HTTP channels...).
         SlowRequestMs          = 5000
         LongRunningPatterns    = @('^Mapi\|NotificationWait\|', '^Eas\|Ping\|', '^RpcHttp\|', '^Owa\|.*(notificationchannel|/ev\.owa)', '^PowerShell\|', '^Imap4\|IDLE\|')
+        # HttpProxy and the IIS front and back end are written all the time by Exchange (health probes): a newest
+        # file older than N hours means that logging stopped or that the logs were moved (0 = no check).
+        # SMTP and message tracking are not checked: a server without mail flow writes nothing there.
+        StaleSourceHours       = 24
     }
 
     # ---------------------------------------------------------------------

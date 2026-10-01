@@ -27,7 +27,7 @@
 
 .NOTES
     Author  : Nicolas Fabert
-    Version : 1.3.1
+    Version : 1.4.0
     PowerShell pitfall: never name a variable $matches — every -match overwrites the automatic
     $Matches, and variable names are case-insensitive.
 #>
@@ -79,6 +79,7 @@ $Icons = @{
     user      = '<circle cx="12" cy="8" r="4"/><path d="M4 21a8 8 0 0 1 16 0"/>'
     server    = '<rect x="4" y="3" width="16" height="7" rx="2"/><rect x="4" y="14" width="16" height="7" rx="2"/><path d="M8 6.5h.01M8 17.5h.01"/>'
     filter    = '<path d="M3 5h18l-7 8v6l-4 2v-8z"/>'
+    folder    = '<path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/>'
 }
 function Get-Icon([string]$Name, [string]$Class = 'icon') {
     $path = $Icons[$Name]; if (-not $path) { $path = $Icons['info'] }

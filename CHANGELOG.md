@@ -3,6 +3,19 @@
 All notable changes are listed here. Versions follow MAJOR.MINOR.PATCH (see the guide, Annex C).
 Author: Nicolas Fabert.
 
+## [1.4.0] — 2026-10-01
+
+### Added
+- **`-Mode Discover`**: finds where every Exchange server really writes its logs — installation folder, SMTP protocol logs per role and direction, message tracking, POP3/IMAP4 — with the Exchange cmdlets run in **Windows PowerShell 5.1** (`src\Get-ExlExchangeSettings.ps1`: Exchange Management Shell on an Exchange server, Exchange remote PowerShell with Kerberos elsewhere, `-ConnectTo`, `-Credential`). *View-Only Organization Management* is enough. Folders on another drive are read through the administrative share of that drive. Every folder is checked from the collector; disabled message tracking, POP/IMAP and SMTP connector logging are reported. Result in `config\ExchangeLogReport.paths.psd1`.
+- **IIS sites from `applicationHost.config`** (`\\<server>\ADMIN$`): log folder, format and target of Default Web Site, Exchange Back End and of every **custom site hosting Exchange virtual directories** (a second OWA/ECP site), recognised from its virtual directories alone. Custom front-end sites are read with the IIS front end, custom back-end sites with ActiveSync with the ActiveSync back end.
+- **Checks at every collection**: `applicationHost.config` is read again, so a moved IIS log folder or a new/removed custom Exchange site is followed at once and reported until `-Mode Discover` records it; an optional folder that does not exist (SMTP, MAPI, POP/IMAP, custom site) is shown as *no folder*; **stale source** warning when HttpProxy or IIS has no file newer than `Collection.StaleSourceHours` (new setting, 24 h). `-Mode Status` flags stale sources too.
+- Per-server path settings for each source (`FrontEndReceivePath`, `HubSendPath`, `IisFrontEndPath`, `MapiHttpPath`...), which win over the paths file; unknown keys in a `Servers` block are rejected.
+
+### Changed
+- Guide chapter 4: where to run the tool and with which account — **SYSTEM on an Exchange server**, or a **domain account local administrator of every Exchange server** (+ View-Only Organization Management for `-Mode Discover`, *Log on as a batch job* on the administration server); why a local account does not work; network flows. Chapter 6.1 rewritten around `-Mode Discover`, chapter 7 with the task of both options, new troubleshooting entries, lab validation 14.2.
+- Exit code 2 now also means a stale source or IIS folders changed since `-Mode Discover`.
+- The console shows where the paths of each server come from (Discover, configuration, defaults).
+
 ## [1.3.1] — 2026-10-01
 
 ### Added

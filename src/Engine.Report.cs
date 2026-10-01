@@ -2,7 +2,7 @@
 //  Exchange Log Report - engine, part 4: report (SQLite -> CSV + HTML)
 // -----------------------------------------------------------------------------
 //  Author  : Nicolas Fabert
-//  Version : 1.3.1
+//  Version : 1.4.0
 //
 //  Datasets (HTML tabs: sessions, issues, users, operations, messages, smtpclients; servers and daily
 //  feed the server cards and the chart; every dataset is also a CSV file)

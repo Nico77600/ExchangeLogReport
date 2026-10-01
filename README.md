@@ -31,8 +31,9 @@ Exchange writes gigabytes of logs per day and per server, and almost none of it 
 </picture>
 
 - **Nothing to install on Exchange.** One collector — an Exchange server running the tool as SYSTEM, or an administration server — reads the log folders of every server over the administrative shares, every hour, and only the **new lines** of each file.
-- **One entry point, one configuration file.** `Invoke-ExchangeLogReport.ps1` collects (`-Mode Collect`), builds a report (`-Range`, `-ReportType`, `-User`, `-Server`) or shows what the database holds (`-Mode Status`).
-- **Read-only** for Exchange: the tool never changes a setting and never sends anything; the reports stay on the local disk.
+- **The real log folders, checked at every run.** `-Mode Discover` asks Exchange where each server really writes its logs — Exchange on another drive, SMTP logs moved per role, message tracking, POP/IMAP — and reads the IIS sites from `applicationHost.config`, including a second OWA/ECP site. Every collection then follows a moved IIS log folder and warns when an expected folder is missing or a source has stopped writing.
+- **One entry point, one configuration file.** `Invoke-ExchangeLogReport.ps1` finds the log folders (`-Mode Discover`), collects (`-Mode Collect`), builds a report (`-Range`, `-ReportType`, `-User`, `-Server`) or shows what the database holds (`-Mode Status`).
+- **Read-only** for Exchange: the tool only reads log files and settings (`Get-*` cmdlets, IIS configuration), never changes a setting and never sends anything; the reports stay on the local disk.
 
 ## Noise removed before storage
 
@@ -91,8 +92,10 @@ Six tabs — **Client sessions**, **Failed and slow requests**, **Users**, **Ope
 | Item | Requirement |
 |---|---|
 | Exchange | Exchange Server SE, on-premises |
-| PowerShell | 7.4 or later — a portable zip is enough |
-| Access | Read access to the log folders of every server. Simplest: run the tool as SYSTEM on an Exchange server (member of *Exchange Trusted Subsystem*) |
+| PowerShell | 7.4 or later — a portable zip is enough. `-Mode Discover` runs the Exchange cmdlets in Windows PowerShell 5.1 (built into Windows Server), since they are not supported in PowerShell 7 |
+| Account | Local administrator of every Exchange server, to read the log folders over the administrative shares. On an Exchange server: SYSTEM (member of *Exchange Trusted Subsystem*), nothing to configure. On an administration server: a domain account, with *Log on as a batch job* on that server ([guide, 4.1](docs/ExchangeLogReport-Guide.md#41-where-to-run-it-and-with-which-account)) |
+| Exchange role | *View-Only Organization Management*, for `-Mode Discover` only — the collection reads files and needs no Exchange role |
+| Network | SMB (445) from the collector to every server; from an administration server, also HTTP (80) to one Exchange server for `-Mode Discover` (remote PowerShell, Kerberos) |
 | Logging | SMTP protocol logging `Verbose` on the connectors to analyse; POP/IMAP protocol logs optional. HTTP Proxy, IIS, MAPI and message tracking logs are on by default |
 | SQLite | Bundled in `lib\sqlite` — nothing to install |
 
@@ -101,9 +104,10 @@ Six tabs — **Client sessions**, **Failed and slow requests**, **Users**, **Ope
 ```powershell
 git clone https://github.com/Nico77600/ExchangeLogReport.git
 cd ExchangeLogReport
-notepad .\config\ExchangeLogReport.config.psd1            # list the Exchange servers
+notepad .\config\ExchangeLogReport.config.psd1            # list the Exchange servers (names only)
 
 .\Invoke-ExchangeLogReport.ps1 -Mode Status               # checks the configuration
+.\Invoke-ExchangeLogReport.ps1 -Mode Discover             # real log folders of every server (View-Only Organization Management)
 .\Invoke-ExchangeLogReport.ps1 -Mode Collect              # first collection, then every hour (scheduled task)
 .\Invoke-ExchangeLogReport.ps1 -Range Last30Days          # usage: which servers are really used, by whom
 .\Invoke-ExchangeLogReport.ps1 -Range Last24Hours -ReportType Detailed -User alice@contoso.com
@@ -113,7 +117,7 @@ The database keeps 60 days of usage and 14 days of detail (client sessions, fail
 
 ## Documentation
 
-The **administrator guide** covers the principles, installation, configuration (servers, sources, noise rules, slow-request threshold, retention), the scheduled collection, how to read each tab of the report, the correlation rules, the data model, volumes, troubleshooting and how to modify the tool:
+The **administrator guide** covers the principles, where to run the tool and with which account, installation, configuration (servers and log folders found by `-Mode Discover`, sources, noise rules, slow-request threshold, retention), the scheduled collection, how to read each tab of the report, the correlation rules, the data model, volumes, troubleshooting and how to modify the tool:
 
 - [docs/ExchangeLogReport-Guide.md](docs/ExchangeLogReport-Guide.md)
 - `docs/ExchangeLogReport-Guide.html` — the same guide as a single HTML file, with a light and a dark theme (download it and open it locally)
@@ -124,7 +128,7 @@ The **administrator guide** covers the principles, installation, configuration (
 Invoke-Pester -Path .\tests      # Pester 5+, logs generated in the exact Exchange formats, no Exchange server needed
 ```
 
-The tool was also validated on a lab of four Exchange Server SE servers (two sites, one DAG) with generated traffic: Outlook, iPhone and Android ActiveSync, OWA, EWS, Outlook for Mac, IMAP, POP, SMTP submission and relay, wrong passwords, blocked devices (guide, chapter 14).
+The tool was also validated on a lab of four Exchange Server SE servers (two sites, one DAG) with generated traffic: Outlook, iPhone and Android ActiveSync, OWA, EWS, Outlook for Mac, IMAP, POP, SMTP submission and relay, wrong passwords, blocked devices; and with a collector on an administration server, log folders moved to another drive and a second OWA/ECP web site (guide, chapter 14).
 
 ## License
 
