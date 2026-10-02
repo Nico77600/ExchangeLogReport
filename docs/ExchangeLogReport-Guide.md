@@ -3,10 +3,12 @@ title: Exchange Log Report
 subtitle: Administrator guide
 version: 1.4.0
 author: Nicolas Fabert
-updated: 2026-10-01
+updated: 2026-10-02
 ---
 
 # Exchange Log Report — Administrator guide
+
+> A modern Log Parser for **Exchange Server SE on-premises**: it reads the IIS / HTTP Proxy, MAPI, ActiveSync, POP/IMAP, SMTP and message tracking logs of several servers, removes the noise **before** storage, and answers two questions — **is this server really used?** and **what happened to this user, this client or this message?**
 
 > [!IMPORTANT]
 > Files downloaded from the Internet may be blocked by Windows and fail to run. Before using this project, unblock every file in the downloaded folder:
@@ -16,8 +18,6 @@ updated: 2026-10-01
 > ```
 >
 > Replace the example path with the folder where you downloaded or extracted this project.
-
-> A modern Log Parser for **Exchange Server SE on-premises**: it reads the IIS / HTTP Proxy, MAPI, ActiveSync, POP/IMAP, SMTP and message tracking logs of several servers, removes the noise **before** storage, and answers two questions — **is this server really used?** and **what happened to this user, this client or this message?**
 
 ```cards
 target | What it answers | Which servers are really used, by whom, with which clients; why a user, a device or a message had a problem.
