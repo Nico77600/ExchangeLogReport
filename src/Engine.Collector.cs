@@ -2,7 +2,7 @@
 //  Exchange Log Report - engine, part 3: collector (log files -> SQLite)
 // -----------------------------------------------------------------------------
 //  Author  : Nicolas Fabert
-//  Version : 1.4.0
+//  Version : 1.6.1
 //
 //  One call of ProcessFile reads the new part of one log file, keeps the lines of
 //  real users / real messages, counts the others by reason ("noise"), and saves

@@ -1,4 +1,5 @@
 #Requires -Version 7.4
+
 <#
 .SYNOPSIS
     Exchange Log Report - usage and troubleshooting reports from the IIS / HTTP Proxy, SMTP
@@ -22,6 +23,10 @@
     Everything is set in config\ExchangeLogReport.config.psd1. The tool only reads the
     Exchange logs: it never changes any Exchange setting and never sends anything.
 
+    Edge Transport servers (detected, or Role = 'Edge' in the Servers block): only their SMTP
+    protocol logs and message tracking are read, without IIS, HttpProxy, MAPI, ActiveSync, POP3 or IMAP4.
+    Run the tool on the Edge itself (SYSTEM or a local administrator).
+
 .PARAMETER Mode
     Report  (default) Collects what is new, then writes the report.
     Collect           Collects what is new (scheduled task). No report.
@@ -34,17 +39,37 @@
                       on the collector with an administrator account (SYSTEM has no Exchange role), and
                       again after a CU or a change of the log paths.
                       Every collection checks the IIS sites again and follows a moved IIS log folder.
+                      On an Edge Transport server: its local Exchange Management Shell (SYSTEM is
+                      accepted), SMTP log folders and message tracking only.
 
 .PARAMETER Range
-    Period of the report. Default: Report.DefaultRange.
+    Period of the report (-Mode Report). Default: Report.DefaultRange.
       Last24Hours, Last7Days, Last30Days : rolling windows ending now
       PreviousMonth                      : the previous calendar month
       Month  -Month 2026-09              : a calendar month
       Day    -Date 2026-09-28            : a calendar day
       Custom -Start '2026-09-01 08:00' -End '2026-09-01 12:00'
+    -Month, -Date and -Start / -End select their range on their own: -Range can be left out. They cannot be
+    combined with each other (parameter sets) nor with another -Range (error). A collection, -Mode Status and
+    -Mode Discover do not use a period: a period given with them is reported as ignored, with the reason.
+
+.PARAMETER Month
+    Calendar month of the report, yyyy-MM (-Range Month).
+
+.PARAMETER Date
+    Calendar day of the report, yyyy-MM-dd (-Range Day).
+
+.PARAMETER Start
+    Start of a custom period, included (-Range Custom, with -End): yyyy-MM-dd or 'yyyy-MM-dd HH:mm' in the
+    time zone of the report (Report.TimeZone), or an ISO 8601 value with an offset.
+
+.PARAMETER End
+    End of a custom period, excluded (-Range Custom, with -Start). Same formats as -Start; a time later
+    than now is replaced by now.
 
 .PARAMETER ReportType
-    Usage (default from the configuration) or Detailed.
+    Usage (default from the configuration) or Detailed. When every server of the report is an Edge
+    Transport server, the report is an Edge report: mail flow only (messages, SMTP clients, SMTP destinations).
 
 .PARAMETER User
     One or more users (part of domain\sam, UPN or SMTP address). Filters every view; with
@@ -86,23 +111,38 @@
     .\Invoke-ExchangeLogReport.ps1 -Range Day -Date 2026-09-30 -ReportType Detailed -User alice@contoso.com
     Everything about one user on one day: requests, failures, messages and their route.
 
+.EXAMPLE
+    .\Invoke-ExchangeLogReport.ps1 -Start '2026-10-01 08:00' -End '2026-10-01 12:00' -ReportType Detailed -NoCollect
+    An incident window (custom period, -Range Custom is implied) from the data already collected.
+
 .NOTES
     Author  : Nicolas Fabert
-    Version : 1.4.0
+    Version : 1.6.1
     Exit codes : 0 = success, 1 = failure, 2 = finished with warnings (a server, a folder or a file could not
                  be read, a source is stale, or the IIS log folders changed since -Mode Discover).
-    Documentation : docs\ExchangeLogReport-Guide.html (source: docs\ExchangeLogReport-Guide.md)
+    Documentation : docs\ExchangeLogReport-UserGuide.html (user guide: prerequisites, everyday commands) and
+                    docs\ExchangeLogReport-Guide.html (developer guide); sources: docs\*.md
 #>
-[CmdletBinding()]
+[CmdletBinding(DefaultParameterSetName = 'Range')]
 param(
+    [Parameter(Position = 0)]
     [ValidateSet('Report', 'Collect', 'Status', 'Discover')]
     [string]$Mode = 'Report',
 
+    # Period of the report: one parameter set per kind of period, so that a period parameter is never ignored.
+    [Parameter(ParameterSetName = 'Range', Position = 1)]
+    [Parameter(ParameterSetName = 'Month', Position = 1)]
+    [Parameter(ParameterSetName = 'Day', Position = 1)]
+    [Parameter(ParameterSetName = 'Custom', Position = 1)]
     [ValidateSet('Last24Hours', 'Last7Days', 'Last30Days', 'PreviousMonth', 'Month', 'Day', 'Custom')]
     [string]$Range,
+    [Parameter(ParameterSetName = 'Month', Mandatory)]
     [string]$Month,
+    [Parameter(ParameterSetName = 'Day', Mandatory)]
     [string]$Date,
+    [Parameter(ParameterSetName = 'Custom', Mandatory)]
     [string]$Start,
+    [Parameter(ParameterSetName = 'Custom', Mandatory)]
     [string]$End,
 
     [ValidateSet('Usage', 'Detailed')]
@@ -135,7 +175,10 @@ try {
 
         # ---- configuration, then command-line overrides -------------------------------------------
         $settings = Import-ExlConfiguration -Path $ConfigPath -Root $PSScriptRoot
-        if (-not $Range) { $Range = $settings.Report.DefaultRange }
+        # -Start / -End, -Month and -Date select their range on their own; with another -Range they are an error.
+        if ($Mode -eq 'Report') { $Range = Resolve-ExlRange -Range $Range -Month $Month -Date $Date -Start $Start -End $End -Default $settings.Report.DefaultRange }
+        # Parameters that this mode does not use: shown after the banner with the reason, never ignored silently.
+        $ignored = @(Get-ExlIgnoredParameter -Mode $Mode -Name @($PSBoundParameters.Keys))
         if (-not $ReportType) { $ReportType = $settings.Report.DefaultType }
         if ($PSBoundParameters.ContainsKey('IncludeRoutingDetails')) { $settings.Report.IncludeRoutingDetails = [bool]$IncludeRoutingDetails }
         if ($PSBoundParameters.ContainsKey('IncludeSessionDetails')) { $settings.Report.IncludeSessionDetails = [bool]$IncludeSessionDetails }
@@ -160,9 +203,13 @@ try {
             $banner['Paths'] = @('File', $settings.PathsFile)
             $banner['Log'] = @('Log', $logPath)
             Write-ExlBanner -Title 'Exchange Log Report' -Subtitle "Exchange Server SE $dot discovery of the log folders" -Details $banner
+            foreach ($n in $ignored) { Write-ExlItem Warn $n }
             $found = Invoke-ExlDiscovery -Settings $settings -ConnectTo $ConnectTo -Credential $Credential
             $values = [ordered]@{}
-            $values['Servers'] = @('Server', ("{0} mailbox server(s): {1}" -f $found.Found.Count, ($found.Found -join ', ')))
+            $mailbox = @($found.Found | Where-Object { $_ -notin $found.Edge })
+            $text = @(if ($mailbox.Count) { "{0} mailbox server(s): {1}" -f $mailbox.Count, ($mailbox -join ', ') }
+                if ($found.Edge.Count) { "{0} Edge Transport server(s): {1}" -f $found.Edge.Count, ($found.Edge -join ', ') }) -join " $dot "
+            $values['Servers'] = @('Server', $text)
             if ($found.NotInConfig.Count) { $values['Add'] = @('Info', ("not in the configuration: " + (($found.NotInConfig | ForEach-Object { "@{ Name = '$_' }" }) -join ' '))) }
             if ($found.NotFound.Count) { $values['Unknown'] = @('Warn', ("in the configuration but not found in Exchange: " + ($found.NotFound -join ', '))) }
             $values['Warnings'] = @($(if ($found.Warnings.Count) { 'Warn' } else { 'Ok' }), $(if ($found.Warnings.Count) { "$($found.Warnings.Count) (see above and the log file)" } else { 'none' }))
@@ -178,7 +225,7 @@ try {
         $totalSteps = switch ($Mode) { 'Status' { 2 } 'Collect' { 4 } default { if ($collecting) { 5 } else { 2 } } }
         $period = if ($Mode -eq 'Report') { Resolve-ExlPeriod -Range $Range -Month $Month -Date $Date -Start $Start -End $End -Zone $zone }
         $banner = [ordered]@{}
-        $banner['Mode'] = @('Info', $Mode + $(if ($period) { " $dot $ReportType $dot $Range" } else { '' }))
+        $banner['Mode'] = @('Info', ($Mode + $(if ($period) { " $dot $ReportType $dot $Range" } else { '' })))
         if ($period) { $banner['Period'] = @('Calendar', "$(Format-ExlRange $period.StartMs $period.EndMs $zone)  ($($settings.Report.TimeZone), end excluded)") }
         $banner['Servers'] = @('Server', ($servers.Name -join ', '))
         if ($User) { $banner['Users'] = @('People', ($User -join ', ')) }
@@ -186,6 +233,7 @@ try {
         $banner['Paths'] = @('Folder', $(if ($settings.Discovery) { "found by -Mode Discover on $($settings.Discovery.When.Substring(0, [Math]::Min(16, $settings.Discovery.When.Length)).Replace('T', ' '))" } else { 'default folders (run -Mode Discover to check them)' }))
         $banner['Log'] = @('Log', $logPath)
         Write-ExlBanner -Title 'Exchange Log Report' -Subtitle "Exchange Server SE $dot usage and troubleshooting from the server logs" -Details $banner
+        foreach ($n in $ignored) { Write-ExlItem Warn $n }
         if ($settings.Discovery -and $settings.Discovery.Collector -and $settings.Discovery.Collector -ne [Environment]::MachineName.ToUpperInvariant()) {
             Write-ExlItem Warn "The paths file was written on $($settings.Discovery.Collector): run -Mode Discover on this computer."
         }
@@ -223,13 +271,21 @@ try {
         $incomplete = $false
         if ($collecting) {
             $step++
-            Write-ExlStep $step $totalSteps 'Checking access to the servers and their IIS log folders' -Icon Server
+            Write-ExlStep $step $totalSteps 'Checking access to the servers and their log folders' -Icon Server
             $here = [Environment]::MachineName.ToUpperInvariant()
             foreach ($s in $servers) {
-                # The IIS settings are read at every collection: a log folder moved since -Mode Discover is followed.
-                $notes = @(Test-ExlIisSites -Server $s -Local:($s.Name -eq $here))
-                foreach ($n in $notes) { Write-ExlItem $n.Status "$($s.Name): $($n.Text)" }
-                if (@($notes | Where-Object { $_.Drift -or $_.Status -eq 'Warn' }).Count) { $incomplete = $true }
+                $local = $s.Name -eq $here
+                if ((Resolve-ExlServerRole -Server $s -Local:$local) -eq 'Edge') {
+                    # Edge Transport: no IIS, HttpProxy, MAPI, ActiveSync, POP3 or IMAP4 to check or read.
+                    $how = @{ Configuration = 'set in the configuration'; Discover = 'recorded by -Mode Discover'; Detected = 'detected' }[$s.RoleOrigin]
+                    Write-ExlItem Info "$($s.Name): Edge Transport server ($how): SMTP protocol logs and message tracking only." -Icon Server
+                }
+                else {
+                    # The IIS settings are read at every collection: a log folder moved since -Mode Discover is followed.
+                    $notes = @(Test-ExlIisSites -Server $s -Local:$local)
+                    foreach ($n in $notes) { Write-ExlItem $n.Status "$($s.Name): $($n.Text)" }
+                    if (@($notes | Where-Object { $_.Drift -or $_.Status -eq 'Warn' }).Count) { $incomplete = $true }
+                }
                 $problems = @(Test-ExlServerAccess -Server $s -Settings $settings)
                 if ($problems.Count) { foreach ($p in $problems) { Write-ExlItem Warn "$($s.Name): $p" }; $incomplete = $true }
                 else { Write-ExlItem Ok "$($s.Name): log folders readable ($(Get-ExlPathOrigin $s))" }
@@ -268,6 +324,12 @@ try {
 
         # ---- last step: report ------------------------------------------------------------------------
         $step++
+        if (-not $collecting) {
+            # Role of each server (an Edge report has its own layout); the collection has already resolved it.
+            # Without collection the servers are not contacted: the role comes from the data already collected.
+            $here = [Environment]::MachineName.ToUpperInvariant()
+            foreach ($s in $servers) { [void](Resolve-ExlServerRole -Server $s -Local:($s.Name -eq $here) -Store $store) }
+        }
         Write-ExlStep $step $totalSteps "Building the $($ReportType.ToLowerInvariant()) report" -Icon Report
         $report = New-ExlReport -Store $store -Settings $settings -Period $period -ReportType $ReportType -User $User -Server $Server -IncludeRoutingDetails $settings.Report.IncludeRoutingDetails -IncludeSessionDetails $settings.Report.IncludeSessionDetails
         foreach ($f in $report.Files) { Write-ExlItem Ok ("{0}  {1} rows {2} {3}" -f (Split-Path $f.Path -Leaf), (Format-ExlNumber $f.Rows), $dot, (Format-ExlBytes $f.Bytes)) -Icon File }
@@ -276,14 +338,21 @@ try {
             $runId = $null
         }
         $c = $report.Counts
+        $edgeReport = $c.ContainsKey('smtpdestinations')
         $values = [ordered]@{}
         $values['Period'] = @('Calendar', (Format-ExlRange $period.StartMs $period.EndMs $zone))
-        $values['Servers'] = @('Server', ("{0} in the report" -f (Format-ExlNumber $c['servers'])))
-        $values['Users'] = @('People', ("{0} real user(s)" -f (Format-ExlNumber $c['users'])))
-        if ($ReportType -eq 'Detailed') {
-            $values['Sessions'] = @('People', ("{0} client session(s) {1} {2} with failures" -f (Format-ExlNumber $c['sessions']), $dot, (Format-ExlNumber $c['sessionsWithFailures'])))
-            $values['Issues'] = @('Warn', ("{0} failed or slow request(s) kept" -f (Format-ExlNumber $c['issues'])))
-            $values['Messages'] = @('Mail', ("{0} message(s) {1} {2} SMTP transaction(s) from {3} SMTP client(s)" -f (Format-ExlNumber $c['messages']), $dot, (Format-ExlNumber $c['smtp']), (Format-ExlNumber $c['smtpclients'])))
+        $values['Servers'] = @('Server', ("{0} in the report{1}" -f (Format-ExlNumber $c['servers']), $(if ($edgeReport) { " $dot Edge Transport (mail flow only)" } else { '' })))
+        if ($edgeReport) {
+            $values['Clients'] = @('Mail', ("{0} SMTP client(s) {1} {2} SMTP destination(s)" -f (Format-ExlNumber $c['smtpclients']), $dot, (Format-ExlNumber $c['smtpdestinations'])))
+            if ($ReportType -eq 'Detailed') { $values['Messages'] = @('Mail', ("{0} message(s) {1} {2} SMTP transaction(s)" -f (Format-ExlNumber $c['messages']), $dot, (Format-ExlNumber $c['smtp']))) }
+        }
+        else {
+            $values['Users'] = @('People', ("{0} real user(s)" -f (Format-ExlNumber $c['users'])))
+            if ($ReportType -eq 'Detailed') {
+                $values['Sessions'] = @('People', ("{0} client session(s) {1} {2} with failures" -f (Format-ExlNumber $c['sessions']), $dot, (Format-ExlNumber $c['sessionsWithFailures'])))
+                $values['Issues'] = @('Warn', ("{0} failed or slow request(s) kept" -f (Format-ExlNumber $c['issues'])))
+                $values['Messages'] = @('Mail', ("{0} message(s) {1} {2} SMTP transaction(s) from {3} SMTP client(s)" -f (Format-ExlNumber $c['messages']), $dot, (Format-ExlNumber $c['smtp']), (Format-ExlNumber $c['smtpclients'])))
+            }
         }
         $values['Folder'] = @('Folder', $report.Folder)
         if ($report.HtmlPath) { $values['Open'] = @('Report', $report.HtmlPath) }

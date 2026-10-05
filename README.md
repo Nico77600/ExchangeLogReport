@@ -11,7 +11,8 @@
   <a href="#sessions-and-messages"><b>Sessions and messages</b></a> &nbsp;&middot;&nbsp;
   <a href="#reports"><b>Reports</b></a> &nbsp;&middot;&nbsp;
   <a href="#quick-start"><b>Quick start</b></a> &nbsp;&middot;&nbsp;
-  <a href="docs/ExchangeLogReport-Guide.md"><b>Administrator guide</b></a>
+  <a href="docs/ExchangeLogReport-UserGuide.md"><b>User guide</b></a> &nbsp;&middot;&nbsp;
+  <a href="docs/ExchangeLogReport-Guide.md"><b>Developer guide</b></a>
 </p>
 
 > [!IMPORTANT]
@@ -41,7 +42,8 @@ Exchange writes gigabytes of logs per day and per server, and almost none of it 
 
 - **Nothing to install on Exchange.** One collector — an Exchange server running the tool as SYSTEM, or an administration server — reads the log folders of every server over the administrative shares, every hour, and only the **new lines** of each file.
 - **The real log folders, checked at every run.** `-Mode Discover` asks Exchange where each server really writes its logs — Exchange on another drive, SMTP logs moved per role, message tracking, POP/IMAP — and reads the IIS sites from `applicationHost.config`, including a second OWA/ECP site. Every collection then follows a moved IIS log folder and warns when an expected folder is missing or a source has stopped writing.
-- **One entry point, one configuration file.** `Invoke-ExchangeLogReport.ps1` finds the log folders (`-Mode Discover`), collects (`-Mode Collect`), builds a report (`-Range`, `-ReportType`, `-User`, `-Server`) or shows what the database holds (`-Mode Status`).
+- **One entry point, one configuration file.** `Invoke-ExchangeLogReport.ps1` finds the log folders (`-Mode Discover`), collects (`-Mode Collect`), builds a report (`-Range`, `-Date`, `-Month`, `-Start` / `-End`, `-ReportType`, `-User`, `-Server`) or shows what the database holds (`-Mode Status`). No parameter is ignored silently: a period that contradicts another is an error, and a parameter that the mode does not use is shown with the reason.
+- **Edge Transport servers too.** Run on the Edge itself, the tool reads only its SMTP protocol logs and message tracking, and builds an **Edge report**: messages, SMTP clients (who sends to the Edge) and SMTP destinations (Exchange Online, internet MX, the mailbox servers).
 - **Read-only** for Exchange: the tool only reads log files and settings (`Get-*` cmdlets, IIS configuration), never changes a setting and never sends anything; the reports stay on the local disk.
 
 ## Noise removed before storage
@@ -68,7 +70,7 @@ The 1–3 GB of logs per day and server of a production environment never reach 
 
 ## Reports
 
-Six tabs — **Client sessions**, **Failed and slow requests**, **Users**, **Operations**, **Messages**, **SMTP clients** — with search, filters, sortable columns and export, up to hundreds of thousands of rows. Every report also writes complete CSV files. Click a screenshot to open it at full size.
+Six tabs — **Client sessions**, **Failed and slow requests**, **Users**, **Operations**, **Messages**, **SMTP clients** — with search, filters, sortable columns and export, up to hundreds of thousands of rows. On an Edge Transport server, the report shows the mail flow only: **Messages**, **SMTP clients** and **SMTP destinations**. Every report also writes complete CSV files. Click a screenshot to open it at full size.
 
 **Overview** · which servers are really used, by whom, with which protocols
 
@@ -102,10 +104,11 @@ Six tabs — **Client sessions**, **Failed and slow requests**, **Users**, **Ope
 |---|---|
 | Exchange | Exchange Server SE, on-premises |
 | PowerShell | 7.4 or later — a portable zip is enough. `-Mode Discover` runs the Exchange cmdlets in Windows PowerShell 5.1 (built into Windows Server), since they are not supported in PowerShell 7 |
-| Account | Local administrator of every Exchange server, to read the log folders over the administrative shares. On an Exchange server: SYSTEM (member of *Exchange Trusted Subsystem*), nothing to configure. On an administration server: a domain account, with *Log on as a batch job* on that server ([guide, 4.1](docs/ExchangeLogReport-Guide.md#41-where-to-run-it-and-with-which-account)) |
+| Account | Local administrator of every Exchange server, to read the log folders over the administrative shares. On an Exchange server: SYSTEM (member of *Exchange Trusted Subsystem*), nothing to configure. On an administration server: a domain account, with *Log on as a batch job* on that server ([developer guide, 4.1](docs/ExchangeLogReport-Guide.md#41-where-to-run-it-and-with-which-account)) |
 | Exchange role | *View-Only Organization Management*, for `-Mode Discover` only — the collection reads files and needs no Exchange role |
 | Network | SMB (445) from the collector to every server; from an administration server, also HTTP (80) to one Exchange server for `-Mode Discover` (remote PowerShell, Kerberos) |
 | Logging | SMTP protocol logging `Verbose` on the connectors to analyse; POP/IMAP protocol logs optional. HTTP Proxy, IIS, MAPI and message tracking logs are on by default |
+| Edge Transport | Its own copy of the tool on the Edge itself, as SYSTEM or a local administrator |
 | SQLite | Bundled in `lib\sqlite` — nothing to install |
 
 ## Quick start
@@ -120,16 +123,21 @@ notepad .\config\ExchangeLogReport.config.psd1            # list the Exchange se
 .\Invoke-ExchangeLogReport.ps1 -Mode Collect              # first collection, then every hour (scheduled task)
 .\Invoke-ExchangeLogReport.ps1 -Range Last30Days          # usage: which servers are really used, by whom
 .\Invoke-ExchangeLogReport.ps1 -Range Last24Hours -ReportType Detailed -User alice@contoso.com
+.\Invoke-ExchangeLogReport.ps1 -Start '2026-10-05 08:00' -End '2026-10-05 12:00' -ReportType Detailed -NoCollect
 ```
 
-The database keeps 60 days of usage and 14 days of detail (client sessions, failed and slow requests, SMTP transcripts). The zip of each [release](https://github.com/Nico77600/ExchangeLogReport/releases) contains only the files needed to run; `.\tools\New-ExchangeLogReportPackage.ps1` builds the same package from the repository.
+One command per everyday question — unused server, user problem, missing message, incident, monthly review, Edge: see the [user guide](docs/ExchangeLogReport-UserGuide.md).
+
+The database keeps 60 days of usage and 14 days of detail (client sessions, failed and slow requests, SMTP transcripts). The zip of each [release](https://github.com/Nico77600/ExchangeLogReport/releases) contains only the files needed to run, with both guides in HTML; `.\tools\New-ExchangeLogReportPackage.ps1` builds the same package from the repository.
 
 ## Documentation
 
-The **administrator guide** covers the principles, where to run the tool and with which account, installation, configuration (servers and log folders found by `-Mode Discover`, sources, noise rules, slow-request threshold, retention), the scheduled collection, how to read each tab of the report, the correlation rules, the data model, volumes, troubleshooting and how to modify the tool:
+| Guide | Content |
+|---|---|
+| **[User guide](docs/ExchangeLogReport-UserGuide.md)** | For the people who run the reports: **prerequisites** and **everyday commands only** — is this server still used, what happened to this user, where did this message go, what failed during this incident, is the collection working. |
+| **[Developer guide](docs/ExchangeLogReport-Guide.md)** | Everything else: the principles, where to run the tool and with which account, installation, configuration (servers and log folders found by `-Mode Discover`, sources, noise rules, slow-request threshold, retention), the scheduled collection, how to read each tab of the report, the correlation rules, the data model, volumes, troubleshooting, how to modify and validate the tool. |
 
-- [docs/ExchangeLogReport-Guide.md](docs/ExchangeLogReport-Guide.md)
-- `docs/ExchangeLogReport-Guide.html` — the same guide as a single HTML file, with a light and a dark theme (download it and open it locally)
+Both guides also exist as a single HTML file with a light and a dark theme (`docs/ExchangeLogReport-UserGuide.html`, `docs/ExchangeLogReport-Guide.html`): download them and open them locally, or use the copies in the release zip.
 
 ## Tests
 
@@ -137,7 +145,7 @@ The **administrator guide** covers the principles, where to run the tool and wit
 Invoke-Pester -Path .\tests      # Pester 5+, logs generated in the exact Exchange formats, no Exchange server needed
 ```
 
-The tool was also validated on a lab of four Exchange Server SE servers (two sites, one DAG) with generated traffic: Outlook, iPhone and Android ActiveSync, OWA, EWS, Outlook for Mac, IMAP, POP, SMTP submission and relay, wrong passwords, blocked devices; and with a collector on an administration server, log folders moved to another drive and a second OWA/ECP web site (guide, chapter 14).
+The tool was also validated on a lab of four Exchange Server SE servers (two sites, one DAG) and an Edge Transport server with generated traffic: Outlook, iPhone and Android ActiveSync, OWA, EWS, Outlook for Mac, IMAP, POP, SMTP submission and relay, wrong passwords, blocked devices, internet mail through the Edge; and with a collector on an administration server, log folders moved to another drive and a second OWA/ECP web site (developer guide, chapter 14).
 
 ## License
 

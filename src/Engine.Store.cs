@@ -2,11 +2,12 @@
 //  Exchange Log Report - engine, part 2: SQLite store
 // -----------------------------------------------------------------------------
 //  Author  : Nicolas Fabert
-//  Version : 1.4.0
+//  Version : 1.6.1
 //
 //  Tables (all times in Unix ms, UTC)
 //    run              one row per execution
-//    source_file      read position of every log file (server, kind, path) -> offset
+//    source_file      read position of every log file (server, kind, file_key) -> offset; file_key is the
+//                     identity of the file whatever the path used to reach it (see FileKey)
 //    noise            lines set aside per execution, server, kind and reason
 //    access_usage     client access, one row per day x server x user x protocol (aggregate)
 //    access_action    client access, one row per day x server x protocol x action (latency per operation)
@@ -50,7 +51,7 @@ namespace ExchangeLogReport
 
     public sealed class Store : IDisposable
     {
-        public const string SchemaVersion = "2";
+        public const string SchemaVersion = "3";
         readonly SqliteConnection _db;
         public string FilePath { get; private set; }
         public bool ReadOnly { get; private set; }
@@ -107,7 +108,7 @@ CREATE TABLE IF NOT EXISTS source_file(
   id INTEGER PRIMARY KEY, server TEXT NOT NULL, kind TEXT NOT NULL, path TEXT NOT NULL,
   offset INTEGER NOT NULL DEFAULT 0, size INTEGER NOT NULL DEFAULT 0, last_write_ms INTEGER, fields TEXT,
   first_ms INTEGER, last_ms INTEGER, lines INTEGER NOT NULL DEFAULT 0, kept INTEGER NOT NULL DEFAULT 0,
-  noise INTEGER NOT NULL DEFAULT 0, updated_ms INTEGER, UNIQUE(server, kind, path));
+  noise INTEGER NOT NULL DEFAULT 0, updated_ms INTEGER, file_key TEXT, UNIQUE(server, kind, path));
 CREATE TABLE IF NOT EXISTS noise(
   run_id INTEGER NOT NULL, server TEXT NOT NULL, kind TEXT NOT NULL, reason TEXT NOT NULL, lines INTEGER NOT NULL,
   PRIMARY KEY(run_id, server, kind, reason)) WITHOUT ROWID;
@@ -191,6 +192,55 @@ CREATE INDEX IF NOT EXISTS ix_step_session ON session_step(session_id, time_ms);
             using (var c = Command("PRAGMA table_info(access_usage);"))
             using (var r = c.ExecuteReader()) while (r.Read()) columns.Add(r.GetString(1));
             if (!columns.Contains("slow")) Exec("ALTER TABLE access_usage ADD COLUMN slow INTEGER NOT NULL DEFAULT 0;");
+
+            // 1.5.1: identity of a log file (file_key). Files read before are keyed from their path; when the same
+            // file was read through two paths (administrative share, then local path), the row read last keeps
+            // the key and the others are left without key: never matched again, removed by the retention.
+            columns.Clear();
+            using (var c = Command("PRAGMA table_info(source_file);"))
+            using (var r = c.ExecuteReader()) while (r.Read()) columns.Add(r.GetString(1));
+            if (!columns.Contains("file_key"))
+            {
+                Exec("ALTER TABLE source_file ADD COLUMN file_key TEXT;");
+                var rows = new List<object[]>();
+                using (var c = Command("SELECT id, server, kind, path FROM source_file ORDER BY COALESCE(updated_ms, 0) DESC, id DESC;"))
+                using (var r = c.ExecuteReader()) while (r.Read()) rows.Add(new object[] { r.GetInt64(0), r.GetString(1), r.GetString(2), r.GetString(3) });
+                var seen = new HashSet<string>(StringComparer.Ordinal);
+                using (var tx = Begin())
+                using (var c = Command("UPDATE source_file SET file_key=@k WHERE id=@id;", tx))
+                {
+                    var key = c.Parameters.Add("@k", SqliteType.Text);
+                    var id = c.Parameters.Add("@id", SqliteType.Integer);
+                    foreach (var row in rows)
+                    {
+                        string k = FileKey((string)row[1], (string)row[3]);
+                        if (!seen.Add((string)row[1] + "|" + (string)row[2] + "|" + k)) continue;
+                        key.Value = k; id.Value = row[0];
+                        c.ExecuteNonQuery();
+                    }
+                    tx.Commit();
+                }
+            }
+            Exec("CREATE UNIQUE INDEX IF NOT EXISTS ux_source_file_key ON source_file(server, kind, file_key);");
+        }
+
+        static readonly System.Text.RegularExpressions.Regex AdminShareRx =
+            new System.Text.RegularExpressions.Regex(@"^\\\\([^\\]+)\\([A-Za-z])\$(\\.*)?$", System.Text.RegularExpressions.RegexOptions.Compiled);
+
+        /// <summary>
+        /// Identity of a log file whatever the path used to reach it: a path through the administrative share of
+        /// its own server (\\EXCH01\D$\Logs\x.log) is the local path on that server (D:\Logs\x.log), and the case
+        /// is ignored (Windows paths). The collector reads a file through its share until -Mode Discover writes
+        /// its local path, and Exchange may return a folder in another case: the file is not read twice.
+        /// </summary>
+        public static string FileKey(string server, string path)
+        {
+            if (string.IsNullOrEmpty(path)) return path;
+            string p = path.Trim();
+            var m = AdminShareRx.Match(p);
+            if (m.Success && string.Equals(m.Groups[1].Value.Split('.')[0], (server ?? "").Split('.')[0], StringComparison.OrdinalIgnoreCase))
+                p = m.Groups[2].Value + ":" + (m.Groups[3].Success && m.Groups[3].Length > 0 ? m.Groups[3].Value : "\\");
+            return p.ToUpperInvariant();
         }
 
         internal SqliteConnection Connection { get { return _db; } }
@@ -291,11 +341,12 @@ CREATE INDEX IF NOT EXISTS ix_step_session ON session_step(session_id, time_ms);
 
         // ---------------------------------------------------------------- files
 
+        /// <summary>Read position of a file, found by its identity (FileKey): Path stays the path used now.</summary>
         public FileState GetFile(string server, string kind, string path)
         {
-            using (var c = Command("SELECT id,offset,size,last_write_ms,fields,first_ms,last_ms,lines,kept,noise FROM source_file WHERE server=@s AND kind=@k AND path=@p;"))
+            using (var c = Command("SELECT id,offset,size,last_write_ms,fields,first_ms,last_ms,lines,kept,noise FROM source_file WHERE server=@s AND kind=@k AND file_key=@fk;"))
             {
-                c.Parameters.AddWithValue("@s", server); c.Parameters.AddWithValue("@k", kind); c.Parameters.AddWithValue("@p", path);
+                c.Parameters.AddWithValue("@s", server); c.Parameters.AddWithValue("@k", kind); c.Parameters.AddWithValue("@fk", FileKey(server, path));
                 using (var r = c.ExecuteReader())
                 {
                     if (!r.Read()) return null;
@@ -311,14 +362,14 @@ CREATE INDEX IF NOT EXISTS ix_step_session ON session_step(session_id, time_ms);
         }
 
         /// <summary>
-        /// Read position of all known files of a server (lets PowerShell skip unchanged files quickly). A file
-        /// whose position is before its end (an SMTP, IMAP or POP session still open when it was read) is
-        /// read again even if it did not grow: once the file is idle, the held session is written.
+        /// Read position of all known files of a server, keyed "kind|FileKey" (lets PowerShell skip unchanged
+        /// files quickly). A file whose position is before its end (an SMTP, IMAP or POP session still open when
+        /// it was read) is read again even if it did not grow: once the file is idle, the held session is written.
         /// </summary>
         public Dictionary<string, long> KnownOffsets(string server)
         {
             var d = new Dictionary<string, long>(StringComparer.OrdinalIgnoreCase);
-            using (var c = Command("SELECT kind, path, offset FROM source_file WHERE server=@s;"))
+            using (var c = Command("SELECT kind, file_key, offset FROM source_file WHERE server=@s AND file_key IS NOT NULL;"))
             {
                 c.Parameters.AddWithValue("@s", server);
                 using (var r = c.ExecuteReader()) while (r.Read()) d[r.GetString(0) + "|" + r.GetString(1)] = r.GetInt64(2);
@@ -328,15 +379,18 @@ CREATE INDEX IF NOT EXISTS ix_step_session ON session_step(session_id, time_ms);
 
         /// <summary>
         /// Id of the source_file row of a file (created if needed): timeline steps keep it to tell which log
-        /// file holds the raw line of a request.
+        /// file holds the raw line of a request. The path of a new row is the one used to read it.
         /// </summary>
         public long FileId(FileState f, SqliteTransaction tx)
         {
             if (f.Id > 0) return f.Id;
-            using (var c = Command(@"INSERT INTO source_file(server,kind,path,offset,size,updated_ms) VALUES(@s,@k,@p,@o,@z,@u) ON CONFLICT(server,kind,path) DO NOTHING;
-SELECT id FROM source_file WHERE server=@s AND kind=@k AND path=@p;", tx))
+            using (var c = Command(@"INSERT INTO source_file(server,kind,path,file_key,offset,size,updated_ms) VALUES(@s,@k,@p,@fk,@o,@z,@u) ON CONFLICT DO NOTHING;
+UPDATE source_file SET file_key=@fk WHERE server=@s AND kind=@k AND path=@p AND file_key IS NULL
+  AND NOT EXISTS (SELECT 1 FROM source_file WHERE server=@s AND kind=@k AND file_key=@fk);
+SELECT id FROM source_file WHERE server=@s AND kind=@k AND file_key=@fk;", tx))
             {
                 c.Parameters.AddWithValue("@s", f.Server); c.Parameters.AddWithValue("@k", f.Kind); c.Parameters.AddWithValue("@p", f.Path);
+                c.Parameters.AddWithValue("@fk", FileKey(f.Server, f.Path));
                 c.Parameters.AddWithValue("@o", f.Offset); c.Parameters.AddWithValue("@z", f.Size);
                 c.Parameters.AddWithValue("@u", DateTimeOffset.UtcNow.ToUnixTimeMilliseconds());
                 f.Id = Convert.ToInt64(c.ExecuteScalar());
@@ -344,14 +398,13 @@ SELECT id FROM source_file WHERE server=@s AND kind=@k AND path=@p;", tx))
             }
         }
 
+        /// <summary>Saves the read position of a file (row found by FileId; its stored path is kept).</summary>
         public void SaveFile(FileState f, SqliteTransaction tx)
         {
-            using (var c = Command(@"INSERT INTO source_file(server,kind,path,offset,size,last_write_ms,fields,first_ms,last_ms,lines,kept,noise,updated_ms)
-VALUES(@s,@k,@p,@o,@z,@w,@f,@fm,@lm,@l,@kp,@n,@u)
-ON CONFLICT(server,kind,path) DO UPDATE SET offset=excluded.offset,size=excluded.size,last_write_ms=excluded.last_write_ms,
-fields=excluded.fields,first_ms=excluded.first_ms,last_ms=excluded.last_ms,lines=excluded.lines,kept=excluded.kept,noise=excluded.noise,updated_ms=excluded.updated_ms;", tx))
+            FileId(f, tx);
+            using (var c = Command(@"UPDATE source_file SET offset=@o,size=@z,last_write_ms=@w,fields=@f,first_ms=@fm,last_ms=@lm,lines=@l,kept=@kp,noise=@n,updated_ms=@u WHERE id=@id;", tx))
             {
-                c.Parameters.AddWithValue("@s", f.Server); c.Parameters.AddWithValue("@k", f.Kind); c.Parameters.AddWithValue("@p", f.Path);
+                c.Parameters.AddWithValue("@id", f.Id);
                 c.Parameters.AddWithValue("@o", f.Offset); c.Parameters.AddWithValue("@z", f.Size); c.Parameters.AddWithValue("@w", f.LastWriteMs);
                 c.Parameters.AddWithValue("@f", (object)f.Fields ?? DBNull.Value);
                 c.Parameters.AddWithValue("@fm", f.FirstMs > 0 ? (object)f.FirstMs : DBNull.Value);

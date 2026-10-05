@@ -2,7 +2,7 @@
 #  Exchange Log Report - configuration file
 #  --------------------------------------------------------------------------
 #  Author  : Nicolas Fabert
-#  Version : 1.4.0
+#  Version : 1.6.1
 #
 #  This file is read by Invoke-ExchangeLogReport.ps1. It is a PowerShell data
 #  file: text between quotes, $true / $false, numbers, and @( ) for lists.
@@ -20,9 +20,13 @@
     # A folder can also be forced here; it wins over Discover:
     #   HttpProxyPath, MapiHttpPath, ImapLogPath, PopLogPath, IisFrontEndPath, IisBackEndPath (W3SVCn folder),
     #   FrontEndReceivePath, FrontEndSendPath, HubReceivePath, HubSendPath, MailboxReceivePath,
-    #   MailboxSendPath, MessageTrackingPath; or a root: ExchangePath, IisLogPath, LoggingPath, TransportLogPath.
+    #   MailboxSendPath, EdgeReceivePath, EdgeSendPath, MessageTrackingPath; or a root: ExchangePath,
+    #   IisLogPath, LoggingPath, TransportLogPath.
+    # Edge Transport servers are detected (registry on the server itself, Edge folders through C$, or
+    # -Mode Discover run on the Edge): only their SMTP protocol logs and message tracking are read, no
+    # IIS, HttpProxy, MAPI, ActiveSync, POP3 or IMAP4. Role = 'Edge' (or 'Mailbox') forces the role.
     # Account: SYSTEM on an Exchange server, or a domain account that is local administrator of
-    # every Exchange server, plus View-Only Organization Management for -Mode Discover (guide, chapter 4).
+    # every Exchange server, plus View-Only Organization Management for -Mode Discover (user guide, chapter 1).
     # ---------------------------------------------------------------------
     Servers = @(
         @{ Name = 'EXCH01' }
@@ -39,7 +43,7 @@
         SmtpReceive     = $true    # TransportRoles\Logs\<role>\ProtocolLog\SmtpReceive (protocol logging must be enabled on the connectors)
         SmtpSend        = $true    # TransportRoles\Logs\<role>\ProtocolLog\SmtpSend
         MessageTracking = $true    # TransportRoles\Logs\MessageTracking\MSGTRK*.log
-        TransportRoles  = @('FrontEnd', 'Hub', 'Mailbox')
+        TransportRoles  = @('FrontEnd', 'Hub', 'Mailbox') # mailbox servers; an Edge Transport server is read from its Edge folder
         MapiBackEnd     = $true    # Logging\MapiHttp\Mailbox: Outlook version and mode, MAPI status codes (an HTTP 200 can hide a MAPI failure)
         EasBackEnd      = $true    # inetpub\logs\LogFiles\<IisBackEndSite>: ActiveSync results hidden behind HTTP 200 (only ActiveSync lines are kept)
         IisBackEndSite  = 'W3SVC2' # Exchange Back End web site when -Mode Discover has not been run

@@ -4,12 +4,14 @@
     Copies the files needed to run Exchange Log Report into a separate folder, ready to be zipped.
 
 .DESCRIPTION
-    The package contains only what Invoke-ExchangeLogReport.ps1 needs at run time, plus the HTML guide and
+    The package contains only what Invoke-ExchangeLogReport.ps1 needs at run time, plus the HTML guides and
     the licence notice of the SQLite binaries:
         Invoke-ExchangeLogReport.ps1, ExchangeLogReport.psd1, ExchangeLogReport.psm1, config\, src\,
-        templates\, lib\sqlite\, docs\ExchangeLogReport-Guide.html, README.md, CHANGELOG.md, THIRD-PARTY-NOTICES.md
-    The HTML guide is rebuilt first from docs\ExchangeLogReport-Guide.md (tools\Build-Documentation.ps1):
-    it is self-contained (images inline), so the Markdown source and the images are not copied.
+        templates\, lib\sqlite\, docs\ExchangeLogReport-UserGuide.html, docs\ExchangeLogReport-Guide.html,
+        README.md, CHANGELOG.md, THIRD-PARTY-NOTICES.md
+    The HTML guides (user guide, developer guide) are rebuilt first from their Markdown source
+    (tools\Build-Documentation.ps1): they are self-contained (images inline), so the Markdown sources and
+    the images are not copied.
     It never copies data\, reports\, logs\, bin\ or tests\: there is no database in the package, the
     tool creates an empty one at the first collection.
 
@@ -25,11 +27,11 @@
 
 .EXAMPLE
     .\tools\New-ExchangeLogReportPackage.ps1
-    Creates ..\package\ExchangeLogReport-1.4.0.
+    Creates ..\package\ExchangeLogReport-1.6.1.
 
 .NOTES
     Author  : Nicolas Fabert
-    Version : 1.4.0
+    Version : 1.6.1
 #>
 [CmdletBinding()]
 param(
@@ -54,13 +56,13 @@ if (Test-Path -LiteralPath $Destination) {
     Remove-Item -LiteralPath $Destination -Recurse -Force
 }
 
-# ---- HTML guide, rebuilt from the Markdown source -------------------------------------------------
+# ---- HTML guides, rebuilt from the Markdown sources ------------------------------------------------
 & (Join-Path $PSScriptRoot 'Build-Documentation.ps1') | Out-Null
 
 # ---- Files needed at run time -------------------------------------------------------------------
 $files = [Collections.Generic.List[string]]::new()
 foreach ($f in 'Invoke-ExchangeLogReport.ps1', 'ExchangeLogReport.psd1', 'ExchangeLogReport.psm1', 'README.md', 'CHANGELOG.md', 'THIRD-PARTY-NOTICES.md',
-    'config\ExchangeLogReport.config.psd1', 'templates\Report.template.html', 'docs\ExchangeLogReport-Guide.html') { $files.Add($f) }
+    'config\ExchangeLogReport.config.psd1', 'templates\Report.template.html', 'docs\ExchangeLogReport-Guide.html', 'docs\ExchangeLogReport-UserGuide.html') { $files.Add($f) }
 foreach ($folder in 'src', 'lib\sqlite') {
     Get-ChildItem -LiteralPath (Join-Path $root $folder) -Recurse -File | ForEach-Object { $files.Add($_.FullName.Substring($rootPrefix.Length)) }
 }
@@ -79,7 +81,7 @@ foreach ($name in 'data', 'reports', 'logs', 'bin', 'tests') {
 }
 Get-ChildItem -LiteralPath $Destination -Recurse -File -Include '*.sqlite', '*.sqlite-*', '*.db', '*.lock', '*.log', '*.csv', '*.paths.psd1' |
     ForEach-Object { $problems.Add("Runtime file in the package: $($_.Name)") }
-foreach ($f in 'src\Engine.Text.cs', 'src\Engine.Store.cs', 'src\Engine.Collector.cs', 'src\Engine.Sessions.cs', 'src\Engine.Report.cs', 'src\Engine.ReportSessions.cs', 'src\Get-ExlExchangeSettings.ps1', 'lib\sqlite\runtimes\win-x64\e_sqlite3.dll', 'docs\ExchangeLogReport-Guide.html') {
+foreach ($f in 'src\Engine.Text.cs', 'src\Engine.Store.cs', 'src\Engine.Collector.cs', 'src\Engine.Sessions.cs', 'src\Engine.Report.cs', 'src\Engine.ReportSessions.cs', 'src\Get-ExlExchangeSettings.ps1', 'lib\sqlite\runtimes\win-x64\e_sqlite3.dll', 'docs\ExchangeLogReport-Guide.html', 'docs\ExchangeLogReport-UserGuide.html') {
     if (-not (Test-Path -LiteralPath (Join-Path $Destination $f))) { $problems.Add("Missing in the package: $f") }
 }
 if ($problems.Count) { throw ("Package not valid ($Destination):`n - " + ($problems -join "`n - ")) }
@@ -90,6 +92,6 @@ Write-Host "  Exchange Log Report $version - package ready" -ForegroundColor Gre
 Write-Host "  Folder   : $Destination"
 Write-Host ("  Content  : {0} files, {1:N1} MB" -f $all.Count, (($all | Measure-Object Length -Sum).Sum / 1MB))
 Write-Host "  Database : none - the tool creates an empty database at the first collection"
-Write-Host "  Config   : example servers - list the Exchange servers, then run -Mode Discover (guide, chapter 6)"
+Write-Host "  Config   : example servers - list the Exchange servers, then run -Mode Discover (user guide, chapter 1.1)"
 Write-Host ''
 $all | Sort-Object FullName | ForEach-Object { '    {0,12:N0}  {1}' -f $_.Length, $_.FullName.Substring($Destination.Length + 1) }

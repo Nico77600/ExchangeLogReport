@@ -3,7 +3,7 @@
 <#
     Exchange Log Report - automated tests (Pester 5 or later).
     Author  : Nicolas Fabert
-    Version : 1.4.0
+    Version : 1.6.1
 
     Run:  Invoke-Pester -Path .\tests\ExchangeLogReport.Tests.ps1 -Output Detailed
 
@@ -600,6 +600,217 @@ $custom      <site name="Intranet" id="4">
     }
 }
 
+Describe 'Edge Transport servers' {
+    BeforeAll {
+        # Folder tree of an Edge Transport server: no IIS, HttpProxy, MAPI, ActiveSync, POP or IMAP; SMTP logs of the
+        # Edge transport service, message tracking, and the AD LDS instance of the Edge role (TransportRoles\data\Adam).
+        $script:EdgeDir = Join-Path $TestDrive 'edge'
+        $script:EdgeExchange = Join-Path $script:EdgeDir 'EDGE01\Exchange'
+        [void][IO.Directory]::CreateDirectory((Join-Path $script:EdgeExchange 'TransportRoles\data\Adam'))
+        $fields = '#Fields: date-time,connector-id,session-id,sequence-number,local-endpoint,remote-endpoint,event,data,context'
+        $c = 'EDGE01\Default internal receive connector EDGE01'
+        Write-Log (Join-Path $script:EdgeExchange 'TransportRoles\Logs\Edge\ProtocolLog\SmtpReceive\RECV2026100108-1.LOG') @(
+            '#Software: Microsoft Exchange Server', '#Version: 15.0.0.0', '#Log-type: SMTP Receive Protocol Log', "#Date: $(T 0)", $fields
+            "$(T 1),$c,08DE000000000001,0,192.0.2.10:25,198.51.100.7:51000,+,,"
+            "$(T 1),$c,08DE000000000001,1,192.0.2.10:25,198.51.100.7:51000,<,EHLO mail.fabrikam.example,"
+            "$(T 1),$c,08DE000000000001,2,192.0.2.10:25,198.51.100.7:51000,<,STARTTLS,"
+            "$(T 1),$c,08DE000000000001,3,192.0.2.10:25,198.51.100.7:51000,*,,""TLS protocol SP_PROT_TLS1_2_SERVER negotiation succeeded using bulk encryption algorithm CALG_AES_256"""
+            "$(T 1),$c,08DE000000000001,4,192.0.2.10:25,198.51.100.7:51000,<,MAIL FROM:<partner@fabrikam.example> SIZE=4096,"
+            "$(T 1),$c,08DE000000000001,5,192.0.2.10:25,198.51.100.7:51000,<,RCPT TO:<alice@contoso.test>,"
+            "$(T 1),$c,08DE000000000001,6,192.0.2.10:25,198.51.100.7:51000,<,BDAT 4096 LAST,"
+            "$(T 1),$c,08DE000000000001,7,192.0.2.10:25,198.51.100.7:51000,>,""250 2.6.0 <edge-001@fabrikam.example> [InternalId=5001, Hostname=EDGE01.perimeter.test] Queued mail for delivery"","
+            "$(T 1),$c,08DE000000000001,8,192.0.2.10:25,198.51.100.7:51000,-,,Local"
+        )
+        $trk = '#Fields: date-time,client-ip,client-hostname,server-ip,server-hostname,source-context,connector-id,source,event-id,internal-message-id,message-id,network-message-id,recipient-address,recipient-status,total-bytes,recipient-count,related-recipient-address,reference,message-subject,sender-address,return-path,message-info,directionality,tenant-id,original-client-ip,original-server-ip,custom-data,transport-traffic-type,log-id,schema-version'
+        # Outbound: one message handed over to Exchange Online, one deferred by a partner MX.
+        $o = 'Internet via EXO'
+        Write-Log (Join-Path $script:EdgeExchange 'TransportRoles\Logs\Edge\ProtocolLog\SmtpSend\SEND2026100108-1.LOG') @(
+            '#Software: Microsoft Exchange Server', '#Version: 15.0.0.0', '#Log-type: SMTP Send Protocol Log', "#Date: $(T 0)", $fields
+            "$(T 2),$o,08DE000000000101,0,192.0.2.10:50001,52.101.1.1:25,+,,"
+            "$(T 2),$o,08DE000000000101,1,192.0.2.10:50001,52.101.1.1:25,<,220 AM0PR02CA0001.outlook.office365.com Microsoft ESMTP MAIL Service ready,"
+            "$(T 2),$o,08DE000000000101,2,192.0.2.10:50001,52.101.1.1:25,>,EHLO hybrid.contoso.test,"
+            "$(T 2),$o,08DE000000000101,3,192.0.2.10:50001,52.101.1.1:25,>,STARTTLS,"
+            "$(T 2),$o,08DE000000000101,4,192.0.2.10:50001,52.101.1.1:25,*,,""TLS protocol SP_PROT_TLS1_2_CLIENT negotiation succeeded using bulk encryption algorithm CALG_AES_256"""
+            "$(T 2),$o,08DE000000000101,5,192.0.2.10:50001,52.101.1.1:25,>,MAIL FROM:<alice@contoso.test> SIZE=2048,"
+            "$(T 2),$o,08DE000000000101,6,192.0.2.10:50001,52.101.1.1:25,>,RCPT TO:<partner@fabrikam.example>,"
+            "$(T 2),$o,08DE000000000101,7,192.0.2.10:50001,52.101.1.1:25,>,BDAT 2048 LAST,"
+            "$(T 2),$o,08DE000000000101,8,192.0.2.10:50001,52.101.1.1:25,<,""250 2.6.0 <edge-002@contoso.test> [InternalId=1, Hostname=AM0PR02MB0001.eurprd02.prod.outlook.com] Queued mail for delivery"","
+            "$(T 2),$o,08DE000000000101,9,192.0.2.10:50001,52.101.1.1:25,-,,Local"
+            "$(T 3),Partner MX,08DE000000000102,0,192.0.2.10:50002,203.0.113.25:25,+,,"
+            "$(T 3),Partner MX,08DE000000000102,1,192.0.2.10:50002,203.0.113.25:25,<,220 mx.northwind.example ESMTP,"
+            "$(T 3),Partner MX,08DE000000000102,2,192.0.2.10:50002,203.0.113.25:25,>,EHLO hybrid.contoso.test,"
+            "$(T 3),Partner MX,08DE000000000102,3,192.0.2.10:50002,203.0.113.25:25,>,MAIL FROM:<bob@contoso.test>,"
+            "$(T 3),Partner MX,08DE000000000102,4,192.0.2.10:50002,203.0.113.25:25,>,RCPT TO:<support@northwind.example>,"
+            "$(T 3),Partner MX,08DE000000000102,5,192.0.2.10:50002,203.0.113.25:25,<,451 4.7.1 Greylisted: try again later,"
+            "$(T 3),Partner MX,08DE000000000102,6,192.0.2.10:50002,203.0.113.25:25,-,,Local"
+        )
+        Write-Log (Join-Path $script:EdgeExchange 'TransportRoles\Logs\MessageTracking\MSGTRK2026100108-1.LOG') @(
+            '#Software: Microsoft Exchange Server', '#Version: 15.02.2562.045', '#Log-type: Message Tracking Log', "#Date: $(T 0)", $trk
+            "$(T 1),198.51.100.7,mail.fabrikam.example,192.0.2.10,EDGE01,08DE000000000001;$(T 1);0,$c,SMTP,RECEIVE,5001,<edge-001@fabrikam.example>,net-e001,alice@contoso.test,,4096,1,,,Order,partner@fabrikam.example,partner@fabrikam.example,,Incoming,,,,,Email,$([guid]::NewGuid()),15.02.2562.045"
+            "$(T 1.1),192.0.2.11,EDGE01,10.0.0.1,EXCH01.contoso.test,,EdgeSync - Inbound to Default-First-Site-Name,SMTP,SENDEXTERNAL,5001,<edge-001@fabrikam.example>,net-e001,alice@contoso.test,250 2.6.0 Queued,4096,1,,,Order,partner@fabrikam.example,partner@fabrikam.example,,Incoming,,,,,Email,$([guid]::NewGuid()),15.02.2562.045"
+        )
+        $script:NewEdgeConfig = {
+            param([string]$Name, [string]$ServerBlock)
+            $dir = Join-Path $script:EdgeDir $Name
+            [void][IO.Directory]::CreateDirectory($dir)
+            $text = [IO.File]::ReadAllText((Join-Path $script:Root 'config\ExchangeLogReport.config.psd1'))
+            $text = [regex]::Replace($text, "(?ms)^    Servers = @\(.*?^    \)", ("Servers = @(`r`n        $ServerBlock`r`n    )").Replace('$', '$$'))
+            $text = $text.Replace("'.\data\ExchangeLogReport.sqlite'", "'$dir\data\test.sqlite'").Replace("Path          = '.\logs'", "Path          = '$dir\toollogs'").Replace("OutputPath            = '.\reports'", "OutputPath            = '$dir\reports'")
+            $path = Join-Path $dir 'test.config.psd1'
+            [IO.File]::WriteAllText($path, $text, [Text.UTF8Encoding]::new($true))
+            return $path
+        }
+    }
+    It 'reads only the SMTP protocol logs and the message tracking of an Edge Transport server' {
+        $s = Import-ExlConfiguration -Path (& $script:NewEdgeConfig 'sources' "@{ Name = 'EDGE01'; Role = 'edge'; TransportLogPath = 'L:\Logs' }") -Root $script:Root
+        $edge = $s.Servers[0]
+        $edge.Role | Should -Be 'Edge'
+        $edge.RoleOrigin | Should -Be 'Configuration'
+        $sources = @(Get-ExlSources $edge $s)
+        ($sources | ForEach-Object { '{0}|{1}' -f $_.Kind, $_.Role }) | Should -Be @('SmtpReceive|Edge', 'SmtpSend|Edge', 'Tracking|')
+        ($sources | Where-Object Kind -eq 'SmtpReceive').Folder | Should -Be 'L:\Logs\Edge\ProtocolLog\SmtpReceive'
+        ($sources | Where-Object Kind -eq 'SmtpSend').Label | Should -Be 'SMTP out (Edge)'
+        # A mailbox server keeps every source.
+        $mailbox = & (Get-Module ExchangeLogReport) { param($src) Resolve-ExlServerPaths -Name 'EXCH01' -Sources $src } $s.Sources
+        $mailbox.Role | Should -Be 'Mailbox'
+        @(Get-ExlSources $mailbox $s | Where-Object Kind -in 'HttpProxy', 'Iis', 'EasBackEnd').Count | Should -Be 3
+    }
+    It 'rejects an unknown server role' {
+        { Import-ExlConfiguration -Path (& $script:NewEdgeConfig 'badrole' "@{ Name = 'EDGE01'; Role = 'Hub' }") -Root $script:Root } | Should -Throw -ExpectedMessage '*Servers`[1`].Role must be Mailbox or Edge*'
+    }
+    It 'detects an Edge Transport server: registry key on this computer, Edge folders on another server' {
+        $s = Import-ExlConfiguration -Path (& $script:NewEdgeConfig 'detect' "@{ Name = 'EDGE01'; ExchangePath = '$script:EdgeExchange' }") -Root $script:Root
+        $edge = $s.Servers[0]
+        $edge.Role | Should -Be 'Mailbox'
+        Resolve-ExlServerRole -Server $edge | Should -Be 'Edge'
+        $edge.RoleOrigin | Should -Be 'Detected'
+        # Client access folder present: a mailbox server, whatever the other folders.
+        $mailboxDir = Join-Path $TestDrive 'edge\mailbox-like'
+        foreach ($f in 'TransportRoles\data\Adam', 'FrontEnd\HttpProxy') { [void][IO.Directory]::CreateDirectory((Join-Path $mailboxDir $f)) }
+        $mailbox = & (Get-Module ExchangeLogReport) { param($src, $dir) Resolve-ExlServerPaths -Name 'EXCH09' -Configured @{ ExchangePath = $dir } -Sources $src } $s.Sources $mailboxDir
+        Resolve-ExlServerRole -Server $mailbox | Should -Be 'Mailbox'
+        # This computer: the EdgeTransportRole registry key.
+        Mock -ModuleName ExchangeLogReport Test-Path { $true } -ParameterFilter { $LiteralPath -eq 'HKLM:\SOFTWARE\Microsoft\ExchangeServer\v15\EdgeTransportRole' }
+        $local = & (Get-Module ExchangeLogReport) { param($src) Resolve-ExlServerPaths -Name 'EDGE02' -Sources $src } $s.Sources
+        Resolve-ExlServerRole -Server $local -Local | Should -Be 'Edge'
+        # A role set in the configuration is kept.
+        $forced = & (Get-Module ExchangeLogReport) { param($src) Resolve-ExlServerPaths -Name 'EDGE03' -Configured @{ Role = 'Mailbox' } -Sources $src } $s.Sources
+        Resolve-ExlServerRole -Server $forced -Local | Should -Be 'Mailbox'
+    }
+    It 'collects an Edge Transport server without looking for client access logs' {
+        $s = Import-ExlConfiguration -Path (& $script:NewEdgeConfig 'collect' "@{ Name = 'EDGE01'; ExchangePath = '$script:EdgeExchange' }") -Root $script:Root
+        [void](Resolve-ExlServerRole -Server $s.Servers[0])
+        @(Test-ExlServerAccess -Server $s.Servers[0] -Settings $s) | Should -BeNullOrEmpty
+        $r = Invoke-TestCollection $s
+        $r.Unreachable.Count | Should -Be 0
+        $r.Stale.Count | Should -Be 0
+        $r.Errors | Should -Be 0
+        $rows = Query $s "SELECT direction, role, connector, helo, mail_from, message_id, status, tls FROM smtp_transaction WHERE direction = 'Receive'"
+        $rows.Count | Should -Be 1
+        @($rows[0]) | Should -Be @('Receive', 'Edge', 'EDGE01\Default internal receive connector EDGE01', 'mail.fabrikam.example', 'partner@fabrikam.example', '<edge-001@fabrikam.example>', 'Accepted', 'TLS 1.2')
+        (Query $s "SELECT COUNT(*) FROM message_event WHERE server='EDGE01' AND message_id='<edge-001@fabrikam.example>'")[0][0] | Should -Be 2
+        @((Query $s 'SELECT DISTINCT kind FROM source_file ORDER BY kind') | ForEach-Object { $_[0] }) | Should -Be @('SmtpReceive', 'SmtpSend', 'Tracking')
+        $script:EdgeSettings = $s
+    }
+    It 'builds an Edge report: mail flow only, with the SMTP destinations of the Edge' {
+        $period = [pscustomobject]@{ StartMs = $script:Base.AddHours(-1).ToUnixTimeMilliseconds(); EndMs = $script:Base.AddHours(2).ToUnixTimeMilliseconds() }
+        $store = Open-ExlStore -Settings $script:EdgeSettings -ReadOnly
+        try { $r = New-ExlReport -Store $store -Settings $script:EdgeSettings -Period $period -ReportType Detailed } finally { $store.Dispose() }
+        Split-Path $r.Folder -Leaf | Should -BeLike 'ExchangeLogs_EdgeDetailed_*'
+        @($r.Counts.Keys | Sort-Object) | Should -Be @('daily', 'messages', 'servers', 'smtp', 'smtpclients', 'smtpdestinations')
+        @($r.Files | ForEach-Object { Split-Path $_.Path -Leaf } | Where-Object { $_ -like '*ClientAccess*' -or $_ -like '*Users*' -or $_ -like '*Sessions.csv' -and $_ -notlike '*SmtpSessions*' }) | Should -BeNullOrEmpty
+        $dest = @(Import-Csv (Join-Path $r.Folder 'ExchangeLogs-SmtpDestinations.csv') -Delimiter ';')
+        $dest.Count | Should -Be 2
+        $exo = $dest | Where-Object Connector -eq 'Internet via EXO'
+        @($exo.'Remote IP', $exo.'Remote host', $exo.Sent, $exo.TLS) | Should -Be @('52.101.1.1', 'AM0PR02CA0001.outlook.office365.com', '1', 'TLS 1.2')
+        $partner = $dest | Where-Object Connector -eq 'Partner MX'
+        @($partner.'Remote host', $partner.Deferred, $partner.'Last error') | Should -Be @('mx.northwind.example', '1', '451 4.7.1 Greylisted: try again later')
+        (Get-Content (Join-Path $r.Folder 'ExchangeLogs-Servers.csv') -TotalCount 1) | Should -Not -Match 'Real users|Requests'
+        # Handed over to the organization (SENDEXTERNAL on an Edge): relayed.
+        (Import-Csv (Join-Path $r.Folder 'ExchangeLogs-Messages.csv') -Delimiter ';' | Where-Object 'Message ID' -eq '<edge-001@fabrikam.example>').Status | Should -Be 'Relayed'
+        $html = Get-Content -Raw $r.HtmlPath
+        $html | Should -Match '"edge":true'
+        $html | Should -Match '"title":"Edge Transport mail flow"'
+        $html | Should -Match '"smtpdestinations":\{'
+        $html | Should -Not -Match '"users":\{'
+        # A mailbox server in the report: the usual report, without SMTP destinations.
+        $store = Open-ExlStore -Settings $script:Settings -ReadOnly
+        try { $m = New-ExlReport -Store $store -Settings $script:Settings -Period $period -ReportType Detailed } finally { $store.Dispose() }
+        $m.Counts.ContainsKey('smtpdestinations') | Should -BeFalse
+        $m.Counts.ContainsKey('sessions') | Should -BeTrue
+    }
+    It 'resolves the role for a report without collection from the database, and never fails on a folder that cannot be read' {
+        # Every server folder answers "access denied" (account that is not administrator of the servers).
+        Mock -ModuleName ExchangeLogReport Test-Path { if ($LiteralPath -like '\\*') { if ($PesterBoundParameters['ErrorAction'] -notin 'SilentlyContinue', 'Ignore') { throw "Access to the path '$LiteralPath' is denied." }; $false } else { Microsoft.PowerShell.Management\Test-Path @PesterBoundParameters } }
+        $new = { param($Name) & (Get-Module ExchangeLogReport) { param($n, $src) Resolve-ExlServerPaths -Name $n -Sources $src } $Name $script:EdgeSettings.Sources }
+        # Report without collection: the Edge SMTP data already collected, the servers are not contacted.
+        $store = Open-ExlStore -Settings $script:EdgeSettings -ReadOnly
+        try {
+            $edge = & $new 'EDGE01'
+            Resolve-ExlServerRole -Server $edge -Store $store | Should -Be 'Edge'
+            $edge.RoleOrigin | Should -Be 'Detected'
+            Resolve-ExlServerRole -Server (& $new 'EXCH42') -Store $store | Should -Be 'Mailbox'
+        } finally { $store.Dispose() }
+        $store = Open-ExlStore -Settings $script:Settings -ReadOnly
+        try { Resolve-ExlServerRole -Server (& $new $script:Settings.Servers[0].Name) -Store $store | Should -Be 'Mailbox' } finally { $store.Dispose() }
+        Should -Invoke -ModuleName ExchangeLogReport Test-Path -Times 0 -Exactly -ParameterFilter { $LiteralPath -like '\\*' }
+        # Collection with folders that cannot be read: Mailbox, and every folder reported as not readable (no error).
+        $denied = & $new 'EDGE01'
+        Resolve-ExlServerRole -Server $denied | Should -Be 'Mailbox'
+        $problems = @(Test-ExlServerAccess -Server $denied -Settings $script:EdgeSettings)
+        $problems.Count | Should -BeGreaterThan 0
+        $problems | ForEach-Object { $_ | Should -Match 'folder not found or not readable' }
+    }
+    It 'reads the settings of an Edge Transport server with -Mode Discover, and records a subscribed Edge seen from the organisation' {
+        $config = & $script:NewEdgeConfig 'discover' "@{ Name = 'EDGE01' }"
+        $before = Import-ExlConfiguration -Path $config -Root $script:Root
+        Mock -ModuleName ExchangeLogReport Get-ExlExchangeSettings {
+            [pscustomobject]@{ Method = 'Exchange Management Shell (Edge Transport)'; Via = 'EDGE01'; Account = 'EDGE01\admin'; ExchangeCount = 3; EdgeServers = @()
+                Servers = @([pscustomobject]@{ Name = 'EDGE01'; Role = 'Edge'; Version = '15.2.2562.17'; Site = $null; InstallPath = 'D:\Exchange\'
+                        EdgeReceivePath = 'L:\Edge\Receive'; EdgeSendPath = 'D:\Exchange\TransportRoles\Logs\Edge\ProtocolLog\SmtpSend'
+                        MessageTrackingPath = 'L:\Tracking'; MessageTrackingEnabled = $true; LoggingOff = @("receive connector 'Default internal receive connector EDGE01'"); Warnings = @() }) }
+        }
+        Mock -ModuleName ExchangeLogReport Get-ExlIisSiteMap { throw 'An Edge Transport server has no IIS.' }
+        Mock -ModuleName ExchangeLogReport Test-Path { if ($LiteralPath -like '\\EDGE0*') { $false } else { Microsoft.PowerShell.Management\Test-Path @PesterBoundParameters } }
+        $r = Invoke-ExlDiscovery -Settings $before 6>$null
+        $r.Found | Should -Be @('EDGE01')
+        $r.Edge | Should -Be @('EDGE01')
+        $r.NotFound | Should -BeNullOrEmpty
+        ($r.Warnings -join "`n") | Should -Match "EDGE01: SMTP protocol logging is off on receive connector 'Default internal receive connector EDGE01'"
+        ($r.Warnings -join "`n") | Should -Match 'EDGE01: not found or not readable by .*: Tracking \(\\\\EDGE01\\L\$\\Tracking\)'
+        Should -Invoke -ModuleName ExchangeLogReport Get-ExlIisSiteMap -Times 0 -Exactly
+        $file = (Import-PowerShellDataFile -LiteralPath $r.File).Servers['EDGE01']
+        $file.Role | Should -Be 'Edge'
+        $file.Keys | Should -Not -Contain 'IisFrontEndPath'
+        $file.Keys | Should -Not -Contain 'ImapProtocolLog'
+        $after = Import-ExlConfiguration -Path $config -Root $script:Root
+        $edge = $after.Servers[0]
+        @($edge.Role, $edge.RoleOrigin) | Should -Be @('Edge', 'Discover')
+        $edge.ExchangePath | Should -Be '\\EDGE01\D$\Exchange'
+        $edge.EdgeReceivePath | Should -Be '\\EDGE01\L$\Edge\Receive'
+        $edge.MessageTrackingPath | Should -Be '\\EDGE01\L$\Tracking'
+        # From a mailbox server: the subscribed Edge of the configuration is recorded with its role only.
+        $config = & $script:NewEdgeConfig 'discover-org' "@{ Name = 'EXCH01' }`r`n        @{ Name = 'EDGE01' }"
+        $before = Import-ExlConfiguration -Path $config -Root $script:Root
+        Mock -ModuleName ExchangeLogReport Get-ExlExchangeSettings {
+            [pscustomobject]@{ Method = 'Exchange Management Shell'; Via = 'EXCH01'; Account = 'CONTOSO\admin'; ExchangeCount = 2; EdgeServers = @('EDGE01', 'EDGE99')
+                Servers = @([pscustomobject]@{ Name = 'EXCH01'; Role = 'Mailbox'; Version = '15.2.2562.17'; Site = 'PARIS'; DataPath = 'C:\Program Files\Microsoft\Exchange Server\V15\Mailbox'
+                        ImapLogPath = $null; ImapProtocolLog = $false; PopLogPath = $null; PopProtocolLog = $false; FrontEndReceivePath = $null; FrontEndSendPath = $null
+                        HubReceivePath = $null; HubSendPath = $null; MailboxReceivePath = $null; MailboxSendPath = $null; MessageTrackingPath = $null
+                        MessageTrackingEnabled = $true; LoggingOff = @(); Warnings = @() }) }
+        }
+        Mock -ModuleName ExchangeLogReport Get-ExlIisSiteMap { $null }
+        Mock -ModuleName ExchangeLogReport Test-Path { if ($LiteralPath -like '\\E*0*') { $false } else { Microsoft.PowerShell.Management\Test-Path @PesterBoundParameters } }
+        $r = Invoke-ExlDiscovery -Settings $before 6>$null
+        $r.Found | Should -Be @('EXCH01', 'EDGE01')
+        $r.Edge | Should -Be @('EDGE01')
+        $r.NotFound | Should -BeNullOrEmpty
+        $after = Import-ExlConfiguration -Path $config -Root $script:Root
+        @($after.Servers[0].Role, $after.Servers[1].Role, $after.Servers[1].RoleOrigin) | Should -Be @('Mailbox', 'Edge', 'Discover')
+        $after.Servers[1].EdgeReceivePath | Should -Be '\\EDGE01\c$\Program Files\Microsoft\Exchange Server\V15\TransportRoles\Logs\Edge\ProtocolLog\SmtpReceive'
+    }
+}
+
 Describe 'Collection and noise removal' {
     It 'keeps only real users and real messages' {
         $users = @((Query $script:Settings 'SELECT DISTINCT user FROM access_usage ORDER BY user') | ForEach-Object { $_[0] })
@@ -664,6 +875,39 @@ Describe 'Collection and noise removal' {
         [IO.File]::AppendAllText($file.FullName, "$now,$c,08DF0000000000FF,2,10.0.0.1:25,10.1.1.60:5000,<,RCPT TO:<bob@contoso.test>,`r`n$now,$c,08DF0000000000FF,3,10.0.0.1:25,10.1.1.60:5000,<,DATA,`r`n$now,$c,08DF0000000000FF,4,10.0.0.1:25,10.1.1.60:5000,>,""250 2.6.0 <msg-009@contoso.test> [InternalId=9, Hostname=EXCH01] Queued mail for delivery"",`r`n$now,$c,08DF0000000000FF,5,10.0.0.1:25,10.1.1.60:5000,-,,Local`r`n")
         [void](Invoke-TestCollection $s)
         (Query $s "SELECT status, message_id FROM smtp_transaction WHERE mail_from='eve@contoso.test'")[0] | Should -Be @('Accepted', '<msg-009@contoso.test>')
+    }
+    It 'identifies a log file whatever the path used to reach it' {
+        [ExchangeLogReport.Store]::FileKey('EXCH01', '\\EXCH01\D$\Logs\Hub\RECV1.LOG') | Should -BeExactly 'D:\LOGS\HUB\RECV1.LOG'
+        [ExchangeLogReport.Store]::FileKey('EXCH01', '\\exch01.contoso.test\d$\Logs\Hub\recv1.log') | Should -BeExactly 'D:\LOGS\HUB\RECV1.LOG'
+        [ExchangeLogReport.Store]::FileKey('EXCH01', 'd:\Logs\Hub\Recv1.log') | Should -BeExactly 'D:\LOGS\HUB\RECV1.LOG'
+        # Another server's share or a NAS stays a UNC path.
+        [ExchangeLogReport.Store]::FileKey('EXCH01', '\\EXCH02\D$\Logs\Hub\RECV1.LOG') | Should -BeExactly '\\EXCH02\D$\LOGS\HUB\RECV1.LOG'
+        [ExchangeLogReport.Store]::FileKey('EXCH01', '\\NAS\Logs\RECV1.LOG') | Should -BeExactly '\\NAS\LOGS\RECV1.LOG'
+    }
+    It 'does not read a file again when it is reached through another path of the same server' {
+        $dir = Join-Path $TestDrive 'rekey'
+        $s = Import-ExlConfiguration -Path (New-TestConfig $dir) -Root $script:Root
+        $first = Invoke-TestCollection $s
+        $first.Lines | Should -BeGreaterThan 0
+        # Same folders in another case (as Exchange may return them to -Mode Discover): nothing to read.
+        $upper = Import-ExlConfiguration -Path (New-TestConfig (Join-Path $TestDrive 'rekey-upper')) -Root $script:Root
+        $upper.Storage.DatabasePath = $s.Storage.DatabasePath
+        $upper.Servers[0] = & (Get-Module ExchangeLogReport) { param($src, $x, $i) Resolve-ExlServerPaths -Name 'EXCH01' -Configured @{ ExchangePath = $x.ToUpperInvariant(); IisLogPath = $i.ToUpperInvariant() } -Sources $src } $s.Sources $s.Servers[0].ExchangePath $s.Servers[0].IisLogPath
+        (Invoke-TestCollection $upper).Lines | Should -Be 0
+        # A 1.5.0 database: the files were read through the administrative share, then once again through the
+        # local path after -Mode Discover. Upgraded, the copy read last keeps the identity of the file.
+        $store = Open-ExlStore -Settings $s
+        try {
+            $store.Exec("DROP INDEX ux_source_file_key; ALTER TABLE source_file DROP COLUMN file_key;")
+            $store.Exec("UPDATE source_file SET path = '\\EXCH01\' || substr(path, 1, 1) || '`$' || substr(path, 3), updated_ms = 2000000000000;")
+            $store.Exec("INSERT INTO source_file(server, kind, path, offset, size, updated_ms) SELECT server, kind, substr(path, 10, 1) || ':' || substr(path, 12), offset, size, 1 FROM source_file WHERE kind = 'Tracking';")
+            $store.Exec("UPDATE metadata SET value = '2' WHERE key = 'schema_version';")
+        } finally { $store.Dispose() }
+        $again = Invoke-TestCollection $s
+        $again.Lines | Should -Be 0
+        (Query $s "SELECT COUNT(*) FROM source_file WHERE file_key IS NULL")[0][0] | Should -Be 2
+        (Query $s "SELECT COUNT(*) FROM source_file WHERE file_key IS NOT NULL AND path LIKE '\\EXCH01\%'")[0][0] | Should -Be (Query $s "SELECT COUNT(*) FROM source_file WHERE file_key IS NOT NULL")[0][0]
+        (Query $s "SELECT value FROM metadata WHERE key = 'schema_version'")[0][0] | Should -Be '3'
     }
 }
 
@@ -756,7 +1000,7 @@ Describe 'Client sessions and back-end correlation' {
         $store = Open-ExlStore -Settings $s -ReadOnly
         try { $r = New-ExlReport -Store $store -Settings $s -Period ([pscustomobject]@{ StartMs = $script:Base.AddHours(-1).ToUnixTimeMilliseconds(); EndMs = $script:Base.AddHours(2).ToUnixTimeMilliseconds() }) -ReportType Detailed } finally { $store.Dispose() }
         $r.Counts['servers'] | Should -Be 2
-        (Query $s "SELECT value FROM metadata WHERE key='schema_version'")[0][0] | Should -Be '2'
+        (Query $s "SELECT value FROM metadata WHERE key='schema_version'")[0][0] | Should -Be ([ExchangeLogReport.Store]::SchemaVersion)
     }
     It 'extends the same session at the next collection instead of creating a new one' {
         $file = Get-ChildItem (Join-Path $script:Dir 'logs-src') -Recurse -Filter 'HttpProxy_*.LOG' | Where-Object { $_.Directory.Name -eq 'Eas' }
@@ -905,6 +1149,40 @@ Describe 'Retention' {
     }
 }
 
+Describe 'Command line and periods' {
+    It 'takes the range from the period parameters, and refuses a period parameter that does not belong to -Range' {
+        Resolve-ExlRange -Start '2026-10-01 08:00' -End '2026-10-01 12:00' -Default 'Last7Days' | Should -Be 'Custom'
+        Resolve-ExlRange -Range Custom -Start '2026-10-01 08:00' -End '2026-10-01 12:00' -Default 'Last7Days' | Should -Be 'Custom'
+        Resolve-ExlRange -Month '2026-09' -Default 'Last7Days' | Should -Be 'Month'
+        Resolve-ExlRange -Range Day -Date '2026-09-28' -Default 'Last7Days' | Should -Be 'Day'
+        Resolve-ExlRange -Range Last30Days -Default 'Last7Days' | Should -Be 'Last30Days'
+        Resolve-ExlRange -Default 'Last7Days' | Should -Be 'Last7Days'
+        { Resolve-ExlRange -Range Last7Days -Start '2026-10-01 08:00' -End '2026-10-01 12:00' -Default 'Last7Days' } | Should -Throw '-Start / -End define the period of the report (-Range Custom) and cannot be combined with -Range Last7Days*'
+        { Resolve-ExlRange -Range Day -Month '2026-09' -Default 'Last7Days' } | Should -Throw '-Month defines the period*-Range Day*'
+        { Resolve-ExlRange -Month '2026-09' -Date '2026-09-28' -Default 'Last7Days' } | Should -Throw '*use only one of them.'
+        # -Start without -End: a custom period that is refused, not the default range.
+        $range = Resolve-ExlRange -Start '2026-10-01 08:00' -Default 'Last7Days'
+        $range | Should -Be 'Custom'
+        { Resolve-ExlPeriod -Range $range -Start '2026-10-01 08:00' -Zone ([TimeZoneInfo]::Utc) } | Should -Throw '*requires -Start and -End*'
+        $p = Resolve-ExlPeriod -Range Custom -Start '2026-10-01 08:00' -End '2026-10-01 12:00' -Zone ([TimeZoneInfo]::Utc) -Now ([DateTimeOffset]'2026-10-05T12:00:00Z')
+        $p.StartMs | Should -Be ([DateTimeOffset]'2026-10-01T08:00:00Z').ToUnixTimeMilliseconds()
+        $p.EndMs | Should -Be ([DateTimeOffset]'2026-10-01T12:00:00Z').ToUnixTimeMilliseconds()
+    }
+    It 'names every parameter that the mode does not use, with the reason' {
+        $collect = @(Get-ExlIgnoredParameter -Mode Collect -Name 'Mode', 'Start', 'End', 'Server', 'ConfigPath')
+        $collect.Count | Should -Be 1
+        $collect[0] | Should -BeLike '-Start, -End ignored with -Mode Collect: a collection reads every new log line, whatever its date*'
+        @(Get-ExlIgnoredParameter -Mode Report -Name 'Range', 'Start', 'End', 'User', 'Server', 'NoCollect', 'OutputPath').Count | Should -Be 0
+        $status = @(Get-ExlIgnoredParameter -Mode Status -Name 'Range', 'User', 'Server')
+        $status.Count | Should -Be 3
+        $status[0] | Should -BeLike '-Range ignored with -Mode Status: *whole database*'
+        $status[1] | Should -Be '-User ignored with -Mode Status: used by -Mode Report only.'
+        @(Get-ExlIgnoredParameter -Mode Discover -Name 'ConnectTo', 'Credential').Count | Should -Be 0
+        @(Get-ExlIgnoredParameter -Mode Discover -Name 'Date')[0] | Should -BeLike '-Date ignored with -Mode Discover: *reads no log line*'
+        @(Get-ExlIgnoredParameter -Mode Report -Name 'ConnectTo') | Should -Be '-ConnectTo ignored with -Mode Report: used by -Mode Discover only.'
+    }
+}
+
 Describe 'Entry script' {
     It 'Status on a new installation confirms the configuration and creates no database' {
         $dir = Join-Path $TestDrive 'fresh'
@@ -912,17 +1190,42 @@ Describe 'Entry script' {
         $output = & pwsh -NoProfile -File (Join-Path $script:Root 'Invoke-ExchangeLogReport.ps1') -Mode Status -ConfigPath $cfg 2>&1 | Out-String
         $LASTEXITCODE | Should -Be 0
         $output | Should -Match 'Ready for the first collection'
+        $output | Should -Not -Match 'ignored with'
         Test-Path -LiteralPath (Join-Path $dir 'data') | Should -BeFalse
     }
     It 'Report collects, reports and returns 2 when a server cannot be read' {
         $dir = Join-Path $TestDrive 'script'
         $cfg = New-TestConfig $dir
-        $start = $script:Base.AddHours(-1).ToString('o'); $end = $script:Base.AddHours(2).ToString('o')
-        $output = & pwsh -NoProfile -File (Join-Path $script:Root 'Invoke-ExchangeLogReport.ps1') -Range Custom -Start $start -End $end -ReportType Detailed -ConfigPath $cfg 2>&1 | Out-String
+        $start = $script:Base.AddHours(-1); $end = $script:Base.AddHours(2)
+        # -Start / -End alone: custom period (-Range Custom implied), never the default range.
+        $output = & pwsh -NoProfile -File (Join-Path $script:Root 'Invoke-ExchangeLogReport.ps1') -Start $start.ToString('o') -End $end.ToString('o') -ReportType Detailed -ConfigPath $cfg 2>&1 | Out-String
         $LASTEXITCODE | Should -Be 2
+        $output | Should -Match 'Report \W Detailed \W Custom'
+        $zone = (Import-ExlConfiguration -Path $cfg -Root $script:Root).Zone
+        $output | Should -Match ([regex]::Escape((Format-ExlRange $start.ToUnixTimeMilliseconds() $end.ToUnixTimeMilliseconds() $zone)))
         $output | Should -Match 'EXCH02'
         $output | Should -Match 'Report ready'
         @(Get-ChildItem (Join-Path $dir 'reports') -Recurse -Filter '*.html').Count | Should -Be 1
+    }
+    It 'never ignores a period parameter silently' {
+        $dir = Join-Path $TestDrive 'period'
+        $cfg = New-TestConfig $dir
+        $entry = Join-Path $script:Root 'Invoke-ExchangeLogReport.ps1'
+        # A period with a mode that does not use it: run, with the reason.
+        $output = & pwsh -NoProfile -File $entry -Mode Status -Range Custom -Start '2026-10-01 08:00' -End '2026-10-01 12:00' -User alice -ConfigPath $cfg 2>&1 | Out-String
+        $LASTEXITCODE | Should -Be 0
+        $output | Should -Match '-Range, -Start, -End ignored with -Mode Status: -Mode Status describes the whole database'
+        $output | Should -Match '-User ignored with -Mode Status'
+        # A period that contradicts -Range: error, nothing is run.
+        $output = & pwsh -NoProfile -File $entry -Range Last7Days -Start '2026-10-01 08:00' -End '2026-10-01 12:00' -ConfigPath $cfg 2>&1 | Out-String
+        $LASTEXITCODE | Should -Be 1
+        $output | Should -Match 'cannot be combined with -Range Last7Days'
+        Test-Path -LiteralPath (Join-Path $dir 'data') | Should -BeFalse
+        # Two kinds of period: refused by the parameter sets before the script runs.
+        { & $entry -Month 2026-09 -Start '2026-10-01 08:00' -End '2026-10-01 12:00' -ConfigPath $cfg } | Should -Throw -ErrorId 'AmbiguousParameterSet*'
+        { & $entry -Date 2026-09-28 -Month 2026-09 -ConfigPath $cfg } | Should -Throw -ErrorId 'AmbiguousParameterSet*'
+        $syntax = (Get-Command $entry).ParameterSets
+        ($syntax | Where-Object Name -eq 'Custom').Parameters | Where-Object Name -in 'Start', 'End' | ForEach-Object IsMandatory | Should -Be $true, $true
     }
 }
 

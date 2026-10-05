@@ -2,16 +2,18 @@
 //  Exchange Log Report - engine, part 4: report (SQLite -> CSV + HTML)
 // -----------------------------------------------------------------------------
 //  Author  : Nicolas Fabert
-//  Version : 1.4.0
+//  Version : 1.6.1
 //
 //  Datasets (HTML tabs: sessions, issues, users, operations, messages, smtpclients; servers and daily
-//  feed the server cards and the chart; every dataset is also a CSV file)
+//  feed the server cards and the chart; every dataset is also a CSV file). Edge report (every server of
+//  the report is an Edge Transport server): servers, daily, smtpclients, smtpdestinations, messages, smtp.
 //    servers     one row per server: is it really used? (users, requests, mail flow)
 //    daily       one row per day x server
 //    users       one row per real user (protocols, clients, servers, failures), with its clients and devices
 //    clients     one row per user x protocol x client (user agent or device): versions, devices, addresses (CSV)
 //    operations  one row per protocol x operation: volume, failures, latency (server-wide)
 //    smtpclients one row per SMTP client (address + HELO): applications and devices sending mail
+//    smtpdestinations  Edge report: one row per SMTP destination (address + send connector): where the Edge sends mail
 //    access      one row per day x server x user x protocol (CSV only: can be large)
 //    sessions    Detailed: ONE ROW PER CLIENT SESSION, with its timeline (front and back end) behind
 //    issues      Detailed: failed and slow requests with their resolution (recovered or not)
@@ -44,6 +46,10 @@ namespace ExchangeLogReport
         public string Title = "Exchange Server usage and troubleshooting", ToolVersion = "", Generated = "";
         public long RecoveryWindowMs = 1800000, SlowRequestMs = 5000;
         public int MaxHtmlRows = 200000;
+        // Edge report: every server of the report is an Edge Transport server (SMTP and message tracking only):
+        // no client access dataset, SMTP destinations added, Edge layout in the HTML file.
+        public bool Edge;
+        public string[] EdgeServers = new string[0];
     }
 
     /// <summary>Kinds: text, num, time (local seconds), list (string[]), steps (list of rows).</summary>
@@ -243,6 +249,16 @@ namespace ExchangeLogReport
             }
             foreach (var r in Rows(store, "SELECT time_ms/3600000, server, COUNT(DISTINCT COALESCE(message_id, internal_id))" + msgWhere + " GROUP BY 1, 2;", m.P))
                 Get(daily, TimeUtil.Day(L(r[0]) * 3600000L, zone) + "|" + S(r[1])).Messages += L(r[2]);
+            // Servers without client access (Edge Transport, mail flow only): activity dates and days from the mail flow.
+            foreach (var r in Rows(store, "SELECT server, MIN(time_ms), MAX(time_ms)" + smtpWhere + " GROUP BY server UNION ALL SELECT server, MIN(time_ms), MAX(time_ms)" + msgWhere + " GROUP BY server;", m.P))
+            {
+                var s = Get(servers, S(r[0]));
+                if (s.Requests > 0) continue;
+                if (s.FirstMs == 0 || L(r[1]) < s.FirstMs) s.FirstMs = L(r[1]);
+                if (L(r[2]) > s.LastMs) s.LastMs = L(r[2]);
+            }
+            foreach (var kv in servers.Where(x => x.Value.Requests == 0))
+                kv.Value.Days = daily.Count(d => d.Key.EndsWith("|" + kv.Key, StringComparison.OrdinalIgnoreCase) && d.Value.SmtpIn + d.Value.SmtpOut + d.Value.Messages > 0);
 
             // ---- servers dataset: every configured server appears, used or not --------------------------
             var serverSet = new Dataset("servers", "Servers");
@@ -330,23 +346,42 @@ namespace ExchangeLogReport
                 smtpSet.Html = false;
             }
             var smtpClientSet = BuildSmtpClients(store, q, su, ss, m.P, local);
+            var smtpDestinationSet = q.Edge ? BuildSmtpDestinations(store, q, su, ss, m.P, local) : null;
             var operationSet = q.Users.Any(u => !string.IsNullOrWhiteSpace(u)) ? null : BuildOperations(store, q, d0, d1);
 
             // ---- notes ------------------------------------------------------------------------------------
             if (q.DetailCutoffMs > q.StartMs)
-                result.Notes.Add("Request-level failures, client sessions and SMTP transcripts are kept " + Math.Round((DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() - q.DetailCutoffMs) / 86400000.0) +
+                result.Notes.Add((q.Edge ? "SMTP transcripts are kept " : "Request-level failures, client sessions and SMTP transcripts are kept ") + Math.Round((DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() - q.DetailCutoffMs) / 86400000.0) +
                     " days: before " + TimeUtil.Format(q.DetailCutoffMs, zone, "yyyy-MM-dd HH:mm") + " the report shows the daily aggregates only.");
-            if (TimeUtil.ToLocal(q.StartMs, zone).TimeOfDay != TimeSpan.Zero || TimeUtil.ToLocal(q.EndMs, zone).TimeOfDay != TimeSpan.Zero)
-                result.Notes.Add("Client access usage is aggregated per day: the first and last day of the period are counted as whole days.");
-            if (operationSet == null) result.Notes.Add("Operations are measured per server, not per user: the Operations view is not built when the report is filtered on users.");
+            if (q.Edge)
+                result.Notes.Add("Edge Transport report: SMTP protocol logs and message tracking of " + string.Join(", ", q.EdgeServers) + ". An Edge Transport server has no client access (no IIS, HttpProxy, MAPI, ActiveSync, POP or IMAP).");
+            else
+            {
+                if (TimeUtil.ToLocal(q.StartMs, zone).TimeOfDay != TimeSpan.Zero || TimeUtil.ToLocal(q.EndMs, zone).TimeOfDay != TimeSpan.Zero)
+                    result.Notes.Add("Client access usage is aggregated per day: the first and last day of the period are counted as whole days.");
+                if (operationSet == null) result.Notes.Add("Operations are measured per server, not per user: the Operations view is not built when the report is filtered on users.");
+            }
 
             // ---- files ------------------------------------------------------------------------------------
-            var sets = new List<Dataset> { serverSet, dailySet, userSet, clientSet };
-            if (operationSet != null) sets.Add(operationSet);
-            sets.Add(smtpClientSet);
-            if (q.Detailed) { sets.Add(sessionSet); sets.Add(issues); sets.Add(messageSet); sets.Add(smtpSet); }
+            List<Dataset> sets;
+            if (q.Edge)
+            {
+                // Client access columns mean nothing on an Edge Transport server: left out of the files.
+                var clientAccess = new[] { "Real users", "Requests", "Failed requests", "Unresolved failures", "Protocols", "Protocol detail" };
+                DropColumns(serverSet, clientAccess);
+                DropColumns(dailySet, clientAccess);
+                sets = new List<Dataset> { serverSet, dailySet, smtpClientSet, smtpDestinationSet };
+                if (q.Detailed) { sets.Add(messageSet); sets.Add(smtpSet); }
+            }
+            else
+            {
+                sets = new List<Dataset> { serverSet, dailySet, userSet, clientSet };
+                if (operationSet != null) sets.Add(operationSet);
+                sets.Add(smtpClientSet);
+                if (q.Detailed) { sets.Add(sessionSet); sets.Add(issues); sets.Add(messageSet); sets.Add(smtpSet); }
+            }
             foreach (var d in sets) result.Counts[d.Name] = d.Rows.Count;
-            if (sessionSet != null)
+            if (sessionSet != null && sets.Contains(sessionSet))
             {
                 int outcome = sessionSet.Columns.FindIndex(x => x.Name == "Outcome");
                 result.Counts["sessionsWithFailures"] = sessionSet.Rows.Count(r => { var o = S(r[outcome]) ?? ""; return o != "OK" && o != "OK (slow)"; });
@@ -355,7 +390,7 @@ namespace ExchangeLogReport
             {
                 foreach (var d in sets) result.Files.Add(WriteCsv(d, Path.Combine(q.OutputFolder, q.FilePrefix + "-" + d.FileName + ".csv"), q.CsvDelimiter));
                 string accessPath = Path.Combine(q.OutputFolder, q.FilePrefix + "-ClientAccess-Daily.csv");
-                result.Files.Add(WriteAccessCsv(store, accessPath, q.CsvDelimiter, "SELECT day, server, user, mailbox, protocol, requests, successes, client_errors, server_errors, slow, bytes_in, bytes_out, CASE WHEN requests > 0 THEN total_ms / requests END, max_ms, first_ms, last_ms, client_ip, user_agent" + usageWhere + " ORDER BY day, server, user, protocol;", a.P, zone));
+                if (!q.Edge) result.Files.Add(WriteAccessCsv(store, accessPath, q.CsvDelimiter, "SELECT day, server, user, mailbox, protocol, requests, successes, client_errors, server_errors, slow, bytes_in, bytes_out, CASE WHEN requests > 0 THEN total_ms / requests END, max_ms, first_ms, last_ms, client_ip, user_agent" + usageWhere + " ORDER BY day, server, user, protocol;", a.P, zone));
             }
             if (q.WriteHtml)
             {
@@ -462,7 +497,9 @@ namespace ExchangeLogReport
                 switch (evt)
                 {
                     case "DELIVER": foreach (var x in rcpts) set(x, "Delivered"); break;
-                    case "SEND": foreach (var x in rcpts) { string cur; if (!status.TryGetValue(x, out cur) || !Final.Contains(cur)) set(x, "Sent"); } break;
+                    // SENDEXTERNAL: handed over by SMTP outside the transport services of the organization (an Edge
+                    // Transport server to the mailbox servers or the internet): same meaning as SEND for the report.
+                    case "SEND": case "SENDEXTERNAL": foreach (var x in rcpts) { string cur; if (!status.TryGetValue(x, out cur) || !Final.Contains(cur)) set(x, "Sent"); } break;
                     case "FAIL": foreach (var x in rcpts) set(x, "Failed"); break;
                     case "DEFER": foreach (var x in rcpts) { string cur; if (!status.TryGetValue(x, out cur) || !Final.Contains(cur)) set(x, "Deferred"); } break;
                     case "DROP": dropped = true; foreach (var x in rcpts) set(x, "Dropped"); break;
@@ -520,12 +557,12 @@ namespace ExchangeLogReport
             string client = S(e[13]) ?? S(e[12]);
             string peer = S(e[14]);
             if (evt == "RECEIVE" && client != null) parts.Add("from " + client);
-            if (evt == "SEND" && peer != null) parts.Add("to " + peer);
+            if ((evt == "SEND" || evt == "SENDEXTERNAL") && peer != null) parts.Add("to " + peer);
             if (S(e[15]) != null) parts.Add("connector " + S(e[15]));
             if (rcpts.Length > 0) parts.Add(rcpts.Length <= 3 ? string.Join("; ", rcpts) : string.Join("; ", rcpts.Take(3)) + " (+" + (rcpts.Length - 3) + ")");
             if (S(e[18]) != null) parts.Add("related " + Identity.Cap(S(e[18]), 120));
             if (S(e[8]) != null) parts.Add(Identity.Cap(S(e[8]), 250));
-            if (evt != "RECEIVE" && evt != "SEND" && S(e[16]) != null && parts.Count < 3) parts.Add(Identity.Cap(S(e[16]), 160));
+            if (evt != "RECEIVE" && evt != "SEND" && evt != "SENDEXTERNAL" && S(e[16]) != null && parts.Count < 3) parts.Add(Identity.Cap(S(e[16]), 160));
             return string.Join(" | ", parts);
         }
 
@@ -587,10 +624,10 @@ namespace ExchangeLogReport
                 c.Servers.Add(S(r[1]) ?? ""); if (S(r[2]) != null) c.Connectors.Add(S(r[2]));
                 if (S(r[5]) != null) c.Tls.Add(S(r[5]));
                 if (S(r[6]) != null) c.Auth.Add(S(r[6]));
-                string from = S(r[7]) ?? "<>";
+                string from = string.IsNullOrEmpty(S(r[7])) ? "<>" : S(r[7]);
                 long k; c.Senders.TryGetValue(from, out k); c.Senders[from] = k + 1;
                 if (q.Detailed)
-                    c.Transactions.Add(new object[] { local(t), S(r[1]), S(r[2]), status, S(r[7]), L(r[8]), S(r[10]), S(r[11]), q.IncludeRoutingDetails ? S(r[12]) : null });
+                    c.Transactions.Add(new object[] { local(t), S(r[1]), S(r[2]), status, from, L(r[8]), S(r[10]), S(r[11]), q.IncludeRoutingDetails ? S(r[12]) : null });
             }
             int statusIndex = 3;
             foreach (var c in clients.Values.OrderByDescending(x => x.Count))
@@ -617,6 +654,84 @@ namespace ExchangeLogReport
             public long First, Last, Count, Accepted, Rejected, Deferred, Incomplete, Recipients;
             public SortedSet<string> Servers = new SortedSet<string>(StringComparer.OrdinalIgnoreCase), Connectors = new SortedSet<string>(StringComparer.OrdinalIgnoreCase);
             public SortedSet<string> Tls = new SortedSet<string>(StringComparer.Ordinal), Auth = new SortedSet<string>(StringComparer.OrdinalIgnoreCase);
+            public Dictionary<string, long> Senders = new Dictionary<string, long>(StringComparer.OrdinalIgnoreCase);
+            public List<object[]> Transactions = new List<object[]>();
+        }
+
+        /// <summary>Removes columns (and their values in every row) from a dataset.</summary>
+        static void DropColumns(Dataset d, IEnumerable<string> names)
+        {
+            var drop = new HashSet<int>(d.Columns.Select((c, i) => new { c, i }).Where(x => names.Contains(x.c.Name)).Select(x => x.i));
+            if (drop.Count == 0) return;
+            d.Columns = d.Columns.Where((c, i) => !drop.Contains(i)).ToList();
+            for (int r = 0; r < d.Rows.Count; r++) d.Rows[r] = d.Rows[r].Where((v, i) => !drop.Contains(i)).ToArray();
+        }
+
+        // ------------------------------------------------------------------ SMTP destinations (Edge report)
+
+        static readonly System.Text.RegularExpressions.Regex BannerRx = new System.Text.RegularExpressions.Regex(@"(?m)^\S+ S: 220[ -](\S+)", System.Text.RegularExpressions.RegexOptions.Compiled);
+
+        /// <summary>
+        /// One row per SMTP destination of the Edge Transport servers (remote address + send connector): Exchange
+        /// Online, the MX of the internet domains, the mailbox servers of the organization (EdgeSync), with volume,
+        /// deferrals and failures. The remote host is the name in its 220 banner (SMTP transcript, DetailRetentionDays).
+        /// The Detailed report keeps up to 200 transactions per destination (failures first) with their transcript.
+        /// </summary>
+        static Dataset BuildSmtpDestinations(Store store, ReportRequest q, string userFilter, string serverFilter, Dictionary<string, object> p, Func<long, object> local)
+        {
+            var set = new Dataset("smtpdestinations", "SmtpDestinations");
+            foreach (var n in new[] { "Remote IP:text", "Remote host:text", "Connector:text", "Servers:text", "Transactions:num", "Sent:num", "Deferred:num", "Failed:num",
+                "Not completed:num", "Recipients:num", "Senders:text", "TLS:text", "First seen:time", "Last seen:time", "Last error:text", "Transactions detail:steps" })
+            { var x = n.Split(':'); set.Add(x[0], x[1]); }
+            set.Columns[15].Grid = false; set.Columns[15].Csv = false;
+            var targets = new Dictionary<string, SmtpTarget>(StringComparer.OrdinalIgnoreCase);
+            foreach (var r in Rows(store, "SELECT time_ms,server,connector,remote_ep,tls,mail_from,rcpt_count,status,response,message_id,transcript FROM smtp_transaction " +
+                "WHERE time_ms >= @t0 AND time_ms < @t1 AND direction='Send'" + userFilter + serverFilter + " ORDER BY time_ms;", p))
+            {
+                string ip = Identity.Host(S(r[3])) ?? "", connector = S(r[2]) ?? "";
+                SmtpTarget c;
+                if (!targets.TryGetValue(ip + "|" + connector, out c)) { c = new SmtpTarget { Ip = ip, Connector = connector, First = L(r[0]) }; targets[ip + "|" + connector] = c; }
+                long t = L(r[0]);
+                string status = S(r[7]) ?? "", transcript = S(r[10]);
+                c.Last = t; c.Count++;
+                switch (status)
+                {
+                    case "Sent": c.Sent++; break;
+                    case "Rejected": c.Failed++; c.LastError = S(r[8]); break;
+                    case "Deferred": c.Deferred++; c.LastError = S(r[8]); break;
+                    default: c.Incomplete++; break;
+                }
+                if (transcript != null) { var b = BannerRx.Match(transcript); if (b.Success) c.Host = b.Groups[1].Value; }
+                c.Recipients += L(r[6]);
+                c.Servers.Add(S(r[1]) ?? "");
+                if (S(r[4]) != null) c.Tls.Add(S(r[4]));
+                string from = string.IsNullOrEmpty(S(r[5])) ? "<>" : S(r[5]);
+                long k; c.Senders.TryGetValue(from, out k); c.Senders[from] = k + 1;
+                if (q.Detailed)
+                    c.Transactions.Add(new object[] { local(t), S(r[1]), S(r[2]), status, from, L(r[6]), S(r[8]), S(r[9]), q.IncludeRoutingDetails ? transcript : null });
+            }
+            const int statusIndex = 3;
+            foreach (var c in targets.Values.OrderByDescending(x => x.Count))
+            {
+                var detail = c.Transactions;
+                if (detail.Count > 200)
+                {
+                    var failed = detail.Where(x => S(x[statusIndex]) != "Sent").Reverse().Take(150).ToList();
+                    var sent = detail.Where(x => S(x[statusIndex]) == "Sent").Reverse().Take(200 - failed.Count).ToList();
+                    detail = failed.Concat(sent).OrderBy(x => L(x[0])).ToList();
+                }
+                set.Rows.Add(new object[] { c.Ip, c.Host, c.Connector, string.Join(", ", c.Servers), c.Count, c.Sent, c.Deferred, c.Failed, c.Incomplete, c.Recipients,
+                    string.Join(", ", c.Senders.OrderByDescending(x => x.Value).Take(3).Select(x => x.Key + " x" + x.Value.ToString(CultureInfo.InvariantCulture))) + (c.Senders.Count > 3 ? " (+" + (c.Senders.Count - 3) + ")" : ""),
+                    c.Tls.Count == 0 ? "No" : string.Join(", ", c.Tls), local(c.First), local(c.Last), c.LastError, detail });
+            }
+            return set;
+        }
+
+        sealed class SmtpTarget
+        {
+            public string Ip, Host, Connector, LastError;
+            public long First, Last, Count, Sent, Deferred, Failed, Incomplete, Recipients;
+            public SortedSet<string> Servers = new SortedSet<string>(StringComparer.OrdinalIgnoreCase), Tls = new SortedSet<string>(StringComparer.Ordinal);
             public Dictionary<string, long> Senders = new Dictionary<string, long>(StringComparer.OrdinalIgnoreCase);
             public List<object[]> Transactions = new List<object[]>();
         }
@@ -755,6 +870,7 @@ namespace ExchangeLogReport
                     w.WriteString("periodStart", TimeUtil.Format(q.StartMs, q.Zone, "yyyy-MM-dd HH:mm"));
                     w.WriteString("periodEnd", TimeUtil.Format(q.EndMs, q.Zone, "yyyy-MM-dd HH:mm"));
                     w.WriteBoolean("detailed", q.Detailed);
+                    w.WriteBoolean("edge", q.Edge);
                     w.WriteBoolean("includeRouting", q.IncludeRoutingDetails);
                     w.WriteBoolean("includeSessions", q.IncludeSessionDetails);
                     w.WriteNumber("slowRequestMs", q.SlowRequestMs);

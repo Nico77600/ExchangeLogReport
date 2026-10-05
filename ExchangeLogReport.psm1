@@ -10,7 +10,7 @@
         1. Console and log        Write-Exl* functions (what the administrator sees)
         2. Configuration          Import-ExlConfiguration (reads and checks the .psd1 file)
         3. Engine                 Initialize-ExlEngine (SQLite + compiled C# engine)
-        4. Periods                Resolve-ExlPeriod
+        4. Command line, periods  Resolve-ExlRange, Resolve-ExlPeriod, Get-ExlIgnoredParameter
         5. Sources                Get-ExlSources (log folders of each Exchange server)
         6. Collection             Invoke-ExlCollection (log files -> SQLite)
         7. Report                 New-ExlReport (SQLite -> CSV / HTML)
@@ -21,13 +21,13 @@
 
 .NOTES
     Author  : Nicolas Fabert
-    Version : 1.4.0
+    Version : 1.6.1
     History : see CHANGELOG.md
 #>
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
-$script:ToolVersion = '1.4.0'
+$script:ToolVersion = '1.6.1'
 $script:ToolRoot = $PSScriptRoot
 $script:LogWriter = $null
 $script:LogPath = $null
@@ -35,8 +35,16 @@ $script:LogPath = $null
 # neither in the Servers block nor in the file written by -Mode Discover (PathsFileName).
 $script:ServerRootKeys = @('ExchangePath', 'IisLogPath', 'LoggingPath', 'TransportLogPath')
 $script:ServerPathKeys = @('HttpProxyPath', 'MapiHttpPath', 'ImapLogPath', 'PopLogPath', 'IisFrontEndPath', 'IisBackEndPath',
-    'FrontEndReceivePath', 'FrontEndSendPath', 'HubReceivePath', 'HubSendPath', 'MailboxReceivePath', 'MailboxSendPath', 'MessageTrackingPath')
+    'FrontEndReceivePath', 'FrontEndSendPath', 'HubReceivePath', 'HubSendPath', 'MailboxReceivePath', 'MailboxSendPath',
+    'EdgeReceivePath', 'EdgeSendPath', 'MessageTrackingPath')
 $script:PathsFileName = 'ExchangeLogReport.paths.psd1'
+# Role of a server (Servers block, -Mode Discover or detected at collection time). An Edge Transport server has
+# no client access (no IIS, HttpProxy, MAPI, ActiveSync, POP3 or IMAP4): only its SMTP protocol logs
+# (TransportRoles\Logs\Edge\ProtocolLog) and its message tracking are read.
+$script:ServerRoles = @('Mailbox', 'Edge')
+$script:EdgeRoleKey = 'HKLM:\SOFTWARE\Microsoft\ExchangeServer\v15\EdgeTransportRole'
+# Default report title: an Edge report gets its own title unless Report.Title was changed.
+$script:DefaultReportTitle = 'Exchange Server usage and troubleshooting'
 # Sources that Exchange itself writes all the time (health probes hit every web site within minutes):
 # a newest file older than Collection.StaleSourceHours means that logging stopped or that the logs were
 # moved. Not message tracking nor SMTP: a server without mail flow writes nothing there for months.
@@ -321,12 +329,13 @@ function Import-ExlConfiguration {
     # ---- servers (paths are resolved once the sources are known) ----------------------------------
     $blocks = [Collections.Generic.List[hashtable]]::new()
     $index = 0
-    $allowed = @('Name') + $script:ServerRootKeys + $script:ServerPathKeys
+    $allowed = @('Name', 'Role') + $script:ServerRootKeys + $script:ServerPathKeys
     foreach ($s in @($config.Servers)) {
         $index++
         if ($s -isnot [hashtable]) { $errors.Add("Servers[$index] must be a @{ } block."); continue }
         if (-not [string]$s['Name']) { $errors.Add("Servers[$index].Name is required."); continue }
         foreach ($key in $s.Keys) { if ($key -notin $allowed) { $errors.Add("Servers[$index].$key is not a known setting. Allowed: $($allowed -join ', ').") } }
+        if ($s.ContainsKey('Role') -and [string]$s['Role'] -notin $script:ServerRoles) { $errors.Add("Servers[$index].Role must be $($script:ServerRoles -join ' or ') (current value: '$($s['Role'])').") }
         $blocks.Add($s)
     }
     $duplicates = @($blocks | ForEach-Object { ([string]$_['Name']).ToUpperInvariant() } | Group-Object | Where-Object Count -gt 1 | ForEach-Object Name)
@@ -394,7 +403,7 @@ function Import-ExlConfiguration {
             IncludeSessionDetails = Test-Bool (Get-Value $r 'Report' 'IncludeSessionDetails' $true) 'Report.IncludeSessionDetails'
             CsvDelimiter          = [string](Get-Value $r 'Report' 'CsvDelimiter' ';')
             MaxHtmlRows           = Test-Int (Get-Value $r 'Report' 'MaxHtmlRows' 200000) 'Report.MaxHtmlRows' 1000 2000000
-            Title                 = [string](Get-Value $r 'Report' 'Title' 'Exchange Server usage and troubleshooting')
+            Title                 = [string](Get-Value $r 'Report' 'Title' $script:DefaultReportTitle)
             TemplatePath          = Join-Path $Root 'templates\Report.template.html'
         }
         Logging    = [ordered]@{
@@ -439,6 +448,8 @@ function Resolve-ExlServerPaths {
           Default            derived from the roots found by Discover, or from the default
                              installation folders on C:
           IIS                set during a collection from applicationHost.config (Test-ExlIisSites)
+        Role (Mailbox or Edge) comes from the Servers block or the paths file (RoleOrigin Configuration
+        or Discover); otherwise it is Mailbox until Resolve-ExlServerRole detects an Edge Transport server.
     #>
     param([Parameter(Mandatory)][string]$Name, [hashtable]$Configured = @{}, [hashtable]$Discovered, [Parameter(Mandatory)]$Sources)
     $origin = [ordered]@{}
@@ -467,9 +478,15 @@ function Resolve-ExlServerPaths {
         HubSendPath         = Join-ExlPath $transport 'Hub\ProtocolLog\SmtpSend'
         MailboxReceivePath  = Join-ExlPath $transport 'Mailbox\ProtocolLog\SmtpReceive'
         MailboxSendPath     = Join-ExlPath $transport 'Mailbox\ProtocolLog\SmtpSend'
+        EdgeReceivePath     = Join-ExlPath $transport 'Edge\ProtocolLog\SmtpReceive'
+        EdgeSendPath        = Join-ExlPath $transport 'Edge\ProtocolLog\SmtpSend'
         MessageTrackingPath = Join-ExlPath $transport 'MessageTracking'
     }
-    $server = [ordered]@{ Name = $Name; ExchangePath = $exchange; IisLogPath = $iis; Discovered = [bool]$Discovered }
+    $canonical = { param($Value) @($script:ServerRoles | Where-Object { $_ -eq [string]$Value }) | Select-Object -First 1 }
+    $role = 'Mailbox'; $roleOrigin = 'Default'
+    if ($Configured['Role'] -and (& $canonical $Configured['Role'])) { $role = & $canonical $Configured['Role']; $roleOrigin = 'Configuration' }
+    elseif ($Discovered -and $Discovered['Role'] -and (& $canonical $Discovered['Role'])) { $role = & $canonical $Discovered['Role']; $roleOrigin = 'Discover' }
+    $server = [ordered]@{ Name = $Name; Role = $role; RoleOrigin = $roleOrigin; ExchangePath = $exchange; IisLogPath = $iis; Discovered = [bool]$Discovered }
     foreach ($key in $script:ServerPathKeys) {
         if ($Configured[$key]) { $server[$key] = ([string]$Configured[$key]).TrimEnd('\'); $origin[$key] = 'Configuration' }
         elseif ($Discovered -and $Discovered[$key]) { $server[$key] = ([string]$Discovered[$key]).TrimEnd('\'); $origin[$key] = 'Discover' }
@@ -548,7 +565,62 @@ function Open-ExlStore {
 
 #endregion
 
-#region 4. Periods ------------------------------------------------------------------------------
+#region 4. Command line and periods ---------------------------------------------------------------
+
+function Get-ExlIgnoredParameter {
+    <#
+    .SYNOPSIS
+        Parameters of the command line that the mode does not use, one sentence per group with the reason:
+        a parameter is never ignored silently (the script shows these sentences as warnings).
+          period      -Range -Month -Date -Start -End        -Mode Report only
+          report      -ReportType -User -Include*Details      -Mode Report only
+                      -OutputPath -NoCollect
+          servers     -Server                                 -Mode Report and Collect
+          discovery   -ConnectTo -Credential                  -Mode Discover only
+    #>
+    param([Parameter(Mandatory)][ValidateSet('Report', 'Collect', 'Status', 'Discover')][string]$Mode, [string[]]$Name)
+    $groups = @(
+        @{ Names = 'Range', 'Month', 'Date', 'Start', 'End'; Modes = @('Report'); Why = @{
+                Collect  = 'a collection reads every new log line, whatever its date; the period only selects what the report shows (-Mode Report)'
+                Status   = '-Mode Status describes the whole database, whatever the period'
+                Discover = '-Mode Discover reads no log line, it only finds the log folders' } }
+        @{ Names = 'ReportType', 'User', 'IncludeRoutingDetails', 'IncludeSessionDetails', 'OutputPath', 'NoCollect'; Modes = @('Report'); Why = 'used by -Mode Report only' }
+        @{ Names = 'Server'; Modes = 'Report', 'Collect'; Why = @{
+                Status   = '-Mode Status describes the whole database'
+                Discover = '-Mode Discover reads the settings of every Exchange server' } }
+        @{ Names = 'ConnectTo', 'Credential'; Modes = @('Discover'); Why = 'used by -Mode Discover only' }
+    )
+    foreach ($g in $groups) {
+        if ($Mode -in $g.Modes) { continue }
+        $hit = @($g.Names | Where-Object { $_ -in $Name })
+        if (-not $hit.Count) { continue }
+        $why = if ($g.Why -is [hashtable]) { $g.Why[$Mode] } else { $g.Why }
+        '{0} ignored with -Mode {1}: {2}.' -f (($hit | ForEach-Object { "-$_" }) -join ', '), $Mode, $why
+    }
+}
+
+function Resolve-ExlRange {
+    <#
+    .SYNOPSIS
+        Range of the report from the command line. A period parameter selects its range on its own:
+        -Start / -End Custom, -Month Month, -Date Day. Without one: -Range, else the default range.
+        A period parameter is never ignored: with another -Range, or with the parameter of another range,
+        it is an error.
+    #>
+    param([string]$Range, [string]$Month, [string]$Date, [string]$Start, [string]$End, [Parameter(Mandatory)][string]$Default)
+    $given = [ordered]@{}
+    if ($Start -or $End) { $given['Custom'] = '-Start / -End' }
+    if ($Month) { $given['Month'] = '-Month' }
+    if ($Date) { $given['Day'] = '-Date' }
+    if ($given.Count -gt 1) { throw ('{0} each define the period of the report: use only one of them.' -f (@($given.Values) -join ' and ')) }
+    if (-not $given.Count) { return $(if ($Range) { $Range } else { $Default }) }
+    $implied = @($given.Keys)[0]
+    if ($Range -and $Range -ne $implied) {
+        $verb = if ($implied -eq 'Custom') { 'define' } else { 'defines' }
+        throw ('{0} {1} the period of the report (-Range {2}) and cannot be combined with -Range {3}: remove -Range {3}.' -f $given[$implied], $verb, $implied, $Range)
+    }
+    return $implied
+}
 
 function ConvertTo-ExlUnixMs {
     <# Text date -> Unix ms. Without an explicit offset (Z, +02:00) the date is read in the report time zone. #>
@@ -630,12 +702,20 @@ function Get-ExlSources {
           EasBackEnd   <IisBackEndPath>\*.log (Exchange Back End web site: ActiveSync results)
                        + the folder of each custom back-end IIS site hosting ActiveSync
           Imap4, Pop3  <ImapLogPath>, <PopLogPath> (optional: protocol logging must be enabled)
+        Edge Transport server (Role Edge): SmtpReceive <EdgeReceivePath>, SmtpSend <EdgeSendPath> and
+        Tracking only; it has no client access, and Sources.TransportRoles does not apply to it.
         Optional: the folder may not exist yet (logging off or never used, custom site without traffic).
     #>
     param([Parameter(Mandatory)]$Server, [Parameter(Mandatory)]$Settings)
     $src = $Settings.Sources
     $list = [Collections.Generic.List[object]]::new()
     $add = { param($Kind, $Role, $Label, $Key, $Filter, $Recurse) $list.Add([pscustomobject]@{ Kind = $Kind; Role = $Role; Label = $Label; Folder = $Server.$Key; Filter = $Filter; Recurse = $Recurse; PathKey = $Key; Optional = $Kind -in $script:OptionalKinds }) }
+    if (Test-ExlEdgeServer $Server) {
+        if ($src.SmtpReceive) { & $add 'SmtpReceive' 'Edge' 'SMTP in (Edge)' 'EdgeReceivePath' '*.log' $true }
+        if ($src.SmtpSend) { & $add 'SmtpSend' 'Edge' 'SMTP out (Edge)' 'EdgeSendPath' '*.log' $true }
+        if ($src.MessageTracking) { & $add 'Tracking' $null 'Tracking' 'MessageTrackingPath' 'MSGTRK*.log' $false }
+        return $list.ToArray()
+    }
     $custom = {
         param($Kind, $Role, [scriptblock]$Where)
         foreach ($c in @($Server.IisCustomSites | Where-Object { $_ -and $_.Role -eq $Role } | Where-Object $Where)) {
@@ -670,8 +750,10 @@ function Get-ExlSourceFiles {
     .SYNOPSIS
         Files of one source that must be read: modified within BackfillDays and not read to their end
         (read position different from the file size: new lines, or a session held back). Oldest first.
+        Known is keyed "kind|FileKey": a file already read through another path of the same server (its
+        administrative share before -Mode Discover, its local path after) is known.
     #>
-    param([Parameter(Mandatory)]$Source, [Parameter(Mandatory)][hashtable]$Known, [Parameter(Mandatory)][datetime]$Since)
+    param([Parameter(Mandatory)]$Source, [Parameter(Mandatory)][hashtable]$Known, [Parameter(Mandatory)][datetime]$Since, [Parameter(Mandatory)][string]$Server)
     $files = if ($Source.Recurse) { Get-ChildItem -LiteralPath $Source.Folder -Filter $Source.Filter -File -Recurse -ErrorAction SilentlyContinue }
              else { Get-ChildItem -LiteralPath $Source.Folder -Filter $Source.Filter -File -ErrorAction SilentlyContinue }
     $todo = [Collections.Generic.List[object]]::new()
@@ -680,7 +762,7 @@ function Get-ExlSourceFiles {
     foreach ($f in @($files)) {
         $total++
         if ($f.LastWriteTimeUtc -gt $newest) { $newest = $f.LastWriteTimeUtc }
-        $key = "$($Source.Kind)|$($f.FullName)"
+        $key = "$($Source.Kind)|$([ExchangeLogReport.Store]::FileKey($Server, $f.FullName))"
         $isKnown = $Known.ContainsKey($key)
         if (-not $isKnown -and $f.LastWriteTimeUtc -lt $Since) { continue }
         if ($isKnown -and [long]$Known[$key] -eq $f.Length) { continue }
@@ -710,7 +792,7 @@ function Test-ExlServerAccess {
     param([Parameter(Mandatory)]$Server, [Parameter(Mandatory)]$Settings)
     $problems = [Collections.Generic.List[string]]::new()
     foreach ($s in Get-ExlSources $Server $Settings) {
-        if (-not (Test-Path -LiteralPath $s.Folder -PathType Container) -and -not $s.Optional) {
+        if (-not (Test-Path -LiteralPath $s.Folder -PathType Container -ErrorAction SilentlyContinue) -and -not $s.Optional) {
             $problems.Add("$($s.Label): folder not found or not readable ($($s.Folder))")
         }
     }
@@ -726,6 +808,52 @@ function Get-ExlPathOrigin {
     if ($configured) { return 'paths set in the configuration' }
     if ('IIS' -in $origins) { return 'IIS folders from applicationHost.config, other default paths: run -Mode Discover to check them' }
     return 'default paths: run -Mode Discover to check them'
+}
+
+function Test-ExlEdgeServer {
+    <# $true for an Edge Transport server (Role Edge): SMTP protocol logs and message tracking only. #>
+    param([Parameter(Mandatory)]$Server)
+    return [bool]($Server.PSObject.Properties['Role'] -and $Server.Role -eq 'Edge')
+}
+
+function Resolve-ExlServerRole {
+    <#
+    .SYNOPSIS
+        Exchange role of a server for the collection and the report: Mailbox, or Edge (Edge Transport server: no IIS,
+        HttpProxy, MAPI, ActiveSync, POP3 or IMAP4, only the SMTP protocol logs and message tracking).
+        A Role set in the Servers block or recorded by -Mode Discover is kept. Otherwise it is detected:
+          this computer     registry key HKLM:\SOFTWARE\Microsoft\ExchangeServer\v15\EdgeTransportRole
+          another server    AD LDS folder of the Edge role (<ExchangePath>\TransportRoles\data\Adam)
+                            and no client access folder (<ExchangePath>\FrontEnd\HttpProxy)
+          -Store (report)   the other servers are not contacted: Edge SMTP logs already collected
+                            (role Edge in smtp_transaction, or files of an Edge\ProtocolLog folder)
+                            and no client access log collected for the server.
+        A folder that cannot be read counts as absent (Mailbox). Sets Role and RoleOrigin (Detected)
+        on the server object and returns the role.
+    #>
+    param([Parameter(Mandatory)]$Server, [switch]$Local, $Store)
+    if ($Server.RoleOrigin -in 'Configuration', 'Discover') { return $Server.Role }
+    $how = $null
+    if ($Local) {
+        if (Test-Path -LiteralPath $script:EdgeRoleKey) { $how = "registry key $script:EdgeRoleKey" }
+    }
+    elseif ($Store) {
+        $sql = "SELECT (SELECT COUNT(*) FROM smtp_transaction WHERE server = @s AND role = 'Edge') + " +
+               "(SELECT COUNT(*) FROM source_file WHERE server = @s AND kind IN ('SmtpReceive', 'SmtpSend') AND path LIKE '%\Edge\ProtocolLog\%'), " +
+               "(SELECT COUNT(*) FROM source_file WHERE server = @s AND kind IN ('HttpProxy', 'Iis', 'MapiBackEnd', 'EasBackEnd', 'Imap4', 'Pop3'))"
+        $row = $Store.Query($sql, @{ s = $Server.Name }).Rows[0]
+        if ([long]$row[0] -gt 0 -and [long]$row[1] -eq 0) { $how = 'Edge SMTP logs and no client access log in the database' }
+    }
+    elseif ((Test-Path -LiteralPath (Join-ExlPath $Server.ExchangePath 'TransportRoles\data\Adam') -PathType Container -ErrorAction SilentlyContinue) -and
+            -not (Test-Path -LiteralPath (Join-ExlPath $Server.ExchangePath 'FrontEnd\HttpProxy') -PathType Container -ErrorAction SilentlyContinue)) {
+        $how = "$($Server.ExchangePath)\TransportRoles\data\Adam without FrontEnd\HttpProxy"
+    }
+    if ($how) {
+        $Server.Role = 'Edge'
+        $Server.RoleOrigin = 'Detected'
+        Write-ExlLog 'INFO' "$($Server.Name): Edge Transport server detected ($how)."
+    }
+    return $Server.Role
 }
 
 #endregion
@@ -777,7 +905,7 @@ function Invoke-ExlCollection {
         $known = @{}
         foreach ($kv in $Store.KnownOffsets($server.Name).GetEnumerator()) { $known[$kv.Key] = $kv.Value }
         foreach ($source in Get-ExlSources $server $Settings) {
-            if (-not (Test-Path -LiteralPath $source.Folder -PathType Container)) {
+            if (-not (Test-Path -LiteralPath $source.Folder -PathType Container -ErrorAction SilentlyContinue)) {
                 # SMTP, MAPI, POP and IMAP protocol log folders exist only where protocol logging is enabled (or has been used);
                 # IIS creates the folder of a site at its first request.
                 if ($source.Optional) {
@@ -790,7 +918,7 @@ function Invoke-ExlCollection {
                 $totals.Unreachable.Add("$($server.Name) $($source.Label): $($source.Folder)")
                 continue
             }
-            $plan = Get-ExlSourceFiles -Source $source -Known $known -Since $since
+            $plan = Get-ExlSourceFiles -Source $source -Known $known -Since $since -Server $server.Name
             $stale = Test-ExlStaleSource -Source $source -Plan $plan -Settings $Settings
             if ($stale) { $totals.Stale.Add("$($server.Name) $($source.Label): $stale ($($source.Folder))") }
             if (-not $plan.Files.Count) {
@@ -841,13 +969,20 @@ function Invoke-ExlCollection {
 #region 7. Report ---------------------------------------------------------------------------------
 
 function New-ExlReport {
-    <# Builds the CSV and HTML files of a period into a new sub-folder of Report.OutputPath. #>
+    <#
+    .SYNOPSIS
+        Builds the CSV and HTML files of a period into a new sub-folder of Report.OutputPath.
+        Edge report when every server of the report (-Server, or the configuration) is an Edge Transport
+        server: mail flow only (SMTP clients and destinations, messages), no client access view.
+    #>
     [CmdletBinding()]
     param([Parameter(Mandatory)]$Store, [Parameter(Mandatory)]$Settings, [Parameter(Mandatory)]$Period,
         [ValidateSet('Usage', 'Detailed')][string]$ReportType = 'Usage', [string[]]$User, [string[]]$Server, [bool]$IncludeRoutingDetails = $true, [bool]$IncludeSessionDetails = $true)
     $zone = $Settings.Zone
+    $scope = @($Settings.Servers | Where-Object { -not $Server -or $_.Name -in $Server })
+    $edge = $scope.Count -gt 0 -and @($scope | Where-Object { -not (Test-ExlEdgeServer $_) }).Count -eq 0
     $stamp = (Format-ExlLocalTime $Period.StartMs $zone 'yyyyMMdd-HHmm') + '_' + (Format-ExlLocalTime $Period.EndMs $zone 'yyyyMMdd-HHmm')
-    $folderName = '{0}_{1}_{2}' -f $Settings.Report.FilePrefix, $ReportType, $stamp
+    $folderName = '{0}_{1}{2}_{3}' -f $Settings.Report.FilePrefix, $(if ($edge) { 'Edge' } else { '' }), $ReportType, $stamp
     if ($User) { $folderName += '_' + (($User | ForEach-Object { ($_ -replace '[^\w@.-]', '_') }) -join '+') }
     $folderName += '_' + (Get-Date -Format 'HHmmss')
     $q = [ExchangeLogReport.ReportRequest]::new()
@@ -867,6 +1002,9 @@ function New-ExlReport {
     $q.CsvDelimiter = $Settings.Report.CsvDelimiter
     $q.TemplatePath = $Settings.Report.TemplatePath
     $q.Title = $Settings.Report.Title
+    $q.Edge = $edge
+    $q.EdgeServers = [string[]]@($scope | Where-Object { Test-ExlEdgeServer $_ } | ForEach-Object Name)
+    if ($edge -and $q.Title -eq $script:DefaultReportTitle) { $q.Title = 'Edge Transport mail flow' }
     $q.ToolVersion = $script:ToolVersion
     $q.Generated = Format-ExlLocalTime ([DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()) $zone 'yyyy-MM-dd HH:mm'
     $q.RecoveryWindowMs = [long]$Settings.Collection.RecoveryWindowMinutes * 60000
@@ -1150,16 +1288,23 @@ function Invoke-ExlDiscovery {
         Windows PowerShell 5.1, View-Only Organization Management is enough) and the IIS log folders
         (applicationHost.config through \\<server>\ADMIN$), checks every folder from this computer and
         writes config\ExchangeLogReport.paths.psd1. Changes nothing on the servers.
+        On an Edge Transport server, reads its own transport settings (local Exchange Management Shell,
+        local administrator; SYSTEM is accepted): SMTP protocol logs and message tracking, no IIS.
+        From the organisation, a configured server that is a subscribed Edge Transport server is recorded
+        with its role only (its log settings are not in Active Directory).
     #>
     [CmdletBinding()]
     param([Parameter(Mandatory)]$Settings, [string]$ConnectTo, [pscredential]$Credential)
     $dot = [char]0x00B7
     $here = [Environment]::MachineName.ToUpperInvariant()
     $isExchange = [bool]$env:ExchangeInstallPath -or (Test-Path -LiteralPath 'HKLM:\SOFTWARE\Microsoft\ExchangeServer\v15\Setup')
+    $isEdge = Test-Path -LiteralPath $script:EdgeRoleKey
     $warnings = [Collections.Generic.List[string]]::new()
     $warn = { param([string]$Text) $warnings.Add($Text); Write-ExlItem Warn $Text }
+    $prop = { param($Object, [string]$Name) if ($null -ne $Object -and $Object.PSObject.Properties[$Name]) { $Object.$Name } }
     $account = [Security.Principal.WindowsIdentity]::GetCurrent().Name
-    if ([Security.Principal.WindowsIdentity]::GetCurrent().IsSystem -and -not $Credential) {
+    # An Edge Transport server has no RBAC: its local Exchange Management Shell needs a local administrator, SYSTEM included.
+    if ([Security.Principal.WindowsIdentity]::GetCurrent().IsSystem -and -not $Credential -and -not ($isEdge -and -not $ConnectTo)) {
         throw 'SYSTEM has no Exchange role: run -Mode Discover with an administrator account that is a member of View-Only Organization Management (or use -Credential). The scheduled collection can keep running as SYSTEM.'
     }
     # Exchange Management Shell on an Exchange server; elsewhere remote PowerShell on the first configured server that answers.
@@ -1168,50 +1313,68 @@ function Invoke-ExlDiscovery {
     # ---- 1. Exchange (Windows PowerShell 5.1) --------------------------------------------------------
     Write-ExlStep 1 4 'Reading the Exchange settings (Windows PowerShell 5.1)' -Icon Server
     $exchange = Get-ExlExchangeSettings -ConnectTo $targets -Credential $Credential
-    $mailboxServers = @($exchange.Servers)
-    Write-ExlItem Ok ("{0} on {1} {2} {3} {2} {4} Exchange server(s), {5} mailbox server(s)" -f $exchange.Method, $exchange.Via, $dot, $exchange.Account, $exchange.ExchangeCount, $mailboxServers.Count)
-    if (-not $mailboxServers.Count) { throw 'No Exchange mailbox server found in the organisation.' }
+    $discovered = @($exchange.Servers)
+    $edgeEntries = @($discovered | Where-Object { (& $prop $_ 'Role') -eq 'Edge' })
+    if ($edgeEntries.Count) {
+        Write-ExlItem Ok ("{0} on {1} {2} {3} {2} Edge Transport server {4}" -f $exchange.Method, $exchange.Via, $dot, $exchange.Account, (($edgeEntries | ForEach-Object Name) -join ', '))
+    }
+    else {
+        Write-ExlItem Ok ("{0} on {1} {2} {3} {2} {4} Exchange server(s), {5} mailbox server(s)" -f $exchange.Method, $exchange.Via, $dot, $exchange.Account, $exchange.ExchangeCount, $discovered.Count)
+    }
+    if (-not $discovered.Count) { throw 'No Exchange mailbox server found in the organisation.' }
 
     # ---- 2. log folders of each server -----------------------------------------------------------------
-    Write-ExlStep 2 4 'Locating the log folders (Exchange and IIS)' -Icon Plan
+    Write-ExlStep 2 4 $(if ($edgeEntries.Count -eq $discovered.Count) { 'Locating the log folders (Edge Transport)' } else { 'Locating the log folders (Exchange and IIS)' }) -Icon Plan
     $labels = [ordered]@{ HttpProxyPath = 'HttpProxy'; MapiHttpPath = 'MAPI back end'; ImapLogPath = 'IMAP4'; PopLogPath = 'POP3'; IisFrontEndPath = 'IIS front end'; IisBackEndPath = 'IIS back end'
         FrontEndReceivePath = 'SMTP in (FrontEnd)'; FrontEndSendPath = 'SMTP out (FrontEnd)'; HubReceivePath = 'SMTP in (Hub)'; HubSendPath = 'SMTP out (Hub)'
-        MailboxReceivePath = 'SMTP in (Mailbox)'; MailboxSendPath = 'SMTP out (Mailbox)'; MessageTrackingPath = 'Message tracking' }
+        MailboxReceivePath = 'SMTP in (Mailbox)'; MailboxSendPath = 'SMTP out (Mailbox)'; EdgeReceivePath = 'SMTP in (Edge)'; EdgeSendPath = 'SMTP out (Edge)'; MessageTrackingPath = 'Message tracking' }
     $found = [ordered]@{}
-    foreach ($x in $mailboxServers) {
+    foreach ($x in $discovered) {
         $name = ([string]$x.Name).ToUpperInvariant()
         $local = $name -eq $here
+        $edge = (& $prop $x 'Role') -eq 'Edge'
         foreach ($w in @($x.Warnings)) { if ($w) { & $warn "${name}: $w" } }
         $raw = [ordered]@{}
-        if ($x.DataPath) {
-            $install = [IO.Path]::GetDirectoryName(([string]$x.DataPath).TrimEnd('\'))
-            $raw.ExchangePath = $install
-            $raw.HttpProxyPath = Join-ExlPath $install 'Logging\HttpProxy'
-            $raw.MapiHttpPath = Join-ExlPath $install 'Logging\MapiHttp\Mailbox'
-        } else { & $warn "${name}: installation folder unknown (empty DataPath): default HttpProxy and MAPI folders kept." }
-        foreach ($key in 'ImapLogPath', 'PopLogPath', 'FrontEndReceivePath', 'FrontEndSendPath', 'HubReceivePath', 'HubSendPath', 'MailboxReceivePath', 'MailboxSendPath', 'MessageTrackingPath') {
-            if ($x.$key) { $raw[$key] = [string]$x.$key }
-        }
         $map = $null
-        try { $map = Get-ExlIisSiteMap -Server $name -Local:$local } catch { Write-ExlLog 'WARN' "${name}: applicationHost.config: $($_.Exception.Message)" }
-        if (-not $map) { & $warn "${name}: IIS settings not readable (\\$name\ADMIN`$, local administrator rights are needed): default IIS folders kept." }
-        else {
-            foreach ($key in $script:ExchangeSites.Keys) {
-                if ($map.$key) { $raw[$key] = $map.$key } else { & $warn "${name}: IIS site '$($script:ExchangeSites[$key])' not found: default folder kept." }
-            }
-            foreach ($p in $map.Problems) { & $warn "${name}: $p" }
+        if ($edge) {
+            # Edge Transport: no client access, no IIS; SMTP protocol logs of the Edge folder and message tracking.
+            if (& $prop $x 'InstallPath') { $raw.ExchangePath = ([string]$x.InstallPath).TrimEnd('\') }
+            else { & $warn "${name}: installation folder unknown: default folders kept for what Exchange did not return." }
+            foreach ($key in 'EdgeReceivePath', 'EdgeSendPath', 'MessageTrackingPath') { if (& $prop $x $key) { $raw[$key] = [string]$x.$key } }
         }
-        $e = [ordered]@{ Version = [string]$x.Version; Site = [string]$x.Site }
+        else {
+            if ($x.DataPath) {
+                $install = [IO.Path]::GetDirectoryName(([string]$x.DataPath).TrimEnd('\'))
+                $raw.ExchangePath = $install
+                $raw.HttpProxyPath = Join-ExlPath $install 'Logging\HttpProxy'
+                $raw.MapiHttpPath = Join-ExlPath $install 'Logging\MapiHttp\Mailbox'
+            } else { & $warn "${name}: installation folder unknown (empty DataPath): default HttpProxy and MAPI folders kept." }
+            foreach ($key in 'ImapLogPath', 'PopLogPath', 'FrontEndReceivePath', 'FrontEndSendPath', 'HubReceivePath', 'HubSendPath', 'MailboxReceivePath', 'MailboxSendPath', 'MessageTrackingPath') {
+                if ($x.$key) { $raw[$key] = [string]$x.$key }
+            }
+            try { $map = Get-ExlIisSiteMap -Server $name -Local:$local } catch { Write-ExlLog 'WARN' "${name}: applicationHost.config: $($_.Exception.Message)" }
+            if (-not $map) { & $warn "${name}: IIS settings not readable (\\$name\ADMIN`$, local administrator rights are needed): default IIS folders kept." }
+            else {
+                foreach ($key in $script:ExchangeSites.Keys) {
+                    if ($map.$key) { $raw[$key] = $map.$key } else { & $warn "${name}: IIS site '$($script:ExchangeSites[$key])' not found: default folder kept." }
+                }
+                foreach ($p in $map.Problems) { & $warn "${name}: $p" }
+            }
+        }
+        $e = [ordered]@{ Version = [string]$x.Version; Site = [string]$x.Site; Role = $(if ($edge) { 'Edge' } else { 'Mailbox' }) }
         foreach ($key in $raw.Keys) { $e[$key] = ConvertTo-ExlRemotePath -Server $name -Path $raw[$key] -Local:$local }
-        $e.ImapProtocolLog = [bool]$x.ImapProtocolLog
-        $e.PopProtocolLog = [bool]$x.PopProtocolLog
+        if (-not $edge) {
+            $e.ImapProtocolLog = [bool]$x.ImapProtocolLog
+            $e.PopProtocolLog = [bool]$x.PopProtocolLog
+        }
         if ($map -and $map.Custom.Count) { $e.IisCustomSites = @($map.Custom) }
 
         # Folders that are not where a default installation puts them (the reason for this mode).
         $default = Resolve-ExlServerPaths -Name $name -Configured @{ ExchangePath = 'C:\Program Files\Microsoft\Exchange Server\V15'; IisLogPath = 'C:\inetpub\logs\LogFiles' } -Sources $Settings.Sources
         $moved = @($labels.Keys | Where-Object { $raw.Contains($_) -and -not [string]::Equals((ConvertTo-ExlRemotePath -Server $name -Path $raw[$_]), (ConvertTo-ExlRemotePath -Server $name -Path $default.$_), [StringComparison]::OrdinalIgnoreCase) } | ForEach-Object { $labels[$_] })
         $where = if ($moved.Count) { 'not in the default folder: ' + ($moved -join ', ') } else { 'default folders' }
-        Write-ExlItem Ok ("{0} {1} {2} {1} site {3} {1} {4}" -f $name, $dot, $e.Version, $e.Site, $where) -Icon Server
+        if ($edge) { Write-ExlItem Ok ("{0} {1} {2} {1} Edge Transport (SMTP and message tracking only) {1} {3}" -f $name, $dot, $e.Version, $where) -Icon Server }
+        else { Write-ExlItem Ok ("{0} {1} {2} {1} site {3} {1} {4}" -f $name, $dot, $e.Version, $e.Site, $where) -Icon Server }
         foreach ($c in @($e['IisCustomSites'] | Where-Object { $_ })) {
             $read = if ($c.Role -eq 'FrontEnd') { 'read with the IIS front end' } elseif ($c.Vdirs -match '(^|, )Microsoft-Server-ActiveSync(,|$)') { 'read with the EAS back end' } else { 'not read (back end without ActiveSync)' }
             Write-ExlItem Info ("{0}: custom IIS site '{1}' {2} {3} {2} {4} {2} {5} {2} {6}" -f $name, $c.Name, $dot, $c.Vdirs, $(if ($c.Role -eq 'BackEnd') { 'back end' } else { 'front end' }), $c.Folder, $read) -Icon Folder
@@ -1219,13 +1382,22 @@ function Invoke-ExlDiscovery {
 
         # Settings that leave holes in the data.
         if ($Settings.Sources.MessageTracking -and $x.MessageTrackingEnabled -eq $false) { & $warn "${name}: message tracking is disabled (Set-TransportService $name -MessageTrackingLogEnabled `$true)." }
-        if ($Settings.Sources.PopImap) {
+        if ($Settings.Sources.PopImap -and -not $edge) {
             if (-not $e.ImapProtocolLog) { & $warn "${name}: IMAP4 protocol logging is off (Set-ImapSettings -Server $name -ProtocolLogEnabled `$true, then restart the IMAP4 services)." }
             if (-not $e.PopProtocolLog) { & $warn "${name}: POP3 protocol logging is off (Set-PopSettings -Server $name -ProtocolLogEnabled `$true, then restart the POP3 services)." }
         }
         $off = @($x.LoggingOff | Where-Object { $_ })
         if (($Settings.Sources.SmtpReceive -or $Settings.Sources.SmtpSend) -and $off.Count) { & $warn ("{0}: SMTP protocol logging is off on {1}: this SMTP traffic is not in the reports." -f $name, ($off -join ', ')) }
         $found[$name] = $e
+    }
+    # Subscribed Edge Transport servers seen from the organisation: their log settings are in their own AD LDS
+    # instance, not in Active Directory. A configured one is recorded with its role so that no client access is
+    # looked for; its folders are the default ones unless -Mode Discover is run on it.
+    foreach ($n in @(& $prop $exchange 'EdgeServers')) {
+        $name = ([string]$n).ToUpperInvariant()
+        if (-not $name -or $found.Contains($name) -or $name -notin @($Settings.Servers | ForEach-Object Name)) { continue }
+        $found[$name] = [ordered]@{ Role = 'Edge' }
+        Write-ExlItem Info ("{0} {1} Edge Transport server (Edge subscription): SMTP protocol logs and message tracking only. Its log settings are not in Active Directory: default folders kept; run -Mode Discover on {0} itself if they were moved." -f $name, $dot) -Icon Server
     }
 
     # ---- 3. folders, as seen by the account running this mode ---------------------------------------
@@ -1234,11 +1406,14 @@ function Invoke-ExlDiscovery {
     foreach ($name in $found.Keys) {
         $current = @($Settings.Servers | Where-Object Name -eq $name) | Select-Object -First 1
         $explicit = @{}
-        if ($current) { foreach ($k in $current.Origin.Keys) { if ($current.Origin[$k] -eq 'Configuration') { $explicit[$k] = $current.$k } } }
+        if ($current) {
+            foreach ($k in $current.Origin.Keys) { if ($current.Origin[$k] -eq 'Configuration') { $explicit[$k] = $current.$k } }
+            if ($current.RoleOrigin -eq 'Configuration') { $explicit['Role'] = $current.Role }
+        }
         $server = Resolve-ExlServerPaths -Name $name -Configured $explicit -Discovered $found[$name] -Sources $Settings.Sources
         $missing = [Collections.Generic.List[string]]::new(); $notYet = [Collections.Generic.List[string]]::new(); $ok = 0
         foreach ($s in Get-ExlSources $server $Settings) {
-            if (Test-Path -LiteralPath $s.Folder -PathType Container) { $ok++ }
+            if (Test-Path -LiteralPath $s.Folder -PathType Container -ErrorAction SilentlyContinue) { $ok++ }
             elseif ($s.Optional) { $notYet.Add($s.Label) }
             else { $missing.Add("$($s.Label) ($($s.Folder))") }
         }
@@ -1288,6 +1463,7 @@ function Invoke-ExlDiscovery {
 
     [pscustomobject]@{
         Found       = @($found.Keys)
+        Edge        = @($found.Keys | Where-Object { $found[$_]['Role'] -eq 'Edge' })
         NotInConfig = @($found.Keys | Where-Object { $_ -notin $configured })
         NotFound    = @($configured | Where-Object { $_ -notin $found.Keys })
         Warnings    = $warnings.ToArray()

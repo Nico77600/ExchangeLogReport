@@ -8,7 +8,7 @@
 #
 @{
     RootModule        = 'ExchangeLogReport.psm1'
-    ModuleVersion     = '1.4.0'
+    ModuleVersion     = '1.6.1'
     GUID              = '7b1cdb50-cb32-4c85-8c8d-9d7a7c8eec14'
     Author            = 'Nicolas Fabert'
     Description       = 'Exchange Log Report: collects the IIS / HTTP Proxy, SMTP protocol and message tracking logs of Exchange Server SE (on-premises) into a local SQLite database, without the noise of system mailboxes and probes, and produces usage and troubleshooting reports (CSV and HTML).'
@@ -20,7 +20,7 @@
         'Start-ExlLog', 'Stop-ExlLog', 'Write-ExlLog'
         'Write-ExlBanner', 'Write-ExlStep', 'Write-ExlItem', 'Write-ExlSummary'
         'Format-ExlNumber', 'Format-ExlDuration', 'Format-ExlBytes', 'Format-ExlRange', 'Format-ExlLocalTime'
-        'Get-ExlTimeZone', 'Resolve-ExlPeriod', 'Get-ExlSources', 'Test-ExlServerAccess', 'Get-ExlPathOrigin', 'Test-ExlIisSites'
+        'Get-ExlTimeZone', 'Resolve-ExlRange', 'Resolve-ExlPeriod', 'Get-ExlIgnoredParameter', 'Get-ExlSources', 'Test-ExlServerAccess', 'Get-ExlPathOrigin', 'Test-ExlIisSites', 'Resolve-ExlServerRole'
         'Invoke-ExlCollection', 'New-ExlReport', 'Show-ExlStatus', 'Invoke-ExlRetention', 'Invoke-ExlDiscovery'
     )
 }

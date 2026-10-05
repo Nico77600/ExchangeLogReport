@@ -1,12 +1,12 @@
 ---
 title: Exchange Log Report
-subtitle: Administrator guide
-version: 1.4.0
+subtitle: Developer guide
+version: 1.6.1
 author: Nicolas Fabert
-updated: 2026-10-02
+updated: 2026-10-05
 ---
 
-# Exchange Log Report — Administrator guide
+# Exchange Log Report — Developer guide
 
 > A modern Log Parser for **Exchange Server SE on-premises**: it reads the IIS / HTTP Proxy, MAPI, ActiveSync, POP/IMAP, SMTP and message tracking logs of several servers, removes the noise **before** storage, and answers two questions — **is this server really used?** and **what happened to this user, this client or this message?**
 
@@ -18,6 +18,9 @@ updated: 2026-10-02
 > ```
 >
 > Replace the example path with the folder where you downloaded or extracted this project.
+
+> [!NOTE]
+> This is the **developer guide**: how the tool works, the configuration in detail, every tab of the report, the correlation rules, the data model and how to modify the tool. For the prerequisites and the everyday commands only, read the [user guide](ExchangeLogReport-UserGuide.md).
 
 ```cards
 target | What it answers | Which servers are really used, by whom, with which clients; why a user, a device or a message had a problem.
@@ -116,7 +119,7 @@ key | Authentication challenges | The anonymous `401` that precedes every NTLM /
 | Item | Requirement |
 |---|---|
 | PowerShell | **7.4 or later** (`pwsh`) for the tool. A portable zip is enough: no installation on the Exchange servers. **Windows PowerShell 5.1** (`powershell.exe`, part of Windows Server) for `-Mode Discover` only: the Exchange cmdlets are not supported in PowerShell 7, so the tool runs them in a Windows PowerShell 5.1 process. |
-| Account | SYSTEM on an Exchange server, or a domain account that is local administrator of every Exchange server (4.1). |
+| Account | SYSTEM on an Exchange server, or a domain account that is local administrator of every Exchange server (4.1). Edge Transport server: on the Edge itself, SYSTEM or a local administrator (4.2). |
 | Network | SMB (445) from the collector to every Exchange server. On a collector that is not an Exchange server, also HTTP (80) to one Exchange server for `-Mode Discover` (remote PowerShell `http://<server>/PowerShell/`, Kerberos). |
 | Protocol logging | SMTP: `ProtocolLoggingLevel Verbose` on the receive and send connectors whose traffic must be analysed (`Get-ReceiveConnector | ft Name,ProtocolLoggingLevel`). POP/IMAP (optional): `Set-PopSettings` / `Set-ImapSettings -ProtocolLogEnabled $true`, then restart the POP3/IMAP4 services. HttpProxy, IIS (front and back end), MAPI over HTTP and message tracking are on by default. `-Mode Discover` lists the connectors and services whose logging is off. |
 | Disk | The database is small (see chapter 12). Plan 1 GB per server and per month in large environments. |
@@ -155,6 +158,19 @@ On the administration server, give `ELR-Collectors` the **Log on as a batch job*
 
 > [!NOTE]
 > **Why View-Only Organization Management is enough.** `-Mode Discover` only runs `Get-ExchangeServer`, `Get-TransportService`, `Get-FrontEndTransportService`, `Get-MailboxTransportService`, `Get-ImapSettings`, `Get-PopSettings`, `Get-ReceiveConnector` and `Get-SendConnector` (checked in the lab: all are in the roles of this group). The collection uses no Exchange role at all: it reads files.
+
+### 4.2 Edge Transport servers
+
+An Edge Transport server has no client access: no IIS, HttpProxy, MAPI, ActiveSync, POP3 or IMAP4. The tool reads **only its SMTP protocol logs** (`TransportRoles\Logs\Edge\ProtocolLog\SmtpReceive|SmtpSend`) **and its message tracking**, and checks nothing else on it.
+
+```cards
+search | Detected | On the Edge itself: registry key `HKLM:\SOFTWARE\Microsoft\ExchangeServer\v15\EdgeTransportRole`. On another server: the AD LDS folder of the Edge role (`TransportRoles\data\Adam`) without the client access folder (`FrontEnd\HttpProxy`). `Role = 'Edge'` in the `Servers` block forces it.
+server | Where to run it | On the Edge itself, as **SYSTEM** (scheduled task, chapter 7) or a local administrator: an Edge is usually outside the domain, in the perimeter network, and not reachable through the administrative shares.
+settings | -Mode Discover | Runs the local Exchange Management Shell of the Edge (no remote PowerShell and no RBAC on an Edge: SYSTEM is accepted) and reads its SMTP log folders, message tracking and connectors whose logging is off.
+file | Report | An **Edge report** (9.6): mail flow only — messages, SMTP clients (who sends to the Edge) and **SMTP destinations** (where the Edge sends). No client access view.
+```
+
+The Edge gets its own tool folder and database. Seen from a mailbox server, a subscribed Edge listed in the configuration is recorded by `-Mode Discover` with its role only: its log settings are in its own AD LDS instance, not in Active Directory.
 
 <!-- icon: download -->
 ## 5. Installation
@@ -197,6 +213,7 @@ The names are enough: where each server really writes its logs is found by **`-M
 | Message tracking | `Get-TransportService` › `MessageTrackingLogPath`, `MessageTrackingLogEnabled` |
 | POP3, IMAP4 | `Get-PopSettings` / `Get-ImapSettings` › `LogFileLocation`, `ProtocolLogEnabled` |
 | IIS | `applicationHost.config` of each server (`\\<server>\ADMIN$`): log folder, format and target of *Default Web Site*, *Exchange Back End* and **every other site hosting Exchange virtual directories** (a second OWA/ECP site, for example) |
+| Edge Transport server (run on the Edge) | `Get-TransportService` of the Edge › `ReceiveProtocolLogPath`, `SendProtocolLogPath`, `MessageTrackingLogPath`; no IIS (4.2) |
 | Logging off | Receive and send connectors with `ProtocolLoggingLevel None`, intra-organization, delivery and submission connectors |
 
 The Exchange cmdlets run in **Windows PowerShell 5.1**: the tool starts `powershell.exe` for them (Exchange Management Shell on an Exchange server, Exchange remote PowerShell with Kerberos elsewhere), and does the rest in PowerShell 7. Every folder found is then checked from the collector with the account running the mode; a folder on another drive is read through the administrative share of that drive (`D:\Logs` › `\\EXCH01\D$\Logs`), and a folder of the collector itself with its local path. The result goes to `config\ExchangeLogReport.paths.psd1` (do not edit it). Run the mode again **after a CU, a new server or a change of the log folders**.
@@ -206,12 +223,18 @@ A custom IIS site is recognised from its virtual directories alone (an applicati
 What every collection checks, without Exchange cmdlets:
 
 ```cards
-server | IIS sites | `applicationHost.config` is read again: a moved IIS log folder, a new or removed custom Exchange site are **followed at once** and reported until `-Mode Discover` records them.
+server | IIS sites | `applicationHost.config` of each mailbox server is read again: a moved IIS log folder, a new or removed custom Exchange site are **followed at once** and reported until `-Mode Discover` records them. Not on an Edge Transport server (no IIS).
 folder | Missing folder | HttpProxy, IIS and message tracking folders must exist (row *not found*). SMTP, MAPI, POP/IMAP and custom sites may have no folder until their logging is on and used (row *no folder*).
 clock | Stale source | HttpProxy and the IIS front and back end are written all the time (health probes). Newest file older than `StaleSourceHours`: logging stopped, or the logs were moved and the old folder is read.
 ```
 
-A path set in the `Servers` block wins over the paths file (the setting is kept and the difference is reported). Keys: `HttpProxyPath`, `MapiHttpPath`, `ImapLogPath`, `PopLogPath`, `IisFrontEndPath`, `IisBackEndPath` (the `W3SVCn` folder), `FrontEndReceivePath`, `FrontEndSendPath`, `HubReceivePath`, `HubSendPath`, `MailboxReceivePath`, `MailboxSendPath`, `MessageTrackingPath`, or a root: `ExchangePath`, `IisLogPath`, `LoggingPath`, `TransportLogPath`. Without paths file, the default installation folders on `C:` are used and the console says so.
+A path set in the `Servers` block wins over the paths file (the setting is kept and the difference is reported). Keys: `HttpProxyPath`, `MapiHttpPath`, `ImapLogPath`, `PopLogPath`, `IisFrontEndPath`, `IisBackEndPath` (the `W3SVCn` folder), `FrontEndReceivePath`, `FrontEndSendPath`, `HubReceivePath`, `HubSendPath`, `MailboxReceivePath`, `MailboxSendPath`, `EdgeReceivePath`, `EdgeSendPath`, `MessageTrackingPath`, or a root: `ExchangePath`, `IisLogPath`, `LoggingPath`, `TransportLogPath`. Without paths file, the default installation folders on `C:` are used and the console says so. `Role = 'Edge'` (or `'Mailbox'`) forces the role of a server instead of detecting it (4.2):
+
+```powershell
+Servers = @(
+    @{ Name = 'EDGE01'; Role = 'Edge' }   # SMTP protocol logs and message tracking only
+)
+```
 
 > [!TIP]
 > The paths file records the collector that wrote it. Copied to another collector, the tool asks to run `-Mode Discover` there: the administrative shares and local paths differ.
@@ -222,7 +245,7 @@ A path set in the `Servers` block wins over the paths file (the setting is kept 
 |---|---|---|
 | `HttpProxy` | `$true` | Client access (all protocols). |
 | `IisFrontEnd`, `IisSite` | `$true`, `W3SVC1` | Default Web Site, and the custom sites hosting front-end Exchange virtual directories (OWA, ECP...). `IisSite` is used only until `-Mode Discover` has run. |
-| `SmtpReceive`, `SmtpSend` | `$true` | SMTP protocol logs of the `TransportRoles` listed (`FrontEnd`, `Hub`, `Mailbox`). A missing folder is not an error (protocol logging not enabled for that role). |
+| `SmtpReceive`, `SmtpSend` | `$true` | SMTP protocol logs of the `TransportRoles` listed (`FrontEnd`, `Hub`, `Mailbox`); on an Edge Transport server, its `Edge` folder whatever this list. A missing folder is not an error (protocol logging not enabled for that role). |
 | `MessageTracking` | `$true` | All `MSGTRK*.log` files (hub, delivery, submission, moderation). |
 | `MapiBackEnd` | `$true` | `Logging\MapiHttp\Mailbox`: Outlook version and mode, MAPI status codes. |
 | `EasBackEnd`, `IisBackEndSite` | `$true`, `W3SVC2` | ActiveSync lines of the Exchange Back End site (the other lines are counted as noise without being parsed). `IisBackEndSite` is used only until `-Mode Discover` has run. |
@@ -298,6 +321,8 @@ Register-ScheduledTask -TaskName 'Exchange Log Report - collect' -Action $action
 
 The account needs the **Log on as a batch job** right on the administration server: without it, the task does not start and its last result is `0xC000015B`.
 
+**On an Edge Transport server**: option A on the Edge itself (SYSTEM), with its own tool folder and database (4.2).
+
 ```cards
 check | Exit code 0 | Success.
 wrench | Exit code 1 | Failure: see the error and the log file.
@@ -318,11 +343,11 @@ shield | Lock | A lock file prevents two collections at the same time; reports c
 .\Invoke-ExchangeLogReport.ps1 -Range Day -Date 2026-09-30 -ReportType Detailed -User alice@contoso.com
 
 # What Outlook, the phone and the mail client of one user did this morning (sessions and timelines)
-.\Invoke-ExchangeLogReport.ps1 -Range Custom -Start '2026-10-01 08:00' -End '2026-10-01 12:00' `
+.\Invoke-ExchangeLogReport.ps1 -Start '2026-10-01 08:00' -End '2026-10-01 12:00' `
     -ReportType Detailed -User alice
 
 # An incident window on two servers, from the data already collected
-.\Invoke-ExchangeLogReport.ps1 -Range Custom -Start '2026-09-23 08:00' -End '2026-09-23 12:00' `
+.\Invoke-ExchangeLogReport.ps1 -Start '2026-09-23 08:00' -End '2026-09-23 12:00' `
     -ReportType Detailed -Server EXCH01,EXCH02 -NoCollect
 
 # What the database contains, and the noise removed by the last collection
@@ -332,14 +357,18 @@ shield | Lock | A lock file prevents two collections at the same time; reports c
 .\Invoke-ExchangeLogReport.ps1 -Mode Discover
 ```
 
+More examples, one per everyday question (unused server, user problem, missing message, incident, monthly review, Edge): [user guide, chapter 2](ExchangeLogReport-UserGuide.md#2-everyday-use).
+
 ```cards
-calendar | -Range | Last24Hours, Last7Days, Last30Days, PreviousMonth, Month (with -Month), Day (with -Date) or Custom (with -Start and -End).
+calendar | -Range | Last24Hours, Last7Days, Last30Days, PreviousMonth, Month (with -Month), Day (with -Date) or Custom (with -Start and -End). -Month, -Date and -Start / -End select their range on their own.
 layers | -ReportType | Usage (who uses which server) or Detailed (+ sessions, failures, messages).
 people | -User | Any part of the account (domain\sam), UPN or SMTP address; filters every view.
 server | -Server | One or more servers of the configuration (report and collection).
 ```
 
 `-User` filters client access, client sessions, messages (as sender or recipient) and SMTP clients. The *Operations* view is measured per server, not per user: it is not built when the report is filtered on users.
+
+**No parameter is ignored silently.** The kinds of period are separate parameter sets (`Get-Help .\Invoke-ExchangeLogReport.ps1` shows them): `-Start` requires `-End`, and `-Month`, `-Date` and `-Start` / `-End` cannot be combined. A period that contradicts `-Range` (`-Range Last7Days -Start …`) is an error. A parameter that the mode does not use is run anyway and shown in yellow under the banner with the reason, for example `-Start, -End ignored with -Mode Collect: a collection reads every new log line, whatever its date; the period only selects what the report shows (-Mode Report).` The same applies to the report parameters with `-Mode Collect`, `Status` or `Discover`, to `-Server` with `-Mode Status` or `Discover`, and to `-ConnectTo` / `-Credential` outside `-Mode Discover`.
 
 ![Console of a detailed report](images/console-report.png)
 
@@ -410,7 +439,7 @@ The **Messages** tab keeps one line per message; the dialog shows the recipients
 | Message | Meaning |
 |---|---|
 | Delivered | Every recipient has a `DELIVER` event. |
-| Relayed / Delivered and relayed | Handed over (`SEND`) to a server outside the collected servers (Edge, internet, other organisation). |
+| Relayed / Delivered and relayed | Handed over (`SEND`, or `SENDEXTERNAL` from an Edge) to a server outside the collected servers (Edge, internet, other organisation, the mailbox servers seen from an Edge). |
 | Failed / Partially failed | `FAIL` for all / some recipients (see their status and the NDR reason). |
 | Deferred | Last event `DEFER`: still in a queue. |
 | Dropped | `DROP` (transport rule, malware…). |
@@ -422,6 +451,19 @@ The **Messages** tab keeps one line per message; the dialog shows the recipients
 | Accepted / Sent | `2xx` after the data. |
 | Rejected / Deferred | `5xx` / `4xx` (during `RCPT` or after the data). |
 | Incomplete | The session ended before the data. |
+
+### 9.6 Edge Transport report
+
+When **every server of the report is an Edge Transport server** (an Edge's own tool folder, or `-Server EDGE01`), the report is an **Edge report**: mail flow only, without any client access view. Its title is *Edge Transport mail flow* (unless `Report.Title` was changed) and its folder `<FilePrefix>_Edge<Type>_…`.
+
+```cards
+chart | Overview | Edge servers with mail flow, inbound SMTP (and refused during the SMTP conversation), outbound SMTP (deferred or failed), messages; server cards and daily chart in SMTP received / sent.
+mail | Messages (Detailed) | One row per message through the Edge, inbound and outbound, with its route; handed over to the organization or to the internet = *Relayed* (green). Relay denied, blocked sender or recipient: *Rejected (SMTP)*.
+people | SMTP clients | Who sends mail to the Edge: internet servers and partners, and the mailbox servers of the organization (outbound mail handed over to the Edge).
+server | SMTP destinations | Where the Edge sends mail: Exchange Online, the MX of the internet domains, the mailbox servers of the organization (EdgeSync). Remote host (name of its 220 banner), connector, sent, deferred, failed, TLS, last error; transactions and transcripts behind a click.
+```
+
+A mixed report (mailbox servers and Edge servers) keeps the usual layout.
 
 <!-- icon: layers -->
 ## 10. Output files
@@ -442,6 +484,8 @@ Each execution writes a new folder `<FilePrefix>_<Type>_<period>[_<users>]_<time
 | `…-ClientAccess-Requests.csv` |  | ✓ | Every failed request with its **resolution**, every **slow** success, every request of `FullDetailUsers`. |
 | `…-Messages.csv` |  | ✓ | **One row per message** with status and route (`Route` column if `IncludeRoutingDetails`), plus the mail refused during the SMTP conversation. |
 | `…-SmtpSessions.csv` |  | ✓ | One row per SMTP transaction, every hop included (`Transcript` column if `IncludeRoutingDetails`). |
+
+Edge report (9.6): `Servers` and `Daily` without the client access columns, `SmtpClients`, **`SmtpDestinations`** (one row per destination: remote address, remote host, send connector, sent, deferred, failed, TLS, last error) and, Detailed, `Messages` and `SmtpSessions`. No `Users`, `Clients`, `Operations`, `ClientSessions` or `ClientAccess-*` file.
 
 > [!TIP]
 > The CSV files are always complete; the HTML file shows up to `MaxHtmlRows` rows per tab. `SmtpSessions.csv` has every SMTP hop: in the HTML report, these transactions are in the route of their message and in the detail of their SMTP client.
@@ -498,7 +542,7 @@ file | One row per message | status, recipients, route, transcripts
 | `iis_status` | IIS sub-status / Win32 status of failed proxied requests | `DetailRetentionDays` |
 | `smtp_transaction` | SMTP transactions; `transcript` | `RetentionDays`; transcript `DetailRetentionDays` |
 | `message_event` | Tracking events of real messages | `RetentionDays` |
-| `source_file` | Read position of every log file | as long as the file exists |
+| `source_file` | Read position of every log file, by file identity: its path on its own server, case ignored (`\\EXCH01\D$\Logs\x.log` and `D:\Logs\x.log` are the same file, read once) | as long as the file exists |
 | `noise`, `run` | Removed lines per reason and execution | `RetentionDays` |
 
 Raw log lines are **never** stored. A database of an older version is upgraded automatically (new tables and columns only).
@@ -534,14 +578,14 @@ Main noise found: Managed Availability probes (1.5 million lines), back-end traf
 | Database schema | `src\Engine.Store.cs` (`Schema`, `Migrate`). New tables: `CREATE … IF NOT EXISTS`; a new column of an existing table: `ALTER TABLE` in `Migrate` (done at the next collection) and a new `schema_version`. |
 | Console output | `ExchangeLogReport.psm1`, region 1 (same functions as Purview DLP Report). |
 | Log folders (`-Mode Discover`) | `ExchangeLogReport.psm1`, region 9 (IIS sites, paths file) and `src\Get-ExlExchangeSettings.ps1`, the Exchange part, run in **Windows PowerShell 5.1**: keep its syntax 5.1 (no `??`, `?.`, ternary operator); the tests run its functions in `powershell.exe`. |
-| This guide | `docs\ExchangeLogReport-Guide.md`, then `.\tools\Build-Documentation.ps1` (also run by the package tool). |
+| This guide, the user guide | `docs\ExchangeLogReport-Guide.md` (developer guide) and `docs\ExchangeLogReport-UserGuide.md` (prerequisites and everyday commands only), then `.\tools\Build-Documentation.ps1`, which builds both (also run by the package tool). A link to the other guide (`ExchangeLogReport-Guide.md#4-prerequisites`, GitHub anchor) becomes a link to its HTML file. |
 | README graphics (GitHub) | `.\tools\New-DocumentationImages.ps1` renders `docs\images\readme-*.png` (light and dark) from the cards and flow blocks of this guide, with its CSS and icons (Microsoft Edge, headless). Run it after `Build-Documentation.ps1` when chapters 1, 2, 3 or 11 change. |
-| Version | `ExchangeLogReport.psd1` (`ModuleVersion`), `$script:ToolVersion` in the module, headers, front matter of this guide, `CHANGELOG.md`. |
+| Version | `ExchangeLogReport.psd1` (`ModuleVersion`), `$script:ToolVersion` in the module, headers, front matter of both guides, `CHANGELOG.md`. |
 
 ```steps
 Test | `Invoke-Pester -Path .\tests\ExchangeLogReport.Tests.ps1 -Output Detailed` — no Exchange needed: the logs are generated with the exact Exchange formats.
-Build the guide | `.\tools\Build-Documentation.ps1` writes `docs\ExchangeLogReport-Guide.html` (self-contained: images inline).
-Build the package | `.\tools\New-ExchangeLogReportPackage.ps1` — no database, no reports, no logs; the HTML guide is included.
+Build the guides | `.\tools\Build-Documentation.ps1` writes `docs\ExchangeLogReport-Guide.html` and `docs\ExchangeLogReport-UserGuide.html` (self-contained: images inline).
+Build the package | `.\tools\New-ExchangeLogReportPackage.ps1` — no database, no reports, no logs; both HTML guides are included.
 ```
 
 <!-- icon: beaker -->
@@ -585,6 +629,18 @@ Collector on an administration server (Windows Server 2025, not an Exchange serv
 | Scheduled task without *Log on as a batch job* | Task not started, last result `0xC000015B`. |
 | `-Mode Discover` as SYSTEM on an Exchange server | Refused: SYSTEM has no Exchange role (Exchange Management Shell connection denied). The collection as SYSTEM works. |
 
+### 14.3 Edge Transport server
+
+Exchange Server SE Edge Transport server EDGE1 (workgroup, no IIS, subscribed to the organisation), tool run on the Edge itself as SYSTEM with PowerShell 7.6.6 portable, configuration `@{ Name = 'EDGE1' }` without `Role`:
+
+| Test | Result |
+|---|---|
+| `-Mode Collect` before `-Mode Discover` | *EDGE1: Edge Transport server (detected): SMTP protocol logs and message tracking only.* No IIS, HttpProxy, MAPI, ActiveSync, POP or IMAP row, no warning, exit code 0; *SMTP out (Edge)* and *Tracking* read, *SMTP in (Edge)* *no file* (receive connector logging off). Before 1.5.0 the same run showed the IIS settings as not readable and the client access folders as *not found* (exit code 2), and read no Edge SMTP log. |
+| `-Mode Discover` as SYSTEM | Local Exchange Management Shell of the Edge; *Edge Transport (SMTP and message tracking only) · default folders*; logging off reported on the receive connector and on the two EdgeSync send connectors; paths file with `Role = 'Edge'`. |
+| Detailed report | EDGE1 *Mail flow only*; the outbound messages to Exchange Online with their SMTP sessions. |
+| Edge report with generated traffic (1.6.0) | Verbose protocol logging on the receive connector of EDGE1 and on *EdgeSync - Inbound to Site1*; internet senders simulated from two addresses (partners with and without TLS, newsletter, unknown recipient, relay attempts), outbound messages from the Pickup folder of EXCH01. Report: 6 SMTP clients (3 partners, the open relay attempt with its 2 refusals, the 2 mailbox servers sending outbound mail), 3 SMTP destinations (the 2 mailbox servers through EdgeSync, Exchange Online with 2 failures `501 5.1.4 Recipient address reserved by RFC 2606`), 14 messages: inbound mail *Relayed* to the organization, relay attempts *Rejected (SMTP)*, the NDR to the newsletter (recipient validation off on the Edge: the unknown recipient was accepted, then bounced). It also showed a **routing loop**: messages to the tenant domain `<tenant>.onmicrosoft.com` (an *InternalRelay* accepted domain without send connector) went back and forth between the Edge and the mailbox servers (`RECEIVE > SENDEXTERNAL` repeated, then `DEFER`). |
+| Upgrade 1.5.0 > 1.6.0 on EDGE1 | The files read through `\\EDGE1\C$` before `-Mode Discover` and through `C:\` after are recognised: no file read twice (1.5.1). |
+
 # Annexes
 
 <!-- icon: lifebuoy -->
@@ -595,7 +651,9 @@ Collector on an administration server (Windows Server 2025, not an Exchange serv
 | `folder not found or not readable` | Wrong path or no access. Run `-Mode Discover` again (logs moved, Exchange on another drive), then test `Test-Path '<folder shown>'` as the account of the task. That account must be local administrator of the server (chapter 4.1); with SYSTEM on an Exchange server, check that the computer account is in *Exchange Trusted Subsystem*. |
 | Scheduled task result `0xC000015B` | The account of the task lacks the **Log on as a batch job** right on the collector (`secpol.msc` › User Rights Assignment, or the Group Policy that sets it). |
 | `-Mode Discover`: *Exchange remote PowerShell could not be opened* | HTTP (80) to the server, Kerberos (use the server name, not its address), membership of *View-Only Organization Management* (log off and on, or wait for the Kerberos ticket, after adding the account). Try another server with `-ConnectTo`. |
-| `-Mode Discover`: *SYSTEM has no Exchange role* | Run the mode interactively with an administrator account; the scheduled collection stays as SYSTEM. |
+| `-Mode Discover`: *SYSTEM has no Exchange role* | Run the mode interactively with an administrator account; the scheduled collection stays as SYSTEM. On an Edge Transport server SYSTEM is accepted. |
+| Edge Transport server: IIS or client access folders *not found* | The role was not detected (Exchange on another drive and no paths file, or Edge read from another server whose `C$` is not reachable): run `-Mode Discover` on the Edge, or set `Role = 'Edge'` in its `Servers` block (4.2). |
+| Edge Transport server: *SMTP in (Edge)* always *no file* | Protocol logging is off on its receive connector: `Set-ReceiveConnector '<Edge>\Default internal receive connector <Edge>' -ProtocolLoggingLevel Verbose` on the Edge. EdgeSync send connectors are set from a mailbox server (`Set-SendConnector`). |
 | `IIS settings not readable (\\<server>\ADMIN$…)` | The account is not local administrator of the server, or the `ADMIN$` share is disabled. The default IIS folders are used meanwhile. |
 | `IIS logs of '…' moved to …` | The IIS log folder of a site changed: the collection already reads the new folder. Run `-Mode Discover` to record it (exit code 2 until then). |
 | A source is **stale** | No new HttpProxy or IIS file for `StaleSourceHours`: the server was stopped, logging was turned off, or the logs were moved and the old folder is read. Check the folder on the server, then run `-Mode Discover`. |

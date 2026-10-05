@@ -1,7 +1,7 @@
 #Requires -Version 7.4
 <#
 .SYNOPSIS
-    Renders the graphics of the GitHub README (docs\images\readme-*.png) from the administrator guide.
+    Renders the graphics of the GitHub README (docs\images\readme-*.png) from the developer guide.
 
 .DESCRIPTION
     GitHub renders Markdown only: the custom blocks of the guide (cards, flow) and its theme are lost.
@@ -31,7 +31,7 @@
 
 .NOTES
     Author  : Nicolas Fabert
-    Version : 1.4.0
+    Version : 1.6.1
     Part of : Exchange Log Report (repository tool, not in the package)
 #>
 [CmdletBinding()]

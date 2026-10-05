@@ -1,7 +1,65 @@
 # Changelog — Exchange Log Report
 
-All notable changes are listed here. Versions follow MAJOR.MINOR.PATCH (see the guide, Annex C).
+All notable changes are listed here. Versions follow MAJOR.MINOR.PATCH (see the developer guide, Annex C).
 Author: Nicolas Fabert.
+
+## [1.6.1] — 2026-10-05
+
+### Fixed
+- **`-Start` / `-End` were ignored silently** without `-Range Custom`: `.\Invoke-ExchangeLogReport.ps1 -Start '2026-10-01 08:00' -End '2026-10-01 12:00'` built a report of the default range (`Report.DefaultRange`). The period parameters now select their range on their own: `-Start` / `-End` Custom, `-Month` Month, `-Date` Day (`-Range` can be left out, `-Range Custom -Start … -End …` still works).
+- **No parameter is ignored silently any more.** The kinds of period are separate parameter sets: `-Start` requires `-End`, and `-Month`, `-Date` and `-Start` / `-End` cannot be combined (refused by PowerShell before the script runs). A period that contradicts `-Range` (`-Range Last7Days -Start …`) stops with an error. A parameter that the mode does not use is shown in yellow under the banner with the reason, for example *-Start, -End ignored with -Mode Collect: a collection reads every new log line, whatever its date* (period and report parameters with `-Mode Collect`, `Status` or `Discover`; `-Server` with `Status` or `Discover`; `-ConnectTo` / `-Credential` outside `Discover`).
+- The *Mode* line of the banner showed only the mode: it shows the report type and the range again (`Report · Detailed · Custom`).
+- `Get-Help .\Invoke-ExchangeLogReport.ps1` showed only the syntax: the `#Requires` line placed just before the help block hid it. The help now documents `-Month`, `-Date`, `-Start` and `-End` too.
+- A report without collection (`-NoCollect`) checked the folders of every server to know its role: the role now comes from the data already collected (Edge SMTP logs and no client access log), and the servers are not contacted.
+- A log folder that cannot be read (access denied: account that is not administrator of the server) stopped the access check, the collection or `-Mode Discover` with an error: it is now reported as *folder not found or not readable*, and a server whose folders cannot be read is treated as a mailbox server.
+
+### Added
+- **User guide** (`docs\ExchangeLogReport-UserGuide.md` and `.html`): prerequisites and everyday commands only — one command per question (unused server, user problem, missing message, incident, monthly review, Edge, collection check), period and filters, results, exit codes and usual warnings. The existing guide becomes the **developer guide**; the README points to both.
+- `tools\Build-Documentation.ps1` without parameter builds both HTML guides; a link to the other guide (GitHub anchor) points to its HTML file. The package contains both HTML guides.
+
+### Changed
+- Only `-Mode` and `-Range` remain positional (`.\Invoke-ExchangeLogReport.ps1 Report Last30Days`); the other parameters are named.
+
+### Validated
+- Lab: on EDGE1 (Edge, SYSTEM) and, in parallel, the four mailbox servers from an administration server (scheduled tasks with the domain account, copy of the database): `-Mode Discover`, `-Mode Collect`, report `-NoCollect`, `-Start` / `-End` without `-Range` (Custom, end replaced by now), `-Range Last7Days -Start …` (error, exit 1), `-Mode Status` with `-Start` / `-End` (shown as ignored), report with a collection by an account that cannot read the folders (warnings, exit 2, report written).
+
+## [1.6.0] — 2026-10-05
+
+### Added
+- **Edge report**: when every server of the report is an Edge Transport server, the report shows the mail flow only — title *Edge Transport mail flow*, tiles *Inbound SMTP* / *Outbound SMTP* / *Messages*, server cards and daily chart in SMTP received and sent, tabs *Messages*, *SMTP clients* and the new **SMTP destinations**. No client access view or file (`Users`, `Clients`, `Operations`, `ClientSessions`, `ClientAccess-*`), and no client access column in `Servers` / `Daily`. Folder `<FilePrefix>_Edge<Type>_…`.
+- **SMTP destinations** (`SmtpDestinations.csv`, Edge report): one row per destination of the Edge (remote address + send connector) — Exchange Online, internet MX, the mailbox servers of the organization — with the remote host of its 220 banner, sent, deferred, failed, recipients, senders, TLS and last error; transactions and SMTP transcripts behind a click (failures first).
+- The role of the servers is resolved for a report without collection too (`-NoCollect`).
+
+### Fixed
+- A message handed over by an Edge Transport server (tracking event `SENDEXTERNAL`) stayed *In transit*: it is now *Relayed*, like `SEND`.
+- A server without client access (Edge, or a mailbox server with mail flow only) showed *No real activity in the period* and 0 active days: its first and last activity and its active days now come from its mail flow.
+- The null sender (`MAIL FROM:<>`, NDRs) was shown empty in the SMTP clients: shown as `<>`.
+
+### Validated
+- Lab: Edge report of EDGE1 with generated internet and outbound traffic (guide 14.3); it showed a routing loop of the lab (tenant `onmicrosoft.com` domain accepted as *InternalRelay* without send connector).
+
+## [1.5.1] — 2026-10-05
+
+### Fixed
+- **A log file reached through another path was read again.** The read position of a file was kept per path: when `-Mode Discover` replaced the administrative share of the collector itself (`\\EXCH01\C$\…`) by its local path (`C:\…`), or returned a folder in another case, every file was read again from the beginning. SMTP transactions and tracking events were not duplicated (unique keys), but the **client access counters** (daily usage, operations, clients) of the files read twice were counted twice. Files are now identified by their path on their own server, case ignored (`\\EXCH01\D$\Logs\x.log` = `D:\Logs\x.log`).
+
+### Changed
+- Database schema 3: `source_file.file_key` (identity of the file), upgraded at the next opening. A file already read through two paths keeps one read position (the one read last); the counters already doubled before the upgrade are not corrected (they leave the database with the retention).
+
+## [1.5.0] — 2026-10-05
+
+### Added
+- **Edge Transport servers**: only their **SMTP protocol logs** (`TransportRoles\Logs\Edge\ProtocolLog\SmtpReceive|SmtpSend`, new sources *SMTP in (Edge)* / *SMTP out (Edge)*, role `Edge` in the SMTP data) and their **message tracking** are read. No IIS, HttpProxy, MAPI, ActiveSync, POP3 or IMAP4 source, and no IIS check (`applicationHost.config`) on them.
+- **Role detection** at every collection: registry key `EdgeTransportRole` when the tool runs on the Edge itself; on another server, the AD LDS folder of the Edge role (`TransportRoles\data\Adam`) without the client access folder (`FrontEnd\HttpProxy`). The console says *Edge Transport server (detected)*. `Role = 'Edge'` or `'Mailbox'` in a `Servers` block forces the role; `EdgeReceivePath` / `EdgeSendPath` force the folders.
+- **`-Mode Discover` on an Edge Transport server**: local Exchange Management Shell of the Edge (snap-in, no remote PowerShell, no RBAC: SYSTEM is accepted); SMTP log folders and message tracking of the Edge, receive and send connectors whose logging is off; `Role = 'Edge'` in the paths file. From a mailbox server, a subscribed Edge listed in the configuration is recorded with its role (no longer reported as *not found in Exchange*).
+
+### Changed
+- The paths file records the role of every server (`Role`).
+- Collection step 2 is now *Checking access to the servers and their log folders*.
+- Guide: new chapter 4.2 (Edge Transport servers), chapters 6.1, 6.2 and 7, lab validation 14.3, troubleshooting.
+
+### Fixed
+- On an Edge Transport server the collection warned about IIS settings not readable and client access folders *not found* (HttpProxy, IIS front end, ActiveSync back end), ended with exit code 2, and never read the SMTP logs of the Edge (it looked for the `FrontEnd`, `Hub` and `Mailbox` folders only).
 
 ## [1.4.0] — 2026-10-01
 

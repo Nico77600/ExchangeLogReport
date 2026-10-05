@@ -3,7 +3,7 @@
 //  clients (devices, versions) and operations (latency per operation)
 // -----------------------------------------------------------------------------
 //  Author  : Nicolas Fabert
-//  Version : 1.4.0
+//  Version : 1.6.1
 //
 //  sessions    one row per client session; its timeline is rebuilt from the steps written
 //              per log file: sorted, back-end details joined to the front-end request with the

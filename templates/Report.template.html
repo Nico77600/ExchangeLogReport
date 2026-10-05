@@ -166,14 +166,14 @@ footer ul { margin:4px 0 8px; padding-left:18px; }
 <p class="subtitle" id="subtitle"></p></div>
 <div class="period"><span class="label">Period</span><div id="range"></div></div></div>
 <div class="metrics">
-<article class="tile tile-primary"><span class="tile-label">Servers really used</span><svg class="tile-icon" aria-hidden="true" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><rect x="4" y="3" width="16" height="7" rx="2"/><rect x="4" y="14" width="16" height="7" rx="2"/><path d="M8 6.5h.01M8 17.5h.01"/></svg><strong id="metric-servers">0</strong><small id="metric-servers-note"></small></article>
-<article class="tile tile-tinted"><span class="tile-label">Real users</span><svg class="tile-icon" aria-hidden="true" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><circle cx="12" cy="8" r="4"/><path d="M4 21v-2a8 8 0 0 1 16 0v2"/></svg><strong id="metric-users">0</strong><small>System mailboxes and probes excluded</small></article>
-<article class="tile tile-tinted"><span class="tile-label">Client requests</span><svg class="tile-icon" aria-hidden="true" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M4 20V10m8 10V4m8 16V7"/></svg><strong id="metric-requests">0</strong><small id="metric-requests-note"></small></article>
-<article class="tile"><span class="tile-label">Messages</span><svg class="tile-icon" aria-hidden="true" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><rect x="3" y="5" width="18" height="14" rx="3"/><path d="m3 6 9 7 9-7"/></svg><strong id="metric-messages">0</strong><small id="metric-messages-note"></small></article>
+<article class="tile tile-primary"><span class="tile-label" id="metric-servers-label">Servers really used</span><svg class="tile-icon" aria-hidden="true" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><rect x="4" y="3" width="16" height="7" rx="2"/><rect x="4" y="14" width="16" height="7" rx="2"/><path d="M8 6.5h.01M8 17.5h.01"/></svg><strong id="metric-servers">0</strong><small id="metric-servers-note"></small></article>
+<article class="tile tile-tinted"><span class="tile-label" id="metric-users-label">Real users</span><svg class="tile-icon" aria-hidden="true" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><circle cx="12" cy="8" r="4"/><path d="M4 21v-2a8 8 0 0 1 16 0v2"/></svg><strong id="metric-users">0</strong><small id="metric-users-note">System mailboxes and probes excluded</small></article>
+<article class="tile tile-tinted"><span class="tile-label" id="metric-requests-label">Client requests</span><svg class="tile-icon" aria-hidden="true" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M4 20V10m8 10V4m8 16V7"/></svg><strong id="metric-requests">0</strong><small id="metric-requests-note"></small></article>
+<article class="tile"><span class="tile-label" id="metric-messages-label">Messages</span><svg class="tile-icon" aria-hidden="true" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><rect x="3" y="5" width="18" height="14" rx="3"/><path d="m3 6 9 7 9-7"/></svg><strong id="metric-messages">0</strong><small id="metric-messages-note"></small></article>
 </div>
 </header>
-<section class="block" id="servers-block"><h2>Servers</h2><p class="caption">Real activity only: users and messages, without health mailboxes, monitoring probes and load balancer checks. Click a server for details.</p><div class="cards" id="cards"></div></section>
-<section class="block" id="activity-block"><h2>Activity by day</h2><div class="legend"><span><i style="background:var(--cp-accent)"></i>Client requests</span><span><i style="background:var(--cp-link)"></i>Messages</span></div><svg class="chart" id="chart" role="img" aria-label="Client requests and messages per day"></svg></section>
+<section class="block" id="servers-block"><h2>Servers</h2><p class="caption" id="servers-caption">Real activity only: users and messages, without health mailboxes, monitoring probes and load balancer checks. Click a server for details.</p><div class="cards" id="cards"></div></section>
+<section class="block" id="activity-block"><h2>Activity by day</h2><div class="legend"><span id="legend-a"><i style="background:var(--cp-accent)"></i>Client requests</span><span id="legend-b"><i style="background:var(--cp-link)"></i>Messages</span></div><svg class="chart" id="chart" role="img" aria-label="Client requests and messages per day"></svg></section>
 <section class="block" id="data"><nav class="tabs" id="tabs" role="tablist"></nav>
 <p class="caption" id="tab-caption"></p>
 <div class="filters" id="filters"></div>
@@ -201,7 +201,13 @@ footer ul { margin:4px 0 8px; padding-left:18px; }
   // ---- Header -------------------------------------------------------------------
   el("title").textContent = meta.title || "Exchange Server usage";
   const scope = [];
-  scope.push(meta.detailed ? "Detailed report: one row per client session with its timeline across the front-end and back-end logs, failed and slow requests with their resolution, users with their clients and devices, operations and their latency, one row per message with its route, SMTP clients." : "Usage report: which servers are really used, by whom, with which protocols, clients, devices and operations, and which SMTP clients send mail through them.");
+  if (meta.edge) {
+    el("origin").textContent = "Exchange Server SE / Edge Transport";
+    document.title = "Exchange Server | Edge Transport mail flow";
+    el("servers-caption").textContent = "Real mail flow only: SMTP sessions with a message and tracking events, without load balancer and monitoring probes. Click a server for details.";
+    scope.push(`Edge Transport report: mail flow only (an Edge Transport server has no client access). SMTP clients: who sends mail to the Edge (internet servers, partners, the Exchange organization). SMTP destinations: where the Edge sends it (Exchange Online, internet MX, the organization).${meta.detailed ? " Messages: one row per message with its route, including the mail refused during the SMTP conversation." : ""}`);
+  }
+  else scope.push(meta.detailed ? "Detailed report: one row per client session with its timeline across the front-end and back-end logs, failed and slow requests with their resolution, users with their clients and devices, operations and their latency, one row per message with its route, SMTP clients." : "Usage report: which servers are really used, by whom, with which protocols, clients, devices and operations, and which SMTP clients send mail through them.");
   if (meta.users.length) scope.push(`Users: ${meta.users.join(", ")}.`);
   if (meta.servers.length) scope.push(`Servers: ${meta.servers.join(", ")}.`);
   el("subtitle").textContent = scope.join(" ");
@@ -234,6 +240,8 @@ footer ul { margin:4px 0 8px; padding-left:18px; }
   const col = (set, name) => meta.datasets[set] ? meta.datasets[set].columns.findIndex(c => c.name === name) : -1;
   const tone = v => {
     const s = String(v || "");
+    // On an Edge Transport server, a message handed over to the organization or to the internet is the normal outcome.
+    if (meta.edge && /^(Relayed|Sent)$/.test(s)) return "good";
     if (/^(Delivered|Accepted|Sent|Success|Recovered|In use|OK)$/.test(s)) return "good";
     if (/^(Failed|Rejected|Unresolved|ServerError|No real usage|Dropped|Poison|Failed at end|Rejected \(SMTP\))$/.test(s)) return "bad";
     if (/^(Deferred|Partially|Recovered later|ClientError|Incomplete|Relayed|Delivered and relayed|In transit|Client access only|Mail flow only|Intermittent errors|OK \(slow\)|Slow|Not completed)/.test(s)) return "warn";
@@ -253,21 +261,40 @@ footer ul { margin:4px 0 8px; padding-left:18px; }
   el("metric-requests-note").textContent = requests ? `${(failed / requests * 100).toLocaleString("en-GB", { maximumFractionDigits: 1 })}% failed, ${number(unresolved)} unresolved` : "No client activity";
   el("metric-messages").textContent = number(sum("Messages"));
   el("metric-messages-note").textContent = `${number(sum("SMTP received"))} SMTP received, ${number(sum("SMTP sent"))} sent`;
+  if (meta.edge) {
+    // Edge Transport: inbound and outbound SMTP instead of users and client requests.
+    const out = data.smtpdestinations || [], oc = n => col("smtpdestinations", n);
+    const outBad = out.reduce((a, r) => a + (Number(r[oc("Deferred")]) || 0) + (Number(r[oc("Failed")]) || 0), 0);
+    el("metric-servers-label").textContent = "Edge servers with mail flow";
+    el("metric-servers-note").textContent = S.length - usedServers ? `${S.length - usedServers} Edge server(s) without mail flow` : "Every Edge server has mail flow";
+    el("metric-users-label").textContent = "Inbound SMTP";
+    el("metric-users").textContent = number(sum("SMTP received"));
+    el("metric-users-note").textContent = `${number(sum("SMTP rejected"))} refused during the SMTP conversation, ${number((data.smtpclients || []).length)} SMTP client(s)`;
+    el("metric-requests-label").textContent = "Outbound SMTP";
+    el("metric-requests").textContent = number(sum("SMTP sent"));
+    el("metric-requests-note").textContent = `${number(outBad)} deferred or failed, ${number(out.length)} destination(s)`;
+    el("metric-messages-note").textContent = `${number(sum("Message failures"))} with a failure (tracking)`;
+    el("legend-a").lastChild.textContent = "SMTP received";
+    el("legend-b").lastChild.textContent = "SMTP sent";
+    el("activity-block").querySelector("svg").setAttribute("aria-label", "SMTP received and sent per day");
+  }
 
   const D = data.daily || [], dc = n => col("daily", n);
   for (const r of S) {
     const name = r[sc("Server")], card = make("article", "card");
     const head = make("div", "card-head"); head.append(make("strong", null, name), make("span", `pill ${tone(r[sc("Verdict")])}`, r[sc("Verdict")]));
     const kv = make("div", "kv");
-    for (const [label, value] of [["Real users", r[sc("Real users")]], ["Requests", r[sc("Requests")]], ["Unresolved", r[sc("Unresolved failures")]],
-      ["SMTP in", r[sc("SMTP received")]], ["SMTP out", r[sc("SMTP sent")]], ["Messages", r[sc("Messages")]]]) { const d = make("div", null, label); d.prepend(make("b", null, number(value))); kv.append(d); }
+    const figures = meta.edge
+      ? [["SMTP in", r[sc("SMTP received")]], ["Refused", r[sc("SMTP rejected")]], ["SMTP out", r[sc("SMTP sent")]], ["Messages", r[sc("Messages")]], ["Msg failures", r[sc("Message failures")]], ["Active days", r[sc("Active days")]]]
+      : [["Real users", r[sc("Real users")]], ["Requests", r[sc("Requests")]], ["Unresolved", r[sc("Unresolved failures")]], ["SMTP in", r[sc("SMTP received")]], ["SMTP out", r[sc("SMTP sent")]], ["Messages", r[sc("Messages")]]];
+    for (const [label, value] of figures) { const d = make("div", null, label); d.prepend(make("b", null, number(value))); kv.append(d); }
     const bars = make("div", "bars"), protocols = (r[sc("Protocol detail")] || []).slice(0, 5), top = protocols.length ? protocols[0][1] : 0;
     for (const p of protocols) {
       const line = make("div", "bar-row"), track = make("div", "track"), fill = make("div", "fill");
       fill.style.width = `${top ? p[1] / top * 100 : 0}%`; track.append(fill);
       line.append(make("span", null, p[0]), track, make("span", "num", number(p[1]))); bars.append(line);
     }
-    const days = D.filter(x => x[dc("Server")] === name).map(x => (Number(x[dc("Requests")]) || 0) + (Number(x[dc("Messages")]) || 0));
+    const days = D.filter(x => x[dc("Server")] === name).map(x => meta.edge ? (Number(x[dc("SMTP received")]) || 0) + (Number(x[dc("SMTP sent")]) || 0) : (Number(x[dc("Requests")]) || 0) + (Number(x[dc("Messages")]) || 0));
     const svg = document.createElementNS("http://www.w3.org/2000/svg", "svg"); svg.setAttribute("class", "spark"); svg.setAttribute("viewBox", "0 0 100 30"); svg.setAttribute("preserveAspectRatio", "none");
     if (days.length > 1) {
       const max = Math.max(...days, 1), pts = days.map((v, i) => `${(i / (days.length - 1) * 100).toFixed(2)},${(28 - v / max * 26).toFixed(2)}`);
@@ -281,7 +308,8 @@ footer ul { margin:4px 0 8px; padding-left:18px; }
   }
   {
     const byDay = new Map();
-    for (const r of D) { const k = r[dc("Day")], v = byDay.get(k) || [0, 0]; v[0] += Number(r[dc("Requests")]) || 0; v[1] += Number(r[dc("Messages")]) || 0; byDay.set(k, v); }
+    const [seriesA, seriesB, labelA, labelB] = meta.edge ? ["SMTP received", "SMTP sent", "SMTP received", "SMTP sent"] : ["Requests", "Messages", "requests", "messages"];
+    for (const r of D) { const k = r[dc("Day")], v = byDay.get(k) || [0, 0]; v[0] += Number(r[dc(seriesA)]) || 0; v[1] += Number(r[dc(seriesB)]) || 0; byDay.set(k, v); }
     const days = Array.from(byDay.keys()).sort(), svg = el("chart");
     if (!days.length) el("activity-block").hidden = true;
     else {
@@ -292,7 +320,7 @@ footer ul { margin:4px 0 8px; padding-left:18px; }
         const [req, msg] = byDay.get(d), x = 30 + i * slot;
         const a = document.createElementNS(svg.namespaceURI, "rect"); a.setAttribute("x", x); a.setAttribute("width", bw); a.setAttribute("y", 125 - req / maxR * 110); a.setAttribute("height", Math.max(1, req / maxR * 110));
         const b = document.createElementNS(svg.namespaceURI, "rect"); b.setAttribute("class", "msg"); b.setAttribute("x", x + bw + 1); b.setAttribute("width", bw); b.setAttribute("y", 125 - msg / maxM * 110); b.setAttribute("height", Math.max(1, msg / maxM * 110));
-        const t = document.createElementNS(svg.namespaceURI, "title"); t.textContent = `${d}: ${number(req)} requests, ${number(msg)} messages`; a.append(t); b.append(t.cloneNode(true));
+        const t = document.createElementNS(svg.namespaceURI, "title"); t.textContent = `${d}: ${number(req)} ${labelA}, ${number(msg)} ${labelB}`; a.append(t); b.append(t.cloneNode(true));
         svg.append(a, b);
         if (days.length <= 16 || i % Math.ceil(days.length / 12) === 0) { const tx = document.createElementNS(svg.namespaceURI, "text"); tx.setAttribute("x", x); tx.setAttribute("y", 142); tx.textContent = d.slice(5); svg.append(tx); }
       });
@@ -305,8 +333,9 @@ footer ul { margin:4px 0 8px; padding-left:18px; }
     { name: "issues", title: "Failed and slow requests", caption: `Failed requests of real users, plus successful requests slower than ${number(meta.slowRequestMs)} ms (long-polling requests excluded), plus every request of the users listed in FullDetailUsers. Useful for a server-side incident (all the errors of one server at one time). Resolution: Recovered = a success of the same user and protocol within the recovery window; Recovered later = later the same day; Unresolved = no success afterwards.`, filters: ["Server", "Protocol", "Outcome", "Resolution"], sort: [0, -1] },
     { name: "users", title: "Users", caption: "Real users (accounts that authenticated), with the protocols, clients and servers they used. Click a user to see each client and device (versions, addresses, servers) and its client sessions.", filters: ["Servers", "Protocols", "Clients"], sort: [5, -1] },
     { name: "operations", title: "Operations", caption: "One row per protocol and operation (MAPI request type, ActiveSync command, OWA action, IMAP/POP command, or method and page), all users: volume, failures and latency. Slow = successful requests above the slow threshold.", filters: ["Protocol", "Servers"], sort: [2, -1] },
-    { name: "messages", title: "Messages", caption: "One row per message (Message-ID), consolidated over all servers, plus the mail refused during the SMTP conversation (relay denied, unknown recipient: no Message-ID). Click a message to see its route: every tracking event and SMTP session, in order.", filters: ["Status", "Direction"], sort: [0, -1] },
-    { name: "smtpclients", title: "SMTP clients", caption: "One row per SMTP client (address and HELO name): the applications, devices, servers and users that send mail to the collected servers, with their volume and refusals. Hops between the collected Exchange servers are not listed. Click a client to see its transactions and their SMTP transcript.", filters: ["Servers", "Connectors", "TLS", "Authentication"], sort: [4, -1] }
+    { name: "messages", title: "Messages", caption: meta.edge ? "One row per message (Message-ID) that went through the Edge, inbound and outbound, plus the mail refused during the SMTP conversation (relay denied, blocked sender or recipient: no Message-ID). Click a message to see its route: every tracking event and SMTP session, in order." : "One row per message (Message-ID), consolidated over all servers, plus the mail refused during the SMTP conversation (relay denied, unknown recipient: no Message-ID). Click a message to see its route: every tracking event and SMTP session, in order.", filters: ["Status", "Direction"], sort: [0, -1] },
+    { name: "smtpclients", title: "SMTP clients", caption: meta.edge ? "One row per SMTP client of the Edge (address and HELO name): internet servers and partners (inbound), and the mailbox servers of the organization (outbound mail handed over to the Edge), with their volume and refusals. Click a client to see its transactions and their SMTP transcript." : "One row per SMTP client (address and HELO name): the applications, devices, servers and users that send mail to the collected servers, with their volume and refusals. Hops between the collected Exchange servers are not listed. Click a client to see its transactions and their SMTP transcript.", filters: ["Servers", "Connectors", "TLS", "Authentication"], sort: [4, -1] },
+    { name: "smtpdestinations", title: "SMTP destinations", caption: "One row per destination of the Edge (remote address and send connector): Exchange Online, the MX of the internet domains, the mailbox servers of the organization (inbound mail handed over by the Edge). Remote host: name of its 220 banner. Click a destination to see its transactions, deferrals and failures with their SMTP transcript.", filters: ["Connector", "Servers", "TLS"], sort: [4, -1] }
   ].filter(t => meta.datasets[t.name]);
   let tab = tabs[0], view = new Int32Array(0), sortState = null;
   for (const t of tabs) {
@@ -480,9 +509,9 @@ footer ul { margin:4px 0 8px; padding-left:18px; }
 
   function showDetails(set, i) {
     const def = meta.datasets[set], r = data[set][i], body = el("detail-body"); body.replaceChildren();
-    const titleColumn = { servers: "Server", users: "User", messages: "Subject", smtp: "Mail from", issues: "User", daily: "Day", sessions: "User", clients: "User", operations: "Operation", smtpclients: "Remote IP" }[set];
-    const t = r[col(set, titleColumn)];
-    el("detail-title").textContent = (t == null || t === "" ? (set === "messages" ? `(no subject) - ${r[col(set, "Status")]}` : "(no subject)") : t) + (set === "issues" ? ` - ${r[col(set, "Protocol")]} ${r[col(set, "Status")]}` : set === "sessions" ? ` - ${r[col(set, "Protocol")]} - ${r[col(set, "Client")]}` : set === "clients" ? ` - ${r[col(set, "Client")]}` : set === "operations" ? ` - ${r[col(set, "Protocol")]}` : set === "smtpclients" && r[col(set, "HELO")] ? ` - ${r[col(set, "HELO")]}` : "");
+    const titleColumn = { servers: "Server", users: "User", messages: "Subject", smtp: "Mail from", issues: "User", daily: "Day", sessions: "User", clients: "User", operations: "Operation", smtpclients: "Remote IP", smtpdestinations: "Remote IP" }[set];
+    const t = set === "smtpdestinations" ? (r[col(set, "Remote host")] || r[col(set, "Remote IP")]) : r[col(set, titleColumn)];
+    el("detail-title").textContent = (t == null || t === "" ? (set === "messages" ? `(no subject) - ${r[col(set, "Status")]}` : "(no subject)") : t) + (set === "issues" ? ` - ${r[col(set, "Protocol")]} ${r[col(set, "Status")]}` : set === "sessions" ? ` - ${r[col(set, "Protocol")]} - ${r[col(set, "Client")]}` : set === "clients" ? ` - ${r[col(set, "Client")]}` : set === "operations" ? ` - ${r[col(set, "Protocol")]}` : set === "smtpclients" && r[col(set, "HELO")] ? ` - ${r[col(set, "HELO")]}` : set === "smtpdestinations" ? ` - ${r[col(set, "Connector")]}` : "");
     const dl = make("dl");
     def.columns.forEach((c, k) => {
       if (c.kind === "steps" || c.kind === "list" || (!c.grid && c.kind === "text")) return;
@@ -544,7 +573,7 @@ footer ul { margin:4px 0 8px; padding-left:18px; }
       } else if (c.kind === "steps" && c.name === "Transactions detail") {
         // [time, server, connector, status, mail from, recipients, response, message id, transcript]
         const total = r[col(set, "Transactions")];
-        body.append(make("h3", null, `Transactions (${v.length}${total > v.length ? ` of ${number(total)}: refusals first, then the latest; the SmtpSessions CSV has them all` : ""})`));
+        body.append(make("h3", null, `Transactions (${v.length}${total > v.length ? ` of ${number(total)}: ${set === "smtpdestinations" ? "deferrals and failures" : "refusals"} first, then the latest; the SmtpSessions CSV has them all` : ""})`));
         const table = make("table", "mini"), head = make("tr");
         for (const h of ["Time", "Server", "Connector", "Status", "Mail from", "Recipients", "Response", "Message ID"]) head.append(make("th", h === "Recipients" ? "num" : null, h));
         table.append(head);
@@ -615,7 +644,9 @@ footer ul { margin:4px 0 8px; padding-left:18px; }
   // ---- Footer ---------------------------------------------------------------------------------------
   const footer = el("footer");
   if (meta.notes.length) { footer.append(make("strong", null, "Notes")); const ul = make("ul"); for (const n of meta.notes) ul.append(make("li", null, n)); footer.append(ul); }
-  footer.append(make("p", null, `Times are shown in ${meta.timeZone}. Real activity only: health mailboxes, system mailboxes, monitoring probes, anonymous authentication challenges and SMTP connections without any message are removed before storage. This file contains user names and e-mail addresses: store and share it accordingly. Generated ${meta.generated} by Exchange Log Report ${meta.toolVersion}.`));
+  footer.append(make("p", null, meta.edge
+    ? `Times are shown in ${meta.timeZone}. Real mail flow only: SMTP connections without any message (load balancer and monitoring probes) and probe or system messages are removed before storage. This file contains e-mail addresses: store and share it accordingly. Generated ${meta.generated} by Exchange Log Report ${meta.toolVersion}.`
+    : `Times are shown in ${meta.timeZone}. Real activity only: health mailboxes, system mailboxes, monitoring probes, anonymous authentication challenges and SMTP connections without any message are removed before storage. This file contains user names and e-mail addresses: store and share it accordingly. Generated ${meta.generated} by Exchange Log Report ${meta.toolVersion}.`));
 
   if (tabs.length) openTab(tabs[0]);
   else el("data").hidden = true;
