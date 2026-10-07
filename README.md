@@ -47,30 +47,33 @@ The commands use one example — servers `EXCH01` to `EXCH04`, the tool in `E:\T
 ### Set up once · 1 to 4
 
 ```powershell
-# On EXCH01, in PowerShell 7 as administrator: the tool (git clone, or the zip of the latest release) in E:\Tools\ExchangeLogReport
+# On EXCH01, in PowerShell 7 as administrator, in the folder of the tool
+# (git clone, or the zip of the latest release)
 cd E:\Tools\ExchangeLogReport
 
-# 1 · List the servers: Servers = @( @{ Name = 'EXCH01' } @{ Name = 'EXCH02' } @{ Name = 'EXCH03' } @{ Name = 'EXCH04' } )
+# 1 · List the servers: one @{ Name = 'EXCH01' } line per server, in Servers
 notepad .\config\ExchangeLogReport.config.psd1
 
-# 2 · Find the log folders: with your administrator account (View-Only Organization Management), not as SYSTEM
+# 2 · Find the log folders, with your administrator account (not as SYSTEM)
 .\Invoke-ExchangeLogReport.ps1 -Mode Discover
 
-# 3 · Collect every hour: a scheduled task as SYSTEM; its first run, started now, reads the last 14 days of logs
+# 3 · Collect every hour, as SYSTEM; the first run, now, reads 14 days of logs
 $pwsh = 'E:\Tools\pwsh\pwsh.exe'
 $tool = 'E:\Tools\ExchangeLogReport\Invoke-ExchangeLogReport.ps1'
 $run  = "$pwsh -NoProfile -ExecutionPolicy Bypass -File $tool"
-schtasks /Create /F /RU SYSTEM /RL HIGHEST /TN "Exchange Log Report - collect" /SC HOURLY /TR "$run -Mode Collect"
+schtasks /Create /F /RU SYSTEM /RL HIGHEST /TN "Exchange Log Report - collect" `
+    /SC HOURLY /TR "$run -Mode Collect"
 schtasks /Run /TN "Exchange Log Report - collect"
 
-# 4 · Check: once the first run is over, every server and every source has data
+# 4 · Check, once the first run is over: every server and every source has data
 .\Invoke-ExchangeLogReport.ps1 -Mode Status
 ```
 
 ### A · Recurring reporting · 5 to 7
 
 ```powershell
-# 5 · Schedule the reports: every day at 07:00 the last 24 hours, the 1st of every month the last month; the daily one now
+# 5 · Schedule the reports: every day at 07:00 the last 24 hours,
+#     the 1st of every month the last month; then the daily one, now
 $pwsh = 'E:\Tools\pwsh\pwsh.exe'
 $tool = 'E:\Tools\ExchangeLogReport\Invoke-ExchangeLogReport.ps1'
 $run  = "$pwsh -NoProfile -ExecutionPolicy Bypass -File $tool"
@@ -80,12 +83,14 @@ schtasks /Create /F /RU SYSTEM /RL HIGHEST /TN "Exchange Log Report - monthly re
     /SC MONTHLY /D 1 /ST 07:00 /TR "$run -Range PreviousMonth"
 schtasks /Run /TN "Exchange Log Report - daily report"
 
-# 6 · Open the newest report (an HTML file in the reports folder: it works offline and can be sent as is)
+# 6 · Open the newest report: an HTML file, it works offline and can be sent as is
 Get-ChildItem .\reports -Recurse -Filter ExchangeLogs.html |
     Sort-Object LastWriteTime | Select-Object -Last 1 | Invoke-Item
 
-# 7 · Option: by e-mail too. Fill the Mail section (here: mail.contoso.com, port 25, STARTTLS, anonymous,
-#     To = @('messaging-team@contoso.com')), send a test message, then create the two tasks again with -SendMail
+# 7 · Option: by e-mail too. In the Mail section: SmtpServer = 'mail.contoso.com',
+#     Port = 25, Encryption = 'StartTls', Authentication = 'Anonymous',
+#     To = @('messaging-team@contoso.com'). Send a test message, then create
+#     the two tasks of step 5 again with -SendMail at the end of /TR
 notepad .\config\ExchangeLogReport.config.psd1
 .\Invoke-ExchangeLogReport.ps1 -Mode MailTest
 ```
@@ -105,11 +110,15 @@ notepad .\config\ExchangeLogReport.config.psd1
 ### B · Troubleshooting · 5 to 7
 
 ```powershell
-# 5 · Alice says that Outlook and her phone kept failing this morning: a Detailed report on her, on that period
-.\Invoke-ExchangeLogReport.ps1 -Start '2026-10-07 08:00' -End '2026-10-07 12:00' -ReportType Detailed -User alice@contoso.com
+# 5 · Alice says that Outlook and her phone kept failing this morning:
+#     a Detailed report on her, on that period
+.\Invoke-ExchangeLogReport.ps1 -ReportType Detailed -User alice@contoso.com `
+    -Start '2026-10-07 08:00' -End '2026-10-07 12:00'
 
-# 6 · Open the HTML file shown at the end, tab Client sessions, and click the session that failed
-# 7 · Follow the timeline: each step shows what failed, front end and back end, and the command that finds its raw log lines
+# 6 · Open the HTML file shown at the end, tab Client sessions,
+#     and click the session that failed
+# 7 · Follow the timeline: each step shows what failed, front end and back end,
+#     and the command that finds its raw log lines
 ```
 
 <details>
