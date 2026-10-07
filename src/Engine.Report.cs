@@ -2,7 +2,7 @@
 //  Exchange Log Report - engine, part 4: report (SQLite -> CSV + HTML)
 // -----------------------------------------------------------------------------
 //  Author  : Nicolas Fabert
-//  Version : 1.6.1
+//  Version : 2.0.0
 //
 //  Datasets (HTML tabs: sessions, issues, users, operations, messages, smtpclients; servers and daily
 //  feed the server cards and the chart; every dataset is also a CSV file). Edge report (every server of
@@ -74,10 +74,26 @@ namespace ExchangeLogReport
 
     public sealed class ReportResult
     {
-        public string Folder, HtmlPath;
+        public string Folder, HtmlPath, Title;
         public List<ReportFile> Files = new List<ReportFile>();
         public Dictionary<string, long> Counts = new Dictionary<string, long>();
         public List<string> Notes = new List<string>();
+        /// <summary>Rows of the servers dataset: server, verdict, real users, requests, failed, unresolved, protocols, first, last, days, SMTP in, out, rejected, messages...</summary>
+        public List<object[]> ServerRows = new List<object[]>();
+        /// <summary>Time of each step, slowest first (execution log).</summary>
+        public List<string> Steps = new List<string>();
+        /// <summary>Detailed report: the main problems of the period, for the body of the e-mail (top 10 per kind).</summary>
+        public List<ReportHighlight> Highlights = new List<ReportHighlight>();
+    }
+
+    /// <summary>One kind of problem of a Detailed report and its first rows (e-mail summary).</summary>
+    public sealed class ReportHighlight
+    {
+        public string Title, Hint;
+        public string[] Columns;
+        public List<string[]> Rows = new List<string[]>();
+        /// <summary>Number of items of this kind in the report (the rows are the first 10).</summary>
+        public long Total;
     }
 
     public static partial class ReportBuilder
@@ -116,19 +132,44 @@ namespace ExchangeLogReport
 
         static IEnumerable<object[]> Rows(Store store, string sql, Dictionary<string, object> p)
         {
-            using (var c = store.Command(sql, p))
-            using (var r = c.ExecuteReader())
+            var watch = System.Diagnostics.Stopwatch.StartNew();
+            long n = 0;
+            try
             {
-                while (r.Read())
+                using (var c = store.Command(sql, p))
+                using (var r = c.ExecuteReader())
                 {
-                    var row = new object[r.FieldCount];
-                    for (int i = 0; i < r.FieldCount; i++) row[i] = r.IsDBNull(i) ? null : r.GetValue(i);
-                    yield return row;
+                    while (r.Read())
+                    {
+                        var row = new object[r.FieldCount];
+                        for (int i = 0; i < r.FieldCount; i++) row[i] = r.IsDBNull(i) ? null : Packed.Unpack(r.GetValue(i));
+                        n++;
+                        yield return row;
+                    }
                 }
             }
+            finally { Timed(watch, n, sql); }
+        }
+
+        /// <summary>Time of each step of the report being built (query and use of its rows, files), for the execution log.</summary>
+        [ThreadStatic] static List<KeyValuePair<double, string>> _steps;
+
+        static void Timed(System.Diagnostics.Stopwatch watch, long rows, string what)
+        {
+            if (_steps == null) return;
+            string text = what.Length > 140 ? what.Substring(0, 140) + "..." : what;
+            _steps.Add(new KeyValuePair<double, string>(watch.Elapsed.TotalSeconds, rows.ToString("N0", CultureInfo.InvariantCulture) + " rows: " + text));
         }
 
         static long L(object v) { return v == null ? 0 : Convert.ToInt64(v, CultureInfo.InvariantCulture); }
+
+        /// <summary>FNV-1a 64-bit hash of a message id (distinct counts of millions of ids without keeping them).</summary>
+        static ulong Hash64(string s)
+        {
+            ulong h = 14695981039346656037UL;
+            foreach (char ch in s) { h ^= ch; h *= 1099511628211UL; }
+            return h;
+        }
         static string S(object v) { return v == null ? null : Convert.ToString(v, CultureInfo.InvariantCulture); }
 
         static T Get<T>(Dictionary<string, T> d, string key) where T : new()
@@ -150,7 +191,19 @@ namespace ExchangeLogReport
 
         public static ReportResult Build(Store store, ReportRequest q)
         {
-            var result = new ReportResult { Folder = q.OutputFolder };
+            var result = new ReportResult { Folder = q.OutputFolder, Title = q.Title };
+            _steps = new List<KeyValuePair<double, string>>();
+            try { Build(store, q, result); }
+            finally
+            {
+                result.Steps = _steps.OrderByDescending(x => x.Key).Select(x => x.Key.ToString("0.0", CultureInfo.InvariantCulture) + " s, " + x.Value).ToList();
+                _steps = null;
+            }
+            return result;
+        }
+
+        static void Build(Store store, ReportRequest q, ReportResult result)
+        {
             Directory.CreateDirectory(q.OutputFolder);
             var zone = q.Zone;
             string d0 = TimeUtil.Day(q.StartMs, zone), d1 = TimeUtil.Day(q.EndMs - 1, zone), d2 = TimeUtil.Day(q.EndMs + 86400000L, zone);
@@ -171,6 +224,7 @@ namespace ExchangeLogReport
             { var p = n.Split(':'); issues.Add(p[0], p[1]); }
             var unresolvedByServer = new Dictionary<string, long>(StringComparer.OrdinalIgnoreCase);
             var unresolvedByUser = new Dictionary<string, long>(StringComparer.Ordinal);
+            var unresolvedDetail = new Dictionary<string, UnresolvedUser>(StringComparer.Ordinal);
             string issueSql = "SELECT e.time_ms,e.server,e.source,e.protocol,e.user,e.mailbox,e.client_ip,e.user_agent,e.method,e.url,e.action,e.status," +
                 "COALESCE(e.sub_status,i.sub_status),COALESCE(e.win32,i.win32),e.backend_status,e.error_code,e.target_server,e.auth_type," +
                 "COALESCE(NULLIF(e.duration_ms,0),i.time_taken),e.outcome,e.recovered_ms,e.request_id,e.errors " +
@@ -198,6 +252,15 @@ namespace ExchangeLogReport
                             long n;
                             unresolvedByServer.TryGetValue(server, out n); unresolvedByServer[server] = n + 1;
                             unresolvedByUser.TryGetValue(user ?? "", out n); unresolvedByUser[user ?? ""] = n + 1;
+                            if (q.Detailed)
+                            {
+                                UnresolvedUser u;
+                                if (!unresolvedDetail.TryGetValue(user ?? "", out u)) { u = new UnresolvedUser(); unresolvedDetail[user ?? ""] = u; }
+                                u.Count++;
+                                if (protocol != null) u.Protocols.Add(protocol);
+                                if (server != null) u.Servers.Add(server);
+                                if (t >= u.LastMs) { u.LastMs = t; u.LastError = FailureText(r[11], r[12], r[13], r[14], S(r[15])); }
+                            }
                         }
                     }
                 }
@@ -242,20 +305,47 @@ namespace ExchangeLogReport
                 var d = Get(daily, TimeUtil.Day(L(r[0]) * 3600000L, zone) + "|" + S(r[1]));
                 if (S(r[2]) == "Receive") d.SmtpIn += L(r[3]); else d.SmtpOut += L(r[3]);
             }
-            foreach (var r in Rows(store, "SELECT server, COUNT(DISTINCT COALESCE(message_id, internal_id)), SUM(CASE WHEN event_id='DELIVER' THEN 1 ELSE 0 END), SUM(CASE WHEN event_id IN ('FAIL','DSN') THEN 1 ELSE 0 END)" + msgWhere + " GROUP BY server;", m.P))
+            // Messages per server and per hour: one pass in time order over the covering index ix_msg_flow, the distinct
+            // messages counted with a 64-bit hash of their id. Two COUNT(DISTINCT) queries sorted every message id of
+            // the period twice (most of a 30-day usage report of four servers).
+            var msgServer = new Dictionary<string, HashSet<ulong>>(StringComparer.OrdinalIgnoreCase);
+            var msgHour = new Dictionary<string, HashSet<ulong>>(StringComparer.OrdinalIgnoreCase);
+            var msgRange = new Dictionary<string, long[]>(StringComparer.OrdinalIgnoreCase);
+            long hour = long.MinValue;
+            Action flushHour = () =>
             {
-                var s = Get(servers, S(r[0]));
-                s.Messages = L(r[1]); s.Deliveries = L(r[2]); s.MessageFailures = L(r[3]);
+                foreach (var kv in msgHour) if (kv.Value.Count > 0) Get(daily, TimeUtil.Day(hour * 3600000L, zone) + "|" + kv.Key).Messages += kv.Value.Count;
+                msgHour.Clear();
+            };
+            foreach (var r in Rows(store, "SELECT time_ms, server, event_id, COALESCE(message_id, internal_id)" + msgWhere + " ORDER BY time_ms;", m.P))
+            {
+                long t = L(r[0]);
+                string server = S(r[1]) ?? "", ev = S(r[2]), id = S(r[3]);
+                if (t / 3600000L != hour) { flushHour(); hour = t / 3600000L; }
+                var s = Get(servers, server);
+                if (ev == "DELIVER") s.Deliveries++; else if (ev == "FAIL" || ev == "DSN") s.MessageFailures++;
+                long[] range;
+                if (!msgRange.TryGetValue(server, out range)) msgRange[server] = new[] { t, t }; else range[1] = t;
+                if (id == null) continue;
+                ulong h = Hash64(id);
+                HashSet<ulong> set;
+                if (!msgServer.TryGetValue(server, out set)) { set = new HashSet<ulong>(); msgServer[server] = set; }
+                set.Add(h);
+                if (!msgHour.TryGetValue(server, out set)) { set = new HashSet<ulong>(); msgHour[server] = set; }
+                set.Add(h);
             }
-            foreach (var r in Rows(store, "SELECT time_ms/3600000, server, COUNT(DISTINCT COALESCE(message_id, internal_id))" + msgWhere + " GROUP BY 1, 2;", m.P))
-                Get(daily, TimeUtil.Day(L(r[0]) * 3600000L, zone) + "|" + S(r[1])).Messages += L(r[2]);
+            flushHour();
+            foreach (var kv in msgServer) Get(servers, kv.Key).Messages = kv.Value.Count;
             // Servers without client access (Edge Transport, mail flow only): activity dates and days from the mail flow.
-            foreach (var r in Rows(store, "SELECT server, MIN(time_ms), MAX(time_ms)" + smtpWhere + " GROUP BY server UNION ALL SELECT server, MIN(time_ms), MAX(time_ms)" + msgWhere + " GROUP BY server;", m.P))
+            var flowRange = new List<KeyValuePair<string, long[]>>(msgRange);
+            foreach (var r in Rows(store, "SELECT server, MIN(time_ms), MAX(time_ms)" + smtpWhere + " GROUP BY server;", m.P))
+                flowRange.Add(new KeyValuePair<string, long[]>(S(r[0]), new[] { L(r[1]), L(r[2]) }));
+            foreach (var kv in flowRange)
             {
-                var s = Get(servers, S(r[0]));
+                var s = Get(servers, kv.Key);
                 if (s.Requests > 0) continue;
-                if (s.FirstMs == 0 || L(r[1]) < s.FirstMs) s.FirstMs = L(r[1]);
-                if (L(r[2]) > s.LastMs) s.LastMs = L(r[2]);
+                if (s.FirstMs == 0 || kv.Value[0] < s.FirstMs) s.FirstMs = kv.Value[0];
+                if (kv.Value[1] > s.LastMs) s.LastMs = kv.Value[1];
             }
             foreach (var kv in servers.Where(x => x.Value.Requests == 0))
                 kv.Value.Days = daily.Count(d => d.Key.EndsWith("|" + kv.Key, StringComparison.OrdinalIgnoreCase) && d.Value.SmtpIn + d.Value.SmtpOut + d.Value.Messages > 0);
@@ -283,6 +373,8 @@ namespace ExchangeLogReport
                     string.Join(", ", s.Protocols.Select(p => p[0] + " " + L(p[1]).ToString("N0", CultureInfo.InvariantCulture))),
                     local(firstMs), local(lastMs), s.Days, s.SmtpIn, s.SmtpOut, s.SmtpRejected, s.Messages, s.Deliveries, s.MessageFailures, s.Protocols });
             }
+            // Summary of the e-mail (columns as above, before the Edge report drops the client access ones).
+            result.ServerRows = serverSet.Rows.Select(r => (object[])r.Clone()).ToList();
 
             // ---- daily dataset ----------------------------------------------------------------------------
             var dailySet = new Dataset("daily", "Daily");
@@ -381,6 +473,7 @@ namespace ExchangeLogReport
                 if (q.Detailed) { sets.Add(sessionSet); sets.Add(issues); sets.Add(messageSet); sets.Add(smtpSet); }
             }
             foreach (var d in sets) result.Counts[d.Name] = d.Rows.Count;
+            if (q.Detailed) result.Highlights = BuildHighlights(q, unresolvedDetail, sessionSet, smtpClientSet, smtpDestinationSet);
             if (sessionSet != null && sets.Contains(sessionSet))
             {
                 int outcome = sessionSet.Columns.FindIndex(x => x.Name == "Outcome");
@@ -388,16 +481,106 @@ namespace ExchangeLogReport
             }
             if (q.WriteCsv)
             {
+                var csvWatch = System.Diagnostics.Stopwatch.StartNew();
                 foreach (var d in sets) result.Files.Add(WriteCsv(d, Path.Combine(q.OutputFolder, q.FilePrefix + "-" + d.FileName + ".csv"), q.CsvDelimiter));
+                Timed(csvWatch, sets.Sum(x => (long)x.Rows.Count), "CSV files of the datasets");
                 string accessPath = Path.Combine(q.OutputFolder, q.FilePrefix + "-ClientAccess-Daily.csv");
                 if (!q.Edge) result.Files.Add(WriteAccessCsv(store, accessPath, q.CsvDelimiter, "SELECT day, server, user, mailbox, protocol, requests, successes, client_errors, server_errors, slow, bytes_in, bytes_out, CASE WHEN requests > 0 THEN total_ms / requests END, max_ms, first_ms, last_ms, client_ip, user_agent" + usageWhere + " ORDER BY day, server, user, protocol;", a.P, zone));
             }
             if (q.WriteHtml)
             {
                 result.HtmlPath = Path.Combine(q.OutputFolder, q.FilePrefix + ".html");
+                var htmlWatch = System.Diagnostics.Stopwatch.StartNew();
                 result.Files.Add(WriteHtml(q, sets, result.Notes, result.HtmlPath));
+                Timed(htmlWatch, sets.Sum(x => (long)Math.Min(x.Rows.Count, q.MaxHtmlRows)), "HTML file");
             }
-            return result;
+        }
+
+        // ------------------------------------------------------------------ main problems (e-mail summary)
+
+        sealed class UnresolvedUser
+        {
+            public long Count, LastMs;
+            public string LastError;
+            public SortedSet<string> Protocols = new SortedSet<string>(StringComparer.OrdinalIgnoreCase), Servers = new SortedSet<string>(StringComparer.OrdinalIgnoreCase);
+        }
+
+        /// <summary>"401.1 Win32 1326", "200 back end 503 DeviceNotProvisioned": what failed, as short as possible.</summary>
+        static string FailureText(object status, object sub, object win32, object backEnd, string errorCode)
+        {
+            var sb = new StringBuilder();
+            if (status != null) { sb.Append(L(status)); if (sub != null && L(sub) != 0) sb.Append('.').Append(L(sub)); }
+            if (win32 != null && L(win32) != 0) sb.Append(" Win32 ").Append(L(win32));
+            if (backEnd != null && L(backEnd) != 0 && L(backEnd) != L(status)) sb.Append(" back end ").Append(L(backEnd));
+            if (!string.IsNullOrWhiteSpace(errorCode)) sb.Append(' ').Append(errorCode.Length > 60 ? errorCode.Substring(0, 60) + "..." : errorCode);
+            return sb.ToString().Trim();
+        }
+
+        static string Cell(object v, int max = 70)
+        {
+            string s = S(v) ?? "";
+            s = s.Replace("\r", " ").Replace("\n", " ").Trim();
+            return s.Length > max ? s.Substring(0, max) + "..." : s;
+        }
+
+        static string LocalText(object localSeconds)
+        {
+            return localSeconds == null ? "" : DateTimeOffset.FromUnixTimeSeconds(L(localSeconds)).UtcDateTime.ToString("yyyy-MM-dd HH:mm", CultureInfo.InvariantCulture);
+        }
+
+        /// <summary>
+        /// The main problems of a Detailed report, 10 per kind, worst first: users with unresolved failures, client
+        /// sessions that failed (Failed, Failed at end, Intermittent errors; Recovered sessions are left out), SMTP
+        /// clients with refused or deferred transactions, and on an Edge report the SMTP destinations with failures.
+        /// </summary>
+        static List<ReportHighlight> BuildHighlights(ReportRequest q, Dictionary<string, UnresolvedUser> unresolved, Dataset sessions, Dataset smtpClients, Dataset destinations)
+        {
+            var list = new List<ReportHighlight>();
+            if (!q.Edge)
+            {
+                var users = new ReportHighlight { Title = "Users with unresolved failures", Hint = "Failed requests not followed by a success of the same user and protocol.", Columns = new[] { "User", "Unresolved", "Protocols", "Servers", "Last failure", "Last error" } };
+                users.Total = unresolved.Count;
+                foreach (var kv in unresolved.OrderByDescending(x => x.Value.Count).ThenBy(x => x.Key, StringComparer.Ordinal).Take(10))
+                    users.Rows.Add(new[] { Cell(kv.Key, 50), kv.Value.Count.ToString("N0", CultureInfo.InvariantCulture), string.Join(", ", kv.Value.Protocols), string.Join(", ", kv.Value.Servers),
+                        TimeUtil.Format(kv.Value.LastMs, q.Zone, "yyyy-MM-dd HH:mm"), Cell(kv.Value.LastError) });
+                list.Add(users);
+
+                if (sessions != null)
+                {
+                    int iStart = sessions.Columns.FindIndex(x => x.Name == "Start"), iOutcome = sessions.Columns.FindIndex(x => x.Name == "Outcome"), iUser = sessions.Columns.FindIndex(x => x.Name == "User");
+                    int iProtocol = sessions.Columns.FindIndex(x => x.Name == "Protocol"), iClient = sessions.Columns.FindIndex(x => x.Name == "Client"), iRequests = sessions.Columns.FindIndex(x => x.Name == "Requests");
+                    int iFailures = sessions.Columns.FindIndex(x => x.Name == "Failures"), iError = sessions.Columns.FindIndex(x => x.Name == "Last error");
+                    Func<string, int> severity = o => o == "Failed" ? 0 : o == "Failed at end" ? 1 : o == "Intermittent errors" ? 2 : 9;
+                    var failed = sessions.Rows.Where(r => severity(S(r[iOutcome]) ?? "") < 9).ToList();
+                    var h = new ReportHighlight { Title = "Client sessions that failed", Hint = "Failed, failed at end or intermittent errors (recovered sessions are not listed).", Columns = new[] { "User", "Client", "Outcome", "Failures", "Start", "Last error" } };
+                    h.Total = failed.Count;
+                    foreach (var r in failed.OrderBy(r => severity(S(r[iOutcome]) ?? "")).ThenByDescending(r => L(r[iFailures])).Take(10))
+                        h.Rows.Add(new[] { Cell(r[iUser], 50), Cell(S(r[iProtocol]) + " " + S(r[iClient]), 50), S(r[iOutcome]), L(r[iFailures]).ToString("N0", CultureInfo.InvariantCulture) + " / " + L(r[iRequests]).ToString("N0", CultureInfo.InvariantCulture),
+                            LocalText(r[iStart]), Cell(r[iError]) });
+                    list.Add(h);
+                }
+            }
+            if (smtpClients != null)
+            {
+                var refused = smtpClients.Rows.Where(r => L(r[6]) + L(r[7]) > 0).ToList();
+                var h = new ReportHighlight { Title = "SMTP clients with refused or deferred mail", Hint = "Applications, devices or servers whose messages were rejected or deferred.", Columns = new[] { "Client", "Transactions", "Rejected", "Deferred", "Last seen", "Last error" } };
+                h.Total = refused.Count;
+                foreach (var r in refused.OrderByDescending(r => L(r[6]) + L(r[7])).ThenByDescending(r => L(r[4])).Take(10))
+                    h.Rows.Add(new[] { Cell(S(r[0]) + (string.IsNullOrEmpty(S(r[1])) ? "" : " (" + S(r[1]) + ")"), 60), L(r[4]).ToString("N0", CultureInfo.InvariantCulture), L(r[6]).ToString("N0", CultureInfo.InvariantCulture),
+                        L(r[7]).ToString("N0", CultureInfo.InvariantCulture), LocalText(r[14]), Cell(r[15]) });
+                list.Add(h);
+            }
+            if (destinations != null)
+            {
+                var failing = destinations.Rows.Where(r => L(r[6]) + L(r[7]) > 0).ToList();
+                var h = new ReportHighlight { Title = "SMTP destinations with failures", Hint = "Remote servers that deferred or refused mail sent by the Edge Transport servers.", Columns = new[] { "Destination", "Transactions", "Deferred", "Failed", "Last seen", "Last error" } };
+                h.Total = failing.Count;
+                foreach (var r in failing.OrderByDescending(r => L(r[6]) + L(r[7])).Take(10))
+                    h.Rows.Add(new[] { Cell(S(r[0]) + (string.IsNullOrEmpty(S(r[1])) ? "" : " (" + S(r[1]) + ")"), 60), L(r[4]).ToString("N0", CultureInfo.InvariantCulture), L(r[6]).ToString("N0", CultureInfo.InvariantCulture),
+                        L(r[7]).ToString("N0", CultureInfo.InvariantCulture), LocalText(r[13]), Cell(r[14]) });
+                list.Add(h);
+            }
+            return list;
         }
 
         // ------------------------------------------------------------------ messages: one row per message
@@ -600,7 +783,7 @@ namespace ExchangeLogReport
             set.Columns[16].Grid = false; set.Columns[16].Csv = false;
             var exchange = new HashSet<string>((q.ConfiguredServers ?? new string[0]).Select(x => x.ToUpperInvariant()), StringComparer.OrdinalIgnoreCase);
             var clients = new Dictionary<string, SmtpClient>(StringComparer.OrdinalIgnoreCase);
-            foreach (var r in Rows(store, "SELECT time_ms,server,connector,remote_ep,helo,tls,auth,mail_from,rcpt_count,status,response,message_id,transcript,role FROM smtp_transaction " +
+            foreach (var r in Rows(store, "SELECT time_ms,server,connector,remote_ep,helo,tls,auth,mail_from,rcpt_count,status,response,message_id,id,role FROM smtp_transaction " +
                 "WHERE time_ms >= @t0 AND time_ms < @t1 AND direction='Receive'" + userFilter + serverFilter + " ORDER BY time_ms;", p))
             {
                 string helo = S(r[4]), role = S(r[13]);
@@ -627,7 +810,7 @@ namespace ExchangeLogReport
                 string from = string.IsNullOrEmpty(S(r[7])) ? "<>" : S(r[7]);
                 long k; c.Senders.TryGetValue(from, out k); c.Senders[from] = k + 1;
                 if (q.Detailed)
-                    c.Transactions.Add(new object[] { local(t), S(r[1]), S(r[2]), status, from, L(r[8]), S(r[10]), S(r[11]), q.IncludeRoutingDetails ? S(r[12]) : null });
+                    c.Transactions.Add(new object[] { local(t), S(r[1]), S(r[2]), status, from, L(r[8]), S(r[10]), S(r[11]), q.IncludeRoutingDetails ? (object)L(r[12]) : null });
             }
             int statusIndex = 3;
             foreach (var c in clients.Values.OrderByDescending(x => x.Count))
@@ -639,13 +822,39 @@ namespace ExchangeLogReport
                     var accepted = detail.Where(x => S(x[statusIndex]) == "Accepted").Reverse().Take(200 - refused.Count).ToList();
                     detail = refused.Concat(accepted).OrderBy(x => L(x[0])).ToList();
                 }
+                c.Transactions = detail;
                 set.Rows.Add(new object[] { c.Ip, c.Helo, string.Join(", ", c.Servers.OrderBy(x => x)), string.Join(", ", c.Connectors.OrderBy(x => x)), c.Count, c.Accepted,
                     c.Rejected, c.Deferred, c.Incomplete, c.Recipients,
                     string.Join(", ", c.Senders.OrderByDescending(x => x.Value).Take(3).Select(x => x.Key + " x" + x.Value.ToString(CultureInfo.InvariantCulture))) + (c.Senders.Count > 3 ? " (+" + (c.Senders.Count - 3) + ")" : ""),
                     c.Tls.Count == 0 ? "No" : string.Join(", ", c.Tls.OrderBy(x => x)), c.Auth.Count == 0 ? "Anonymous" : string.Join(", ", c.Auth.OrderBy(x => x)),
                     local(c.First), local(c.Last), c.LastError, detail });
             }
+            FillTranscripts(store, clients.Values.SelectMany(c => c.Transactions), 8);
             return set;
+        }
+
+        /// <summary>
+        /// The transcript slot of the transaction details holds the id of the transaction: replaced by its transcript,
+        /// read for the kept transactions only (a report never reads the transcripts that it does not show).
+        /// </summary>
+        static void FillTranscripts(Store store, IEnumerable<object[]> rows, int slot)
+        {
+            var keep = rows.Where(x => x[slot] is long).ToList();
+            var text = Transcripts(store, keep.Select(x => (long)x[slot]));
+            foreach (var x in keep) { string s; x[slot] = text.TryGetValue((long)x[slot], out s) ? s : null; }
+        }
+
+        static Dictionary<long, string> Transcripts(Store store, IEnumerable<long> ids)
+        {
+            var result = new Dictionary<long, string>();
+            var all = ids.Distinct().ToList();
+            for (int i = 0; i < all.Count; i += 500)
+            {
+                string list = string.Join(",", all.Skip(i).Take(500).Select(x => x.ToString(CultureInfo.InvariantCulture)));
+                foreach (var r in Rows(store, "SELECT id, transcript FROM smtp_transaction WHERE id IN (" + list + ") AND transcript IS NOT NULL;", new Dictionary<string, object>()))
+                    result[L(r[0])] = S(r[1]);
+            }
+            return result;
         }
 
         sealed class SmtpClient
@@ -685,14 +894,14 @@ namespace ExchangeLogReport
             { var x = n.Split(':'); set.Add(x[0], x[1]); }
             set.Columns[15].Grid = false; set.Columns[15].Csv = false;
             var targets = new Dictionary<string, SmtpTarget>(StringComparer.OrdinalIgnoreCase);
-            foreach (var r in Rows(store, "SELECT time_ms,server,connector,remote_ep,tls,mail_from,rcpt_count,status,response,message_id,transcript FROM smtp_transaction " +
+            foreach (var r in Rows(store, "SELECT time_ms,server,connector,remote_ep,tls,mail_from,rcpt_count,status,response,message_id,id,transcript IS NOT NULL FROM smtp_transaction " +
                 "WHERE time_ms >= @t0 AND time_ms < @t1 AND direction='Send'" + userFilter + serverFilter + " ORDER BY time_ms;", p))
             {
                 string ip = Identity.Host(S(r[3])) ?? "", connector = S(r[2]) ?? "";
                 SmtpTarget c;
                 if (!targets.TryGetValue(ip + "|" + connector, out c)) { c = new SmtpTarget { Ip = ip, Connector = connector, First = L(r[0]) }; targets[ip + "|" + connector] = c; }
                 long t = L(r[0]);
-                string status = S(r[7]) ?? "", transcript = S(r[10]);
+                string status = S(r[7]) ?? "";
                 c.Last = t; c.Count++;
                 switch (status)
                 {
@@ -701,16 +910,24 @@ namespace ExchangeLogReport
                     case "Deferred": c.Deferred++; c.LastError = S(r[8]); break;
                     default: c.Incomplete++; break;
                 }
-                if (transcript != null) { var b = BannerRx.Match(transcript); if (b.Success) c.Host = b.Groups[1].Value; }
+                if (L(r[11]) != 0) { c.WithTranscript.Enqueue(L(r[10])); if (c.WithTranscript.Count > 3) c.WithTranscript.Dequeue(); }
                 c.Recipients += L(r[6]);
                 c.Servers.Add(S(r[1]) ?? "");
                 if (S(r[4]) != null) c.Tls.Add(S(r[4]));
                 string from = string.IsNullOrEmpty(S(r[5])) ? "<>" : S(r[5]);
                 long k; c.Senders.TryGetValue(from, out k); c.Senders[from] = k + 1;
                 if (q.Detailed)
-                    c.Transactions.Add(new object[] { local(t), S(r[1]), S(r[2]), status, from, L(r[6]), S(r[8]), S(r[9]), q.IncludeRoutingDetails ? transcript : null });
+                    c.Transactions.Add(new object[] { local(t), S(r[1]), S(r[2]), status, from, L(r[6]), S(r[8]), S(r[9]), q.IncludeRoutingDetails ? (object)L(r[10]) : null });
             }
             const int statusIndex = 3;
+            // Remote host: the name in the 220 banner, from the last transcripts of each destination.
+            var banners = Transcripts(store, targets.Values.SelectMany(x => x.WithTranscript));
+            foreach (var c in targets.Values)
+                foreach (var id in c.WithTranscript.Reverse())
+                {
+                    string s; if (!banners.TryGetValue(id, out s) || s == null) continue;
+                    var b = BannerRx.Match(s); if (b.Success) { c.Host = b.Groups[1].Value; break; }
+                }
             foreach (var c in targets.Values.OrderByDescending(x => x.Count))
             {
                 var detail = c.Transactions;
@@ -720,10 +937,12 @@ namespace ExchangeLogReport
                     var sent = detail.Where(x => S(x[statusIndex]) == "Sent").Reverse().Take(200 - failed.Count).ToList();
                     detail = failed.Concat(sent).OrderBy(x => L(x[0])).ToList();
                 }
+                c.Transactions = detail;
                 set.Rows.Add(new object[] { c.Ip, c.Host, c.Connector, string.Join(", ", c.Servers), c.Count, c.Sent, c.Deferred, c.Failed, c.Incomplete, c.Recipients,
                     string.Join(", ", c.Senders.OrderByDescending(x => x.Value).Take(3).Select(x => x.Key + " x" + x.Value.ToString(CultureInfo.InvariantCulture))) + (c.Senders.Count > 3 ? " (+" + (c.Senders.Count - 3) + ")" : ""),
                     c.Tls.Count == 0 ? "No" : string.Join(", ", c.Tls), local(c.First), local(c.Last), c.LastError, detail });
             }
+            FillTranscripts(store, targets.Values.SelectMany(c => c.Transactions), 8);
             return set;
         }
 
@@ -734,6 +953,8 @@ namespace ExchangeLogReport
             public SortedSet<string> Servers = new SortedSet<string>(StringComparer.OrdinalIgnoreCase), Tls = new SortedSet<string>(StringComparer.Ordinal);
             public Dictionary<string, long> Senders = new Dictionary<string, long>(StringComparer.OrdinalIgnoreCase);
             public List<object[]> Transactions = new List<object[]>();
+            /// <summary>Ids of the last transactions with a transcript (remote host of the 220 banner).</summary>
+            public Queue<long> WithTranscript = new Queue<long>();
         }
 
         // ------------------------------------------------------------------ CSV

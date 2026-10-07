@@ -27,11 +27,11 @@
 
 .EXAMPLE
     .\tools\New-ExchangeLogReportPackage.ps1
-    Creates ..\package\ExchangeLogReport-1.6.1.
+    Creates ..\package\ExchangeLogReport-2.0.0.
 
 .NOTES
     Author  : Nicolas Fabert
-    Version : 1.6.1
+    Version : 2.0.0
 #>
 [CmdletBinding()]
 param(
@@ -92,6 +92,6 @@ Write-Host "  Exchange Log Report $version - package ready" -ForegroundColor Gre
 Write-Host "  Folder   : $Destination"
 Write-Host ("  Content  : {0} files, {1:N1} MB" -f $all.Count, (($all | Measure-Object Length -Sum).Sum / 1MB))
 Write-Host "  Database : none - the tool creates an empty database at the first collection"
-Write-Host "  Config   : example servers - list the Exchange servers, then run -Mode Discover (user guide, chapter 1.1)"
+Write-Host "  Config   : example servers - list the Exchange servers, then run -Mode Discover (user guide, chapter 3)"
 Write-Host ''
 $all | Sort-Object FullName | ForEach-Object { '    {0,12:N0}  {1}' -f $_.Length, $_.FullName.Substring($Destination.Length + 1) }

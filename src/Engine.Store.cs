@@ -2,7 +2,7 @@
 //  Exchange Log Report - engine, part 2: SQLite store
 // -----------------------------------------------------------------------------
 //  Author  : Nicolas Fabert
-//  Version : 1.6.1
+//  Version : 2.0.0
 //
 //  Tables (all times in Unix ms, UTC)
 //    run              one row per execution
@@ -34,6 +34,14 @@ namespace ExchangeLogReport
         public long Id;
         public string Server, Kind, Path, Fields;
         public long Offset, Size, LastWriteMs, FirstMs, LastMs, Lines, Kept, Noise;
+
+        /// <summary>Copy of a known state for the path used now (its stored path is kept in the database).</summary>
+        public FileState CopyFor(string path)
+        {
+            var c = (FileState)MemberwiseClone();
+            c.Path = path;
+            return c;
+        }
     }
 
     /// <summary>Generic query result handed to PowerShell (status views).</summary>
@@ -46,12 +54,18 @@ namespace ExchangeLogReport
     public sealed class PurgeResult
     {
         public long Usage, Events, IisStatus, Smtp, Transcripts, Messages, Runs, Files, Sessions, Actions, Clients;
+        public double DeleteSeconds, VacuumSeconds, OptimizeSeconds;
         public long Total { get { return Usage + Events + IisStatus + Smtp + Messages + Sessions + Actions + Clients; } }
     }
 
     public sealed class Store : IDisposable
     {
-        public const string SchemaVersion = "3";
+        public const string SchemaVersion = "5";
+        /// <summary>SQLite page cache of a collection, in KB (set before opening the store; 256 MB by default).</summary>
+        public static int CacheKilobytes = 262144;
+        /// <summary>Page size of a NEW database (an existing one keeps its own). 16 KB: fewer and larger writes, on a
+        /// hard disk the copy of the WAL into the database took 2.6 times less time than with 4 KB pages (lab, 2.0.0).</summary>
+        public static int PageSize = 16384;
         readonly SqliteConnection _db;
         public string FilePath { get; private set; }
         public bool ReadOnly { get; private set; }
@@ -75,19 +89,31 @@ namespace ExchangeLogReport
             {
                 // A database of an older version (report without collection after an update): upgrade it
                 // once (new tables and columns only), then go on read-only.
-                if (StoredSchemaVersion() >= int.Parse(SchemaVersion, System.Globalization.CultureInfo.InvariantCulture)) return;
-                _db.Dispose();
-                using (new Store(FilePath, false, toolVersion)) { }
-                _db = new SqliteConnection(builder.ToString());
-                _db.Open();
-                Exec("PRAGMA busy_timeout=30000;");
+                if (StoredSchemaVersion() < int.Parse(SchemaVersion, System.Globalization.CultureInfo.InvariantCulture))
+                {
+                    _db.Dispose();
+                    using (new Store(FilePath, false, toolVersion)) { }
+                    _db = new SqliteConnection(builder.ToString());
+                    _db.Open();
+                    Exec("PRAGMA busy_timeout=30000;");
+                }
+                // A report reads index pages again and again (messages by id, steps by session) and sorts large sets:
+                // the same page cache as a collection, and its sorts in memory instead of temporary files.
+                Exec("PRAGMA cache_size=-" + CacheKilobytes.ToString(System.Globalization.CultureInfo.InvariantCulture) + ";");
+                Exec("PRAGMA temp_store=MEMORY;");
                 return;
             }
-            // auto_vacuum must be chosen before the first table is created (new database only).
+            // auto_vacuum and page_size must be chosen before the first table is created (new database only).
+            Exec("PRAGMA page_size=" + PageSize.ToString(System.Globalization.CultureInfo.InvariantCulture) + ";");
             Exec("PRAGMA auto_vacuum=INCREMENTAL;");
             Exec("PRAGMA journal_mode=WAL;");
             Exec("PRAGMA synchronous=NORMAL;");
             Exec("PRAGMA temp_store=MEMORY;");
+            // A collection writes large batches: a large page cache keeps the indexes in memory (the default 2 MB cache
+            // made every row of a large database wait for the disk), and the WAL is copied to the database every 64 MB
+            // instead of every 4 MB (fewer checkpoints, each one flushed to the disk).
+            Exec("PRAGMA cache_size=-" + CacheKilobytes.ToString(System.Globalization.CultureInfo.InvariantCulture) + ";");
+            Exec("PRAGMA wal_autocheckpoint=16384;");
             Exec(Schema);
             Migrate();
             Exec("INSERT INTO metadata(key,value) VALUES('schema_version','" + SchemaVersion + "') ON CONFLICT(key) DO UPDATE SET value=excluded.value;");
@@ -136,7 +162,8 @@ CREATE TABLE IF NOT EXISTS smtp_transaction(
   role TEXT, connector TEXT, session_id TEXT NOT NULL, local_ep TEXT, remote_ep TEXT, helo TEXT, tls TEXT, auth TEXT,
   mail_from TEXT, rcpt_count INTEGER, rcpts TEXT, message_id TEXT, internal_id TEXT, status TEXT, response TEXT, transcript TEXT,
   UNIQUE(server, direction, session_id, time_ms));
-CREATE INDEX IF NOT EXISTS ix_smtp_time ON smtp_transaction(time_ms);
+-- 2.0.0: covering index of the SMTP aggregates of the reports (replaces ix_smtp_time).
+CREATE INDEX IF NOT EXISTS ix_smtp_flow ON smtp_transaction(time_ms, server, direction, status);
 CREATE INDEX IF NOT EXISTS ix_smtp_message ON smtp_transaction(message_id);
 CREATE TABLE IF NOT EXISTS message_event(
   id INTEGER PRIMARY KEY, time_ms INTEGER NOT NULL, server TEXT NOT NULL, event_id TEXT, source TEXT,
@@ -144,7 +171,8 @@ CREATE TABLE IF NOT EXISTS message_event(
   recipient_count INTEGER, total_bytes INTEGER, subject TEXT, client_ip TEXT, client_host TEXT, server_ip TEXT,
   server_host TEXT, connector TEXT, source_context TEXT, related_recipient TEXT, reference TEXT,
   directionality TEXT, message_info TEXT, return_path TEXT, log_id TEXT, UNIQUE(server, log_id));
-CREATE INDEX IF NOT EXISTS ix_msg_time ON message_event(time_ms);
+-- 2.0.0: covering index of the mail flow aggregates of the reports (replaces ix_msg_time).
+CREATE INDEX IF NOT EXISTS ix_msg_flow ON message_event(time_ms, server, event_id, message_id, internal_id);
 CREATE INDEX IF NOT EXISTS ix_msg_id ON message_event(message_id);
 CREATE TABLE IF NOT EXISTS access_action(
   day TEXT NOT NULL, server TEXT NOT NULL, protocol TEXT NOT NULL, action TEXT NOT NULL,
@@ -188,6 +216,10 @@ CREATE INDEX IF NOT EXISTS ix_step_session ON session_step(session_id, time_ms);
         /// <summary>Upgrades a database created by an older version: new columns only, the data is kept.</summary>
         void Migrate()
         {
+            // 2.0.0: ix_msg_flow and ix_smtp_flow (Schema) replace the indexes on the time of the tracking events and of
+            // the SMTP transactions.
+            Exec("DROP INDEX IF EXISTS ix_msg_time;");
+            Exec("DROP INDEX IF EXISTS ix_smtp_time;");
             var columns = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
             using (var c = Command("PRAGMA table_info(access_usage);"))
             using (var r = c.ExecuteReader()) while (r.Read()) columns.Add(r.GetString(1));
@@ -289,7 +321,7 @@ CREATE INDEX IF NOT EXISTS ix_step_session ON session_step(session_id, time_ms);
                 while (r.Read())
                 {
                     var row = new object[r.FieldCount];
-                    for (int i = 0; i < r.FieldCount; i++) row[i] = r.IsDBNull(i) ? null : r.GetValue(i);
+                    for (int i = 0; i < r.FieldCount; i++) row[i] = r.IsDBNull(i) ? null : Packed.Unpack(r.GetValue(i));
                     result.Rows.Add(row);
                 }
             }
@@ -341,39 +373,27 @@ CREATE INDEX IF NOT EXISTS ix_step_session ON session_step(session_id, time_ms);
 
         // ---------------------------------------------------------------- files
 
-        /// <summary>Read position of a file, found by its identity (FileKey): Path stays the path used now.</summary>
-        public FileState GetFile(string server, string kind, string path)
-        {
-            using (var c = Command("SELECT id,offset,size,last_write_ms,fields,first_ms,last_ms,lines,kept,noise FROM source_file WHERE server=@s AND kind=@k AND file_key=@fk;"))
-            {
-                c.Parameters.AddWithValue("@s", server); c.Parameters.AddWithValue("@k", kind); c.Parameters.AddWithValue("@fk", FileKey(server, path));
-                using (var r = c.ExecuteReader())
-                {
-                    if (!r.Read()) return null;
-                    return new FileState
-                    {
-                        Id = r.GetInt64(0), Server = server, Kind = kind, Path = path,
-                        Offset = r.GetInt64(1), Size = r.GetInt64(2), LastWriteMs = r.IsDBNull(3) ? 0 : r.GetInt64(3),
-                        Fields = r.IsDBNull(4) ? null : r.GetString(4), FirstMs = r.IsDBNull(5) ? 0 : r.GetInt64(5),
-                        LastMs = r.IsDBNull(6) ? 0 : r.GetInt64(6), Lines = r.GetInt64(7), Kept = r.GetInt64(8), Noise = r.GetInt64(9)
-                    };
-                }
-            }
-        }
-
         /// <summary>
-        /// Read position of all known files of a server, keyed "kind|FileKey" (lets PowerShell skip unchanged
-        /// files quickly). A file whose position is before its end (an SMTP, IMAP or POP session still open when
-        /// it was read) is read again even if it did not grow: once the file is idle, the held session is written.
+        /// Read position of every known file, keyed "server|kind|FileKey" (the collection plan skips the files read to
+        /// their end). A file whose position is before its end (an SMTP, IMAP or POP session still open when it was
+        /// read) is read again even if it did not grow: once the file is idle, the held session is written.
         /// </summary>
-        public Dictionary<string, long> KnownOffsets(string server)
+        public Dictionary<string, FileState> KnownFiles()
         {
-            var d = new Dictionary<string, long>(StringComparer.OrdinalIgnoreCase);
-            using (var c = Command("SELECT kind, file_key, offset FROM source_file WHERE server=@s AND file_key IS NOT NULL;"))
-            {
-                c.Parameters.AddWithValue("@s", server);
-                using (var r = c.ExecuteReader()) while (r.Read()) d[r.GetString(0) + "|" + r.GetString(1)] = r.GetInt64(2);
-            }
+            var d = new Dictionary<string, FileState>(StringComparer.OrdinalIgnoreCase);
+            using (var c = Command("SELECT id,server,kind,path,file_key,offset,size,last_write_ms,fields,first_ms,last_ms,lines,kept,noise FROM source_file WHERE file_key IS NOT NULL;"))
+            using (var r = c.ExecuteReader())
+                while (r.Read())
+                {
+                    var f = new FileState
+                    {
+                        Id = r.GetInt64(0), Server = r.GetString(1), Kind = r.GetString(2), Path = r.GetString(3),
+                        Offset = r.GetInt64(5), Size = r.GetInt64(6), LastWriteMs = r.IsDBNull(7) ? 0 : r.GetInt64(7),
+                        Fields = r.IsDBNull(8) ? null : r.GetString(8), FirstMs = r.IsDBNull(9) ? 0 : r.GetInt64(9),
+                        LastMs = r.IsDBNull(10) ? 0 : r.GetInt64(10), Lines = r.GetInt64(11), Kept = r.GetInt64(12), Noise = r.GetInt64(13)
+                    };
+                    d[f.Server + "|" + f.Kind + "|" + r.GetString(4)] = f;
+                }
             return d;
         }
 
@@ -441,13 +461,15 @@ ON CONFLICT(run_id,server,kind,reason) DO UPDATE SET lines=lines+excluded.lines;
         public PurgeResult Purge(long retentionCutoffMs, string retentionCutoffDay, long detailCutoffMs)
         {
             var p = new PurgeResult();
+            var clock = System.Diagnostics.Stopwatch.StartNew();
             using (var tx = Begin())
             {
                 p.Usage = Delete("DELETE FROM access_usage WHERE day < @d;", "@d", retentionCutoffDay, tx);
                 p.Actions = Delete("DELETE FROM access_action WHERE day < @d;", "@d", retentionCutoffDay, tx);
                 p.Clients = Delete("DELETE FROM access_client WHERE day < @d;", "@d", retentionCutoffDay, tx);
-                Delete("DELETE FROM session_step WHERE session_id IN (SELECT id FROM client_session WHERE end_ms < @t);", "@t", detailCutoffMs, tx);
-                p.Sessions = Delete("DELETE FROM client_session WHERE end_ms < @t;", "@t", detailCutoffMs, tx);
+                // start_ms <= end_ms: the index on start_ms finds the old sessions without reading all of them.
+                Delete("DELETE FROM session_step WHERE session_id IN (SELECT id FROM client_session WHERE start_ms < @t AND end_ms < @t);", "@t", detailCutoffMs, tx);
+                p.Sessions = Delete("DELETE FROM client_session WHERE start_ms < @t AND end_ms < @t;", "@t", detailCutoffMs, tx);
                 p.Events = Delete("DELETE FROM access_event WHERE time_ms < @t;", "@t", detailCutoffMs, tx);
                 p.IisStatus = Delete("DELETE FROM iis_status WHERE time_ms < @t;", "@t", detailCutoffMs, tx);
                 p.Transcripts = Delete("UPDATE smtp_transaction SET transcript=NULL WHERE transcript IS NOT NULL AND time_ms < @t;", "@t", detailCutoffMs, tx);
@@ -459,8 +481,13 @@ ON CONFLICT(run_id,server,kind,reason) DO UPDATE SET lines=lines+excluded.lines;
                 p.Files = Delete("DELETE FROM source_file WHERE COALESCE(last_write_ms,0) < @t;", "@t", retentionCutoffMs, tx);
                 tx.Commit();
             }
+            p.DeleteSeconds = clock.Elapsed.TotalSeconds;
             Exec("PRAGMA incremental_vacuum;");
+            p.VacuumSeconds = clock.Elapsed.TotalSeconds - p.DeleteSeconds;
+            // ANALYZE of the tables that need it, on a sample: a full analysis of a large database reads all of it.
+            Exec("PRAGMA analysis_limit=1000;");
             Exec("PRAGMA optimize;");
+            p.OptimizeSeconds = clock.Elapsed.TotalSeconds - p.DeleteSeconds - p.VacuumSeconds;
             return p;
         }
 
@@ -470,7 +497,16 @@ ON CONFLICT(run_id,server,kind,reason) DO UPDATE SET lines=lines+excluded.lines;
         }
 
         /// <summary>Writes the WAL into the database file (smaller files to copy, consistent backups).</summary>
-        public void Checkpoint() { if (!ReadOnly) Exec("PRAGMA wal_checkpoint(TRUNCATE);"); }
+        public void Checkpoint()
+        {
+            if (ReadOnly) return;
+            Exec("PRAGMA wal_checkpoint(TRUNCATE);");
+            // A collection copies the WAL itself (Collector.Checkpoints): automatic copies again afterwards.
+            Exec("PRAGMA wal_autocheckpoint=16384;");
+        }
+
+        /// <summary>Size of the WAL file (written but not yet copied into the database).</summary>
+        public long WalBytes { get { var f = new FileInfo(FilePath + "-wal"); return f.Exists ? f.Length : 0; } }
 
         public long FileBytes
         {

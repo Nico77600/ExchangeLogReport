@@ -3,6 +3,76 @@
 All notable changes are listed here. Versions follow MAJOR.MINOR.PATCH (see the developer guide, Annex C).
 Author: Nicolas Fabert.
 
+## [2.0.0] — 2026-10-07
+
+A new collection engine: every server and every source is read at the same time, and the database is written in large transactions. The first collection of a production environment takes minutes instead of hours. The report can also be sent by e-mail.
+
+### Changed
+- **A report reads the database; it no longer collects first by default.** The daily routine is: the hourly scheduled collection reads the logs, and reports read the database.
+  - A report reads the new log lines first only when the last collection is older than `Report.MaxDataAgeMinutes` (new, 90 min) **and** the period ends after it.
+  - With no collection in the database, a report stops and asks for `-Mode Collect`: it never starts the first collection (14 days of logs) on its own.
+  - While a collection is running, a report does not wait: it uses the data already collected.
+  - The banner line **Data** gives the time of the last collection and what the report does.
+  - New `-Collect` forces the collection first. `-NoCollect` still never collects.
+  - Before, `-Range Last30Days` run without a scheduled collection started a collection of several hours before the report.
+- **Parallel collection.** One parse thread per file reads every server and every source at the same time (`Collection.Parallelism`, default one per processor, 2 to 16, at below-normal priority). A single write thread uses the database. HttpProxy files are read first because they give the `domain\sam` accounts. SMTP and message tracking keep the threads busy meanwhile, and the back-end logs start once HttpProxy is written. The console shows one row per server and source as soon as that source is done, with a progress bar for the whole collection.
+- **One transaction per batch of files** (30 s or 500,000 rows) instead of one per file, with the read positions of its files. An interrupted collection still resumes without duplicates. The client sessions stay in memory for the whole batch instead of being read and rewritten for every file.
+- **Faster parsing and writing**:
+  - lines are read and split as bytes;
+  - field values and noise decisions are cached per thread;
+  - the daily aggregates are computed by the parse threads;
+  - SQLite statements are prepared once;
+  - the page cache is 256 MB;
+  - a new database uses 16 KB pages.
+- **Recoveries** (a failure followed by a success of the same user) are resolved once, at the end of the collection. The result no longer depends on the order in which the files were read.
+- **WAL.** It is copied into the database by a background thread during the collection, and emptied at the end. The execution log gives the time of each step and a statistics line: threads, write thread, commits, WAL copies, GC (developer guide 12.3).
+- **Compressed storage.** SMTP transcripts and session timelines are stored compressed (Deflate, about 6 times smaller). Those written by 1.x stay readable. **A database written by 2.0.0 cannot be used by 1.x any more.**
+- Retention deletes use the time indexes, and the SQLite statistics (`PRAGMA optimize`) are bounded.
+- **Faster reports.**
+  - A report now opens the database with the same 256 MB page cache as a collection, and sorts in memory. Before, it kept the 2 MB SQLite default and sorted in temporary files.
+  - Messages per server and per hour are counted in one pass over a new covering index of the tracking events (`ix_msg_flow`). The SMTP counts use a covering index too (`ix_smtp_flow`). Both are built at the first opening of a 1.x database. Before, two `COUNT(DISTINCT …)` queries took most of a 30-day Usage report.
+  - SMTP transcripts are read only for the transactions shown: none in a Usage report.
+  - The execution log gives the slowest steps of every report (`Report step: …`).
+- **Faster start of a collection.** The days that have client sessions and the `domain\sam` accounts are found by index seeks. Before, both reads went through whole tables: 24 s at the start of every collection on the lab hard disk, even with nothing new to read.
+
+### Added
+- **Report by e-mail.** The new `Mail` section of the configuration:
+  - **Anonymous**, **Basic** (`AUTH LOGIN` / `PLAIN`, over TLS only) or **Kerberos** (`AUTH GSSAPI`, RFC 4752, without NTLM fallback);
+  - **STARTTLS** (required by default) or implicit **TLS** (465), or no encryption;
+  - the certificate is checked, or pinned with `CertificateThumbprint`.
+  
+  The body gives the summary of the report: period, real users, sessions, failures, messages and the verdict of every server. The report is attached as HTML (zipped above `MaxAttachmentMB`) or as a zip of every file, or not at all. A refused recipient or a message that is not sent gives exit code 2, and the report is still written.
+- **`Collection.MaxFilesPerServer`** (default 4): files of one server read at the same time. The reads spread over the servers, and no server (nor the local disk of a collector that is an Exchange server) serves all the threads. The listing of the folders follows `Parallelism` too.
+- **Main problems in the e-mail of a Detailed report**: 10 per kind, worst first — users with unresolved failures, client sessions that failed, SMTP clients with refused or deferred mail, SMTP destinations with failures (Edge). A kind without any problem is named on a *None in this period* line. A daily Detailed report sent by e-mail can be read without opening the attachment.
+- **Two ways to use the tool**, documented as such: **recurring reporting** (scheduled tasks: the monthly usage and the daily Detailed report, written in HTML and sent by e-mail as an option; developer guide 7 C) and **troubleshooting on demand**. The user guide is rewritten as **one guided path**: set up once (steps 1 to 4: servers, `-Mode Discover`, the hourly task, `-Mode Status`), then branch **A** (steps 5 to 7: the two scheduled reports, open the report, option: by e-mail) or branch **B** (steps 5 to 7: Detailed report on the user and the period, client session, timeline to the raw log lines). Every step says what to do, gives one exact command on one example (EXCH01 to EXCH04, contoso.com, alice), what you should see and what to do if not; the README shows the same path.
+- `-SendMail` (or `-SendMail:$false`) decides for one report run. `Mail.Enabled = $true` sends every report.
+- **`-Mode MailTest`** sends a test message and shows the SMTP conversation, with the AUTH data masked. `-Mode MailTest -Credential` saves the account of `Basic` / `Kerberos` in `Mail.CredentialFile`, protected by DPAPI (`CredentialScope` `User` or `Computer`, file restricted to SYSTEM, the administrators and its writer). The credential file is never in the package.
+- **Load test tools.** `tools\New-ExlSyntheticLogs.ps1` writes Exchange logs with the volumes of a production server (deterministic; `-Only` generates the logs of each lab server in place; `-Profile Decommission`: a barely used server and an unused one, for a decommissioning review). `tools\Measure-ExlCollection.ps1` measures a collection on them: duration, rate, database, peak memory and statistics (developer guide 12.2).
+
+### Validated
+- **The customer capture reproduced.** In the lab, 1.6.1 took 1 h 04 min for HttpProxy and **43 min 58 s for message tracking (273 KB/s)** on one server, the same as the customer (409 KB/s).
+- **Load test** (2 servers × 14 days, 14.8 GB, 33.1 million lines, 7.0 million kept):
+  - on a PC (8 logical processors, SSD), 1.6.1 took **29 min 45 s** and 2.0.0 takes **3 min 51 s to 4 min 21 s** (7 to 8 times faster);
+  - the database is 2,116 MB instead of 2,562 MB;
+  - the next collection with nothing new takes under 1 s.
+- **The volume of a second customer capture** (4 servers × 14 days, 33.3 GB, 76.2 million lines; in production 1.6.1 took 6 h 36 min for 31.6 GB): 2.0.0 collects it in **13 min 18 s** on the PC, database 4.6 GB.
+- **Lab, 1.6.1 against 2.0.0 on the same collector** (EXMBX1: 4 vCPU, 16 GB, Standard HDD; logs of 2 servers × 14 days through `E$`, 14.6 GB, 33.1 million lines; file cache emptied before each cold measure):
+  - first collection: **4 h 55 min 49 s → 6 min 02 s** (× 49), database 2,522 → 2,212 MB;
+  - next collection with nothing new: 7 min 17 s → 2.6 s;
+  - Usage report, 30 days: **14 min 57 s → 2 min 30 s** cold, 27 s → 18 s warm;
+  - Detailed report, 7 days: 15 min 36 s → 6 min 58 s cold, 52 s → 45 s warm;
+  - 1.6.1 reproduced the customer capture: message tracking at 273 KB/s (44 min per server).
+- **Lab, one server** (4 vCPU, Standard HDD), 7.2 GB:
+  - read in about 2 min, 2 min 28 s with the end-of-run WAL copy;
+  - with 16 KB pages, that copy took 22 s instead of 58 s with 4 KB pages.
+- **E-mail on Exchange Server SE** (lab):
+  - anonymous on 25, in clear and with STARTTLS (pinned certificate);
+  - an untrusted certificate is refused;
+  - Basic on 587; a wrong password gives `535`;
+  - Kerberos on 587 with a saved account, including the security layer;
+  - Kerberos as SYSTEM is refused by Exchange (`535 5.7.3 Unable to proxy authenticated session`, the computer account has no mailbox), and the tool explains why;
+  - reports sent with `-SendMail` (Basic, Usage, 7 days, HTML 1.2 MB attached) and with `Mail.Enabled` (Kerberos, Detailed, 24 hours, HTML 3.3 MB attached);
+  - a 7-day Detailed report whose zip (73 MB) is larger than `MaxAttachmentMB` is sent without attachment, and the console and the message say so.
 ## [1.6.1] — 2026-10-05
 
 ### Fixed

@@ -1,9 +1,9 @@
 ---
 title: Exchange Log Report
 subtitle: Developer guide
-version: 1.6.1
+version: 2.0.0
 author: Nicolas Fabert
-updated: 2026-10-05
+updated: 2026-10-07
 ---
 
 # Exchange Log Report — Developer guide
@@ -31,17 +31,26 @@ file | What it produces | **CSV + HTML** files in a local folder: a usage report
 
 ## Quick start
 
-```steps
-Check the prerequisites | PowerShell 7.4+ on the collector, and the account of chapter 4: SYSTEM on an Exchange server, or a domain account that is local administrator of the Exchange servers.
-List the servers | Open `config\ExchangeLogReport.config.psd1` and put the server names in the `Servers` section (names only).
-Find the log folders | `.\Invoke-ExchangeLogReport.ps1 -Mode Discover` with an account of *View-Only Organization Management*: it reads where every server really writes its logs (Windows PowerShell 5.1, Exchange cmdlets).
-Run the first collection | `.\Invoke-ExchangeLogReport.ps1 -Mode Collect` reads the last `BackfillDays` days of logs into the database.
-Schedule the collection | `-Mode Collect` every hour (scheduled task, chapter 7).
-Build a report | `.\Invoke-ExchangeLogReport.ps1 -Range Last30Days` (usage) or `-ReportType Detailed -User alice` (troubleshooting).
+```path
+Set up once | settings | Set up once: then the collection runs by itself every hour
+Set up once | 1 | List the servers | write their names in the configuration
+Set up once | 2 | Find the log folders | `-Mode Discover`, with your administrator account
+Set up once | 3 | Collect every hour | a scheduled task; its first run reads 14 days of logs
+Set up once | 4 | Check | `-Mode Status`: every server has data
+A | chart | Recurring reporting
+A | 5 | Schedule the reports | every morning the last 24 hours, every month the last month
+A | 6 | Open the report | the HTML file in the reports folder
+A | 7 | Option: by e-mail | the same reports, sent to your team
+B | search | Troubleshooting on demand
+B | 5 | Run a Detailed report | on the user and the hours of the problem
+B | 6 | Open the client session | HTML report, **Client sessions** tab
+B | 7 | Follow the timeline | each step: what failed, and where its raw log lines are
 ```
 
+Every step with its exact command, on one example (EXCH01 to EXCH04, contoso.com, alice): [user guide, chapters 3 to 5](ExchangeLogReport-UserGuide.md#1-start-here). The account and the prerequisites: chapter 4; the scheduled tasks: chapter 7; the e-mail: 8.1.
+
 > [!IMPORTANT]
-> The tool is **read-only** for Exchange: it reads log files and, with `-Mode Discover`, settings (`Get-*` cmdlets and IIS `applicationHost.config`). It never changes a setting and never sends anything. Reports stay on the local disk.
+> The tool is **read-only** for Exchange: it reads log files and, with `-Mode Discover`, settings (`Get-*` cmdlets and IIS `applicationHost.config`). It never changes a setting. Reports stay on the local disk, unless the `Mail` section sends them by e-mail (chapter 8.1).
 
 # Part I · Understand
 
@@ -85,7 +94,21 @@ chart | CSV + HTML | usage or detailed troubleshooting report
 | **SMTP protocol logs** (`<role>\ProtocolLog\SmtpReceive|SmtpSend`) | One row per mail transaction (`MAIL FROM` … end of data): remote host, HELO, TLS, authentication, recipients, final response, Message-ID, session transcript. |
 | **Message tracking** (`MSGTRK*.log`) | Every event of every real message on every server; consolidated into **one row per Message-ID** with its route. |
 
-Performance-critical work (reading, parsing, SQLite, report files) is done by a C# engine (`src\Engine.*.cs`) compiled automatically on first use, like in Purview DLP Report.
+Performance-critical work (reading, parsing, SQLite, report files, e-mail) is done by a C# engine (`src\Engine.*.cs`) compiled automatically on first use, like in Purview DLP Report.
+
+A collection reads **every server and every source at the same time** (2.0.0):
+
+```flow
+folder | List | every log folder of every server, in parallel
+arrow | new files | read position in the database
+terminal | Parse threads | one file each (Collection.Parallelism): noise removed, records and aggregates of the file
+arrow | records | in memory
+database | Write thread | sessions, recoveries, rows; one transaction per batch of files, with their read positions
+arrow | rows | as soon as a source is done
+chart | Console | one row per server and source, progress bar for the whole collection
+```
+
+The parse threads share nothing but the noise rules: everything that depends on the other files (the `domain\sam` form of an account, the client sessions, the recoveries) is done by the write thread, the only one that uses the database. HttpProxy files are read first (they teach the `domain\sam` accounts), SMTP and message tracking fill the threads meanwhile, and the back-end logs (IIS, MAPI, ActiveSync, POP/IMAP) start once HttpProxy is written. A file is either written whole with its new read position, or not at all: an interrupted collection (Ctrl+C, reboot, error) resumes where it stopped, without duplicates.
 
 <!-- icon: lightbulb -->
 ## 3. Things to know
@@ -288,9 +311,12 @@ Built-in rules that need no configuration:
 | `Collection.SlowRequestMs` | 5000 | Successful requests slower than this are kept as **Slow** (0 = never). Applied at collection: changing it does not recompute the history. |
 | `Collection.LongRunningPatterns` | NotificationWait, Ping, RPC/HTTP, OWA notifications, PowerShell, IMAP IDLE | Long-polling requests (regex on `Protocol|Action|Url`): never slow. |
 | `Collection.StaleSourceHours` | 24 | HttpProxy, IIS front end or back end whose newest file is older than this is **stale** (warning, exit code 2). 0 = no check. SMTP and message tracking are not checked: a server without mail flow writes nothing there. |
+| `Collection.Parallelism` | 0 | Log files read at the same time (one thread each, every server and source together); one more thread writes the database. 0 = one per processor, 2 to 16. The read threads run at below-normal priority (the write thread at normal priority): on an Exchange server, Exchange keeps the processors it needs. Lower it on a collector that does other work (chapter 12). |
+| `Collection.MaxFilesPerServer` | 4 | Files of one server read at the same time (0 = no limit). Whatever the number of servers, at most `Parallelism` files are read at once; this spreads them over the servers, so that no server - nor the local disk when the tool runs on an Exchange server - serves all of them. |
 | `Storage.RetentionDays` | **60** | Daily usage, operations, clients and devices, SMTP transactions, message tracking. |
 | `Storage.DetailRetentionDays` | **14** | Failed and slow requests, client sessions and their timeline, SMTP session transcripts. |
 | `Report.DefaultType` | `Usage` | `Usage` or `Detailed`. |
+| `Report.MaxDataAgeMinutes` | 90 | A report reads the new log lines first only when the last collection is older than this **and** the period ends after it. 0 = never on its own (`-Collect` only). See chapter 8. |
 | `Report.IncludeRoutingDetails` | `$true` | Message route and SMTP transcripts **in the CSV files** (always available behind a click in HTML). |
 | `Report.IncludeSessionDetails` | `$true` | Timeline of each client session **in the CSV files** (always available behind a click in HTML). |
 | `Report.MaxHtmlRows` | 200,000 | Per table in the HTML file; the CSV files are always complete. |
@@ -323,17 +349,49 @@ The account needs the **Log on as a batch job** right on the administration serv
 
 **On an Edge Transport server**: option A on the Edge itself (SYSTEM), with its own tool folder and database (4.2).
 
+**C. Scheduled reports (recurring reporting)**, with the account of the collection:
+
+```powershell
+$pwsh = 'E:\Tools\pwsh\pwsh.exe'
+$tool = 'E:\Tools\ExchangeLogReport\Invoke-ExchangeLogReport.ps1'
+$run  = "$pwsh -NoProfile -ExecutionPolicy Bypass -File $tool"
+
+# Every day at 07:00: the last 24 hours (Detailed report)
+schtasks /Create /F /RU SYSTEM /RL HIGHEST /TN "Exchange Log Report - daily report" `
+    /SC DAILY /ST 07:00 /TR "$run -Range Last24Hours -ReportType Detailed"
+
+# The 1st of every month at 07:00: the usage of the previous month
+schtasks /Create /F /RU SYSTEM /RL HIGHEST /TN "Exchange Log Report - monthly report" `
+    /SC MONTHLY /D 1 /ST 07:00 /TR "$run -Range PreviousMonth"
+```
+
+Each run writes a new report folder under `Report.OutputPath`. The reports read the database (chapter 8): they never wait for the collection. **By e-mail too**: set and check the `Mail` section (8.1), then create the same tasks with `-SendMail` at the end of `/TR` (`/F` replaces them); the daily e-mail lists the main problems in its body. With a domain account: `/RU CONTOSO\svc-elr /RP *`, and the mail credential file written by that account.
+
 ```cards
 check | Exit code 0 | Success.
 wrench | Exit code 1 | Failure: see the error and the log file.
-info | Exit code 2 | Finished with warnings: a server, a folder or a file could not be read, a source is stale, or the IIS log folders changed since `-Mode Discover` (see the console and the log file).
-shield | Lock | A lock file prevents two collections at the same time; reports can still be built from the data already collected (-NoCollect).
+info | Exit code 2 | Finished with warnings: a server, a folder or a file could not be read, a source is stale, the IIS log folders changed since `-Mode Discover`, or the report could not be sent by e-mail (see the console and the log file).
+shield | Lock | A lock file prevents two collections at the same time. A report never waits for it: while a collection runs, it uses the data already collected.
 ```
 
 # Part III · Use
 
 <!-- icon: terminal -->
 ## 8. Everyday use
+
+The tool serves two purposes, for different reasons. Both read the database filled by the hourly collection:
+
+```cards
+chart | Recurring reporting | Scheduled reports, in HTML and by e-mail as an option: every month the usage of every server, every morning the last 24 hours with their main problems. For the messaging manager, the architects and operations: decisions and follow-up over time, without anyone running a command.
+search | Troubleshooting on demand | A user, a message, an incident: a Detailed report on the period and the people concerned, in seconds or minutes. For the Exchange administrators and support: client sessions with their timeline, failed requests, messages with their route.
+```
+
+| | Recurring reporting | Troubleshooting on demand |
+|---|---|---|
+| **For** | Messaging manager, architects, operations | Exchange administrators, support |
+| **Why** | Decisions and follow-up over time — which servers can go, which old clients and applications remain, what keeps failing — without anyone running a command | Answer during an incident in minutes, instead of Log Parser queries on the raw files of every server |
+| **How** | Scheduled tasks that write the HTML report (chapter 7, C): `-Range PreviousMonth` (usage), `-Range Last24Hours -ReportType Detailed` (the day). Add `-SendMail` to receive them by e-mail too (8.1): the daily e-mail lists the main problems in its body | A Detailed report on the period, the users or the servers concerned: `-Date`, `-Start` / `-End`, `-User`, `-Server` |
+| **Reads** | Usage: servers, users, clients, operations, SMTP clients. Detailed: + failed sessions and requests, refused mail | Client sessions and their timeline, failed and slow requests, messages and their route, SMTP transcripts |
 
 ```powershell
 # Which servers are really used (last 30 days)
@@ -346,9 +404,9 @@ shield | Lock | A lock file prevents two collections at the same time; reports c
 .\Invoke-ExchangeLogReport.ps1 -Start '2026-10-01 08:00' -End '2026-10-01 12:00' `
     -ReportType Detailed -User alice
 
-# An incident window on two servers, from the data already collected
+# An incident window on two servers: a past period, read from the database
 .\Invoke-ExchangeLogReport.ps1 -Start '2026-09-23 08:00' -End '2026-09-23 12:00' `
-    -ReportType Detailed -Server EXCH01,EXCH02 -NoCollect
+    -ReportType Detailed -Server EXCH01,EXCH02
 
 # What the database contains, and the noise removed by the last collection
 .\Invoke-ExchangeLogReport.ps1 -Mode Status
@@ -357,7 +415,7 @@ shield | Lock | A lock file prevents two collections at the same time; reports c
 .\Invoke-ExchangeLogReport.ps1 -Mode Discover
 ```
 
-More examples, one per everyday question (unused server, user problem, missing message, incident, monthly review, Edge): [user guide, chapter 2](ExchangeLogReport-UserGuide.md#2-everyday-use).
+The guided path — set up once, then **A · Recurring reporting** or **B · Troubleshooting**, one exact command per step: [user guide, chapter 1](ExchangeLogReport-UserGuide.md#1-start-here).
 
 ```cards
 calendar | -Range | Last24Hours, Last7Days, Last30Days, PreviousMonth, Month (with -Month), Day (with -Date) or Custom (with -Start and -End). -Month, -Date and -Start / -End select their range on their own.
@@ -366,11 +424,79 @@ people | -User | Any part of the account (domain\sam), UPN or SMTP address; filt
 server | -Server | One or more servers of the configuration (report and collection).
 ```
 
+**Collect, then report.** The hourly scheduled collection (chapter 7) reads the logs; a report reads the database. Before the banner, the report decides whether it reads the new log lines first (`Resolve-ExlReportCollection`), from the end of the last successful collection recorded in the database (table `run`, any account):
+
+| Case | The report |
+|---|---|
+| No collection in the database | Stops: *run -Mode Collect first* (exit code 1). The first collection (`BackfillDays` days) is never started by a report on its own. |
+| `-NoCollect` | Reads the database. |
+| The period ends before the last collection | Reads the database: the data of the period is complete, whatever its age (`-Month`, `PreviousMonth`, a past incident). |
+| Last collection younger than `Report.MaxDataAgeMinutes` (90) | Reads the database: the hourly collection keeps it fresh. |
+| Older (the scheduled task is not running) | Reads the lines written since the last collection, then builds the report. When a collection is running (lock), it does not wait: it uses the data as it is. |
+| `-Collect` | Reads the new log lines first, whatever the age (waits for a running collection, 30 s at most). |
+
+The banner line **Data** gives the case and the time of the last collection. Before 2.0, every report without `-NoCollect` collected first: run without a scheduled collection, a 30-day report started a first collection of several hours.
+
 `-User` filters client access, client sessions, messages (as sender or recipient) and SMTP clients. The *Operations* view is measured per server, not per user: it is not built when the report is filtered on users.
 
 **No parameter is ignored silently.** The kinds of period are separate parameter sets (`Get-Help .\Invoke-ExchangeLogReport.ps1` shows them): `-Start` requires `-End`, and `-Month`, `-Date` and `-Start` / `-End` cannot be combined. A period that contradicts `-Range` (`-Range Last7Days -Start …`) is an error. A parameter that the mode does not use is run anyway and shown in yellow under the banner with the reason, for example `-Start, -End ignored with -Mode Collect: a collection reads every new log line, whatever its date; the period only selects what the report shows (-Mode Report).` The same applies to the report parameters with `-Mode Collect`, `Status` or `Discover`, to `-Server` with `-Mode Status` or `Discover`, and to `-ConnectTo` / `-Credential` outside `-Mode Discover`.
 
 ![Console of a detailed report](images/console-report.png)
+
+### 8.1 Sending the report by e-mail
+
+The `Mail` section sends the report after it is built. The body is the summary: period, real users, sessions, failures, messages and the verdict of every server. A **Detailed** report adds its **main problems**, 10 per kind: users with unresolved failures, client sessions that failed (*Failed*, *Failed at end*, *Intermittent errors*), SMTP clients with refused or deferred mail, and for an Edge report the SMTP destinations with failures. A kind without any problem is named on a *None in this period* line. The report is attached (`Attach = 'Html'`: the HTML file, zipped when it is larger than `MaxAttachmentMB`; `'Zip'`: every file; `'None'`). A report larger than the limit is not attached: the body gives its folder.
+
+```powershell
+Mail = @{
+    Enabled        = $true                                  # every -Mode Report sends; -SendMail / -SendMail:$false decide for one run
+    SmtpServer     = 'smtp.contoso.com'                     # a name, not an address (certificate, Kerberos)
+    Port           = 587                                    # 0: 25, or 465 with Encryption 'Tls'
+    Encryption     = 'StartTls'                             # None | StartTls | Tls
+    Authentication = 'Kerberos'                             # Anonymous | Basic | Kerberos
+    From           = 'exchange-log-report@contoso.com'
+    To             = @('messaging-team@contoso.com')
+}
+```
+
+| Setting | Values | Meaning |
+|---|---|---|
+| `Encryption` | `None` | Plain SMTP: on a trusted network only. |
+| | `StartTls` (default) | `STARTTLS` **required**: when the server does not offer it, nothing is sent. Ports 25 and 587. |
+| | `Tls` | TLS from the first byte (SMTPS, port 465). |
+| `Authentication` | `Anonymous` (default) | No account: a receive connector that accepts the collector (anonymous or by address). |
+| | `Basic` | `AUTH LOGIN` (or `PLAIN`) with the account of `CredentialFile`; refused without TLS. |
+| | `Kerberos` | `AUTH GSSAPI` (RFC 4752), Kerberos only (no NTLM fallback): the account of `CredentialFile` when it exists, else the account that runs the tool. SPN `SMTPSVC/<SmtpServer>`, or `TargetName` behind a load balancer. |
+| `CredentialFile`, `CredentialScope` | `.\config\ExchangeLogReport.mail.credential`, `User` | The account and its password, protected by **DPAPI**: `User` = readable only by the Windows account that wrote it, on this computer; `Computer` = by any account of this computer. The file is restricted to SYSTEM, the administrators and its writer. |
+| `CertificateThumbprint` | 40 hexadecimal characters | Pins the certificate of the server (the self-signed certificate of an Exchange server) instead of checking its chain and name. |
+| `From`, `FromName`, `To`, `Cc`, `Bcc` | addresses | Addresses only (`'team@contoso.com'`), checked at start. A refused recipient is reported (exit code 2), the others receive the report. |
+| `Subject` | `{Title} - {Type} report - {Period}` | Also `{Range}`, `{Servers}`, `{Computer}`. |
+| `Attach`, `MaxAttachmentMB` | `Html`, 7 | See above. Exchange accepts 25 MB by default (`MaxSendSize`, 33 % more once encoded). |
+| `HeloName`, `TimeoutSeconds` | the computer name, 60 | EHLO name; network timeout. |
+
+**Check it first**, with the account of the scheduled task:
+
+```powershell
+# Basic, or Kerberos with another account: save the account once (DPAPI), then send a test message
+.\Invoke-ExchangeLogReport.ps1 -Mode MailTest -Credential (Get-Credential 'CONTOSO\svc-elr-mail')
+
+# The SMTP conversation is shown (AUTH data masked): TLS, certificate, account, response of the server
+.\Invoke-ExchangeLogReport.ps1 -Mode MailTest
+```
+
+```powershell
+# The two recurring reports, by e-mail too (scheduled tasks: chapter 7, C)
+.\Invoke-ExchangeLogReport.ps1 -Range PreviousMonth -SendMail                          # monthly usage
+.\Invoke-ExchangeLogReport.ps1 -Range Last24Hours -ReportType Detailed -SendMail       # the day, main problems in the body
+```
+
+![E-mail of the daily Detailed report: summary, servers and main problems](images/mail-daily-problems.png)
+
+> [!IMPORTANT]
+> **Write the credential file with the account that runs the scheduled task** (`CredentialScope = 'User'`): DPAPI ties the password to that Windows account and this computer. Written by another account, the tool says so and nothing is sent. For a task that runs as SYSTEM, write it as SYSTEM, or use `CredentialScope = 'Computer'`.
+
+> [!NOTE]
+> **Kerberos and Exchange.** On the client receive connector of a front end (*Client Frontend*, port 587), Exchange hands the authenticated session over to the mailbox server of the account: the account needs a **mailbox**. The computer account (SYSTEM) has none and is refused (`535 5.7.3 Unable to proxy authenticated session`): save a mailbox account with `-Mode MailTest -Credential`. The default front-end connector (port 25) offers no Kerberos (`AUTH NTLM` only): use it anonymously, from an address that it accepts.
 
 <!-- icon: chart -->
 ## 9. Reading the report
@@ -540,15 +666,15 @@ file | One row per message | status, recipients, route, transcripts
 | `client_session` | One row per client session: counters, servers, client, errors, back-end information | `DetailRetentionDays` |
 | `session_step` | Timeline of a session: one JSON row per session and log file read (with the log file of each step) | `DetailRetentionDays` |
 | `iis_status` | IIS sub-status / Win32 status of failed proxied requests | `DetailRetentionDays` |
-| `smtp_transaction` | SMTP transactions; `transcript` | `RetentionDays`; transcript `DetailRetentionDays` |
+| `smtp_transaction` | SMTP transactions; `transcript` (compressed, 2.0.0) | `RetentionDays`; transcript `DetailRetentionDays` |
 | `message_event` | Tracking events of real messages | `RetentionDays` |
 | `source_file` | Read position of every log file, by file identity: its path on its own server, case ignored (`\\EXCH01\D$\Logs\x.log` and `D:\Logs\x.log` are the same file, read once) | as long as the file exists |
 | `noise`, `run` | Removed lines per reason and execution | `RetentionDays` |
 
-Raw log lines are **never** stored. A database of an older version is upgraded automatically (new tables and columns only).
+Raw log lines are **never** stored. A database of an older version is upgraded automatically (new tables and columns only). Since 2.0.0, the SMTP transcripts and the session timelines are written compressed (Deflate, about 6 times smaller); those of an older version stay readable as they are.
 
 <!-- icon: database -->
-## 12. Volumes
+## 12. Volumes and performance
 
 Measured on the lab on 2026-10-01 (4 servers, 60 days of logs):
 
@@ -567,6 +693,92 @@ Main noise found: Managed Availability probes (1.5 million lines), back-end traf
 > [!NOTE]
 > In production (1–3 GB of logs per day and server) the database grows with the number of **real users** and **messages**, not with the log volume: about one `access_usage` row per user, protocol, server and day, one `message_event` row per tracking event of a real message. For very large mail volumes, lower `RetentionDays` or run one database per site.
 
+### 12.1 Collection performance (2.0.0)
+
+With 1.6.1, the first collection in a production environment took hours. A customer capture, per server and for 14 days of logs: HttpProxy 4 GB in 15 to 23 minutes, message tracking 1 GB in **45 minutes (409 KB/s)**. Reading was not the problem: the IIS front-end logs, 99 % noise, were read at 74 MB/s. The time was spent in SQLite for each **kept** line, on one thread: an index lookup and a write per row, one transaction per file, the client sessions read again and rewritten for each file, and a 2 MB page cache.
+
+What 2.0.0 changes:
+
+- **Every server and every source at the same time**: parse threads read one file each (`Collection.Parallelism`), and a single write thread uses the database (chapter 2).
+- **One transaction per batch of files** (30 s or 500,000 rows), with their read positions. Prepared statements, a 256 MB page cache, and 16 KB pages for a new database.
+- **Work moved to the parse threads**: lines are split as bytes, field values and noise decisions are cached per thread, and the daily aggregates of a file are computed there. The write thread only merges them.
+- Client sessions stay in memory for the whole batch. Recoveries are resolved once, at the end of the collection.
+- The WAL is copied into the database by a background thread. SMTP transcripts and session timelines are compressed, so there is less to write.
+
+| Measure | 1.6.1 | 2.0.0 |
+|---|---|---|
+| Load test (12.2), 2 servers × 14 days: 14.8 GB, 9,596 files, 33.1 million lines, 7.0 million kept. PC with 8 logical processors and an SSD | **29 min 45 s**, database 2,562 MB | **3 min 51 s to 4 min 21 s** (7 to 8 times faster), database 2,116 MB, peak memory 2.3 GB |
+| Lab, EXCH01 (4 vCPU, 16 GB, Standard HDD): the same logs of EXCH01 and EXCH02 through `\\<server>\E$`, 14.6 GB (14.4) | **4 h 55 min 49 s**, database 2,522 MB | **6 min 02 s** (49 times faster), database 2,212 MB |
+| Lab, EXCH01 only (its logs, 7.4 GB) | HttpProxy **1 h 04 min to 1 h 11 min**, MAPI 14 to 15 min, message tracking **44 to 46 min (259 to 273 KB/s)**: the customer capture, reproduced | read with EXCH02 in the line above |
+| Lab, EXCH02 only, on EXCH02 (local disk, 7.2 GB) | — | **2 min 28 s** with 16 KB pages, 3 min 06 s with 4 KB pages (end-of-run WAL copy: 22 s instead of 58 s) |
+| The volume of a second customer capture: 4 servers × 14 days, 33.3 GB, 19,196 files, 76.2 million lines, 16.3 million kept (12.2, `-Scale 1.15`). PC with 8 logical processors and an SSD | the customer collection took **6 h 36 min** on this volume (31.6 GB, 69.3 million lines, 4 servers) | **13 min 18 s**, database 4.6 GB, peak memory 2.9 GB |
+| Next collection, nothing new (4,799 files) | — | **under 1 s** |
+
+The hourly collection reads one hour of logs: a few seconds per server.
+
+### 12.2 Load test
+
+Two tools in `tools\` measure the collection without an Exchange server:
+
+```powershell
+# Logs with the volumes of the customer capture (about 7 GB per server for 14 days); deterministic content
+.\tools\New-ExlSyntheticLogs.ps1 -Path D:\ElrSim -Server SIM01,SIM02 -Days 14
+
+# A month where EXCH03 is barely used and EXCH04 not at all (decommissioning review, screenshots of chapter 9)
+.\tools\New-ExlSyntheticLogs.ps1 -Path D:\ElrDemo -Server EXCH01,EXCH02,EXCH03,EXCH04 -Days 30 -Scale 0.05 -Users 800 -Profile Decommission
+
+# On every Exchange server of a lab, its own logs only (identical to a full run), then read through E$
+.\tools\New-ExlSyntheticLogs.ps1 -Path E:\ElrSim -Server EXCH01,EXCH02 -Only EXCH01 -Days 14
+
+# First collection (-Fresh), the same console table as -Mode Collect, then duration, rate, database size and statistics
+.\tools\Measure-ExlCollection.ps1 -LogPath D:\ElrSim -WorkPath D:\ElrWork -Fresh -Set 'Collection.BackfillDays=15'
+.\tools\Measure-ExlCollection.ps1 -LogPath '\\{0}\E$\ElrSim' -Server EXCH01,EXCH02 -WorkPath E:\ElrWork -Fresh `
+    -Set 'Collection.BackfillDays=15','Collection.Parallelism=2'
+```
+
+`New-ExlSyntheticLogs.ps1` writes HttpProxy, IIS front end and back end, MAPI back end, SMTP front end and message tracking files, using the exact Exchange formats and the noise of a real server: probes, health mailboxes, server-to-server traffic. `Measure-ExlCollection.ps1` writes a configuration for these servers in `-WorkPath` (database, logs and reports go there too). It runs the collection and the retention as `-Mode Collect` does, and `-Report Usage|Detailed` also measures a report. Run it a second time without `-Fresh` to measure an incremental collection.
+
+### 12.3 Reading the statistics, tuning
+
+Each collection writes a statistics line to the execution log:
+
+```text
+Collection threads: 124.6 s, 4 parse thread(s) busy 71% (354.2 s), apply thread busy 41%: client access 8.5 s,
+back end 2.3 s, rows 15.0 s, sessions 20.5 s, aggregates 3.2 s, commits 1.4 s (5 batches), waiting for files 64.7 s;
+WAL copied into the database in the background 8 time(s), 44.5 s; GC 545 collections, pauses 10.5 s; WAL 1.54 GB
+Retention: deletes 0.0 s, vacuum 0.0 s, statistics 0.2 s, WAL 1.56 GB written into the database in 22.4 s
+```
+
+| Statistic | Meaning |
+|---|---|
+| **Parse threads busy close to 100 %** | The processors are the limit: more processors help, or a higher `Parallelism` if the computer has idle processors. |
+| **Apply thread busy close to 100 %** | The write thread is the limit (one thread by design). More parse threads do not help. |
+| **Commits and WAL copies long** | The disk is the limit. Put `Storage.DatabasePath` on a faster disk (SSD). On the lab's Standard HDD the commit time varied from one run to the next, from 1 s to 75 s for the same logs. |
+| **Waiting for files** | Time the write thread had nothing to do: the reading was slower than the writing. |
+
+- **`Parallelism`.** The default is one thread per processor, from 2 to 16. On the lab's 4 vCPU servers, where the parse threads were the limit, 4 threads read one server in 123 s, 3 threads in 143 s and 2 threads in 142 s. The parse threads run at below-normal priority, and the write thread at normal priority: on an Exchange server, Exchange and the write thread get the processors first. Lower `Parallelism` on a collector that shares its processors with other work.
+- **Many servers.** At most `Parallelism` files are read at once (default: one per processor, at most 16), whatever the number of servers. The folders are listed 2 × `Parallelism` at a time (at most 16). `MaxFilesPerServer` (default 4) spreads the reads over the servers. With 96 servers and 16 threads, each server serves at most a few files at a time, one after the other. The unit of work is the **file**: every folder of every server is read at the same time, and a file is read by one thread from start to end (its lines are in time order, and its read position is saved with its rows).
+- **Antivirus.** An antivirus that scans every log file at its first opening adds a fixed time per file. On the load-test PC, Microsoft Defender added 74 ms per file: 40,847 small files (a month of four servers, 2.8 GB) took 13 minutes, against 0.7 ms per file once scanned. Microsoft recommends excluding the Exchange log folders from the antivirus of the Exchange servers. A collector on another server reads them over SMB: exclude the database folder of the tool, and check the scanning of network files.
+- **Disk space during the first collection.** The WAL file (`…sqlite-wal`) grows to about the size of the database and is emptied at the end, so plan about twice the size of the database. A database created by 1.x keeps its 4 KB pages.
+- **Memory.** A first collection uses the most memory: 2.3 GB at peak for the load test (two servers, 14 days), most of it for the client sessions of the batch being written and the 256 MB page cache. The next collections read only the new lines and need much less.
+### 12.4 Report performance
+
+A report only reads the database, so its time depends on the period, the number of servers and the report type. On the load-test database of 4 servers (4.6 GB), on the same PC:
+
+| Report | Rows | 2.0.0 |
+|---|---|---|
+| Usage, 30 days (`-NoCollect`) | 805,154 `ClientAccess-Daily` rows, 148,061 SMTP clients | **1 min 15 s** (3 min 01 s before the changes below) |
+| Detailed, 7 days (`-NoCollect`) | 1.57 million rows in the HTML file (101 MB) | **3 min 25 s** (5 min 41 s before) |
+
+What 2.0.0 changes:
+
+- **Page cache.** A report opens the database with the same 256 MB page cache as a collection, and sorts in memory. Before, it used the 2 MB SQLite default and sorted in temporary files: with a large database on a hard disk, every message, session and index page was read again from the disk.
+- **Messages per server and per hour.** These are counted in a single pass over a covering index of the tracking events (`ix_msg_flow`), using a 64-bit hash of each message id. Before, two `COUNT(DISTINCT …)` queries sorted every message id of the period, which took 67 s of the 3 minutes above. The SMTP counts use a covering index too (`ix_smtp_flow`).
+- **SMTP transcripts.** They are read only for the transactions that the report shows: none for a Usage report, at most 200 per SMTP client for a Detailed report. Before, every transcript of the period was read and decompressed.
+- **Timing.** The execution log gives the 8 slowest steps of every report (`Report step: …`): query or file, time and rows.
+
+The first opening of a 1.x database by 2.0.0 builds `ix_msg_flow` and `ix_smtp_flow`: about 10 s for 3.4 million tracking events on the load-test PC, a few minutes for a large database on a slow disk.
+
 <!-- icon: wrench -->
 ## 13. Modifying the tool
 
@@ -574,7 +786,9 @@ Main noise found: Managed Availability probes (1.5 million lines), back-end traf
 |---|---|
 | A noise rule (account, client, URL, sender) | `config\…psd1`, section `Noise`. New lines are filtered at the next collection; what is already stored is not changed. |
 | Texts, colours, tabs, columns shown | `templates\Report.template.html` (no rebuild). Columns are described in the report metadata. |
-| Parsing, a new field, a new status | `src\Engine.Collector.cs` (collection), `src\Engine.Sessions.cs` (sessions, back-end logs, POP/IMAP), `src\Engine.Report.cs` and `src\Engine.ReportSessions.cs` (datasets). The engine is recompiled automatically at the next start (hash of the sources). Add a test. |
+| Parsing, a new field, a new status | `src\Engine.Collector.cs` (collection), `src\Engine.Sessions.cs` (sessions, back-end logs, POP/IMAP), `src\Engine.Report.cs` and `src\Engine.ReportSessions.cs` (datasets). The engine is recompiled automatically at the next start (hash of the sources). Add a test. A `Parse…` method runs on a parse thread: it may only fill the records of its `ParseContext` (no database, no session, no shared dictionary); what depends on other files goes to the apply side (`HandleAccess`, `Apply…`, `EmitPopImap`). |
+| Collection pipeline, threads, batches | `src\Engine.Pipeline.cs` (plan, parse threads, apply thread, prepared statements, background WAL copies). Check a change on a load test (chapter 12.2) and with `Parallelism = 1` against the default: the *Parallel collection* test compares both. |
+| E-mail | `src\Engine.Mail.cs` (SMTP client, MIME, summary of the report), `ExchangeLogReport.psm1` region 10 (settings, DPAPI credential file). |
 | Database schema | `src\Engine.Store.cs` (`Schema`, `Migrate`). New tables: `CREATE … IF NOT EXISTS`; a new column of an existing table: `ALTER TABLE` in `Migrate` (done at the next collection) and a new `schema_version`. |
 | Console output | `ExchangeLogReport.psm1`, region 1 (same functions as Purview DLP Report). |
 | Log folders (`-Mode Discover`) | `ExchangeLogReport.psm1`, region 9 (IIS sites, paths file) and `src\Get-ExlExchangeSettings.ps1`, the Exchange part, run in **Windows PowerShell 5.1**: keep its syntax 5.1 (no `??`, `?.`, ternary operator); the tests run its functions in `powershell.exe`. |
@@ -641,6 +855,40 @@ Exchange Server SE Edge Transport server EDGE1 (workgroup, no IIS, subscribed to
 | Edge report with generated traffic (1.6.0) | Verbose protocol logging on the receive connector of EDGE1 and on *EdgeSync - Inbound to Site1*; internet senders simulated from two addresses (partners with and without TLS, newsletter, unknown recipient, relay attempts), outbound messages from the Pickup folder of EXCH01. Report: 6 SMTP clients (3 partners, the open relay attempt with its 2 refusals, the 2 mailbox servers sending outbound mail), 3 SMTP destinations (the 2 mailbox servers through EdgeSync, Exchange Online with 2 failures `501 5.1.4 Recipient address reserved by RFC 2606`), 14 messages: inbound mail *Relayed* to the organization, relay attempts *Rejected (SMTP)*, the NDR to the newsletter (recipient validation off on the Edge: the unknown recipient was accepted, then bounced). It also showed a **routing loop**: messages to the tenant domain `<tenant>.onmicrosoft.com` (an *InternalRelay* accepted domain without send connector) went back and forth between the Edge and the mailbox servers (`RECEIVE > SENDEXTERNAL` repeated, then `DEFER`). |
 | Upgrade 1.5.0 > 1.6.0 on EDGE1 | The files read through `\\EDGE1\C$` before `-Mode Discover` and through `C:\` after are recognised: no file read twice (1.5.1). |
 
+### 14.4 Collection performance and e-mail (2.0.0)
+
+The synthetic logs of the load test (12.2) were written on two mailbox servers of the lab, EXCH01 and EXCH02. Each server has 4 vCPU, 16 GB and a Standard HDD `E:`, and got 14 days of logs (`E:\ElrSim`, 7.2 to 7.4 GB). The collector was EXCH01, as SYSTEM, reading both servers through `\\<server>\E$`. Its database was on `E:`.
+
+Both versions ran on the same collector, with the same logs (9,597 files, 14.6 GB, 33.1 million lines) and the same account. Before each "cold" measure, the Windows file cache of EXCH01 (and of EXCH02 for the collection) was emptied, as after a restart. "Warm" is the same report run again right away. Times are those of the whole command.
+
+| Measure (EXCH01, 4 vCPU, Standard HDD) | 1.6.1 | 2.0.0 | Factor |
+|---|---|---|---|
+| First collection, 14 days of both servers | **4 h 55 min 49 s** | **6 min 02 s** | × 49 |
+| Next collection, nothing new (hourly task) | 7 min 17 s | 2.6 s | × 168 |
+| Usage report, 30 days, cold (`-NoCollect`) | **14 min 57 s** | **2 min 30 s** | × 6 |
+| Usage report, 30 days, warm | 27 s | 18 s | × 1.5 |
+| Detailed report, 7 days, cold (`-NoCollect`) | 15 min 36 s | 6 min 58 s | × 2.2 |
+| Detailed report, 7 days, warm | 52 s | 45 s | × 1.2 |
+| Database | 2,522 MB | 2,212 MB | − 12 % |
+
+1.6.1 reproduced the customer capture: on EXCH01, HttpProxy took 1 h 04 min (1.1 MB/s) and message tracking **43 min 58 s (273 KB/s)**, the 45 minutes of the capture. On EXCH02, they took 1 h 27 min and 54 min. In 2.0.0, every source of both servers is read at the same time. A report is mostly disk reads (cold) or processor (warm): on a hard disk, keep the database on the fastest disk of the collector.
+
+Run on its own, EXCH02 collected its logs in 2 min 03 s to 2 min 23 s (4 or 3 parse threads), plus 23 s to copy the WAL at the end. With 4 KB pages, that copy took 58 s.
+
+E-mail, from EXCH02 to the receive connectors of EXCH01 (Exchange Server SE, self-signed certificate):
+
+| Test | Result |
+|---|---|
+| Anonymous, port 25, no encryption | Sent. |
+| Anonymous, port 25, STARTTLS, `CertificateThumbprint` | Sent, TLS 1.2. |
+| The same without `CertificateThumbprint` | Not sent: the self-signed certificate is not trusted, and the message says so. |
+| Basic, port 587, STARTTLS, a mailbox account saved by `-Mode MailTest -Credential` | Sent, `AUTH LOGIN`. A wrong password gives `535 5.7.3 Authentication unsuccessful`. |
+| Kerberos, port 587, another mailbox account saved | Sent, `AUTH GSSAPI` with SPN `SMTPSVC/<server FQDN>`, including the RFC 4752 security layer. |
+| Kerberos as SYSTEM, port 587 | Refused by Exchange: `535 5.7.3 Unable to proxy authenticated session`, because the computer account has no mailbox. The tool explains why (8.1). |
+| Kerberos as SYSTEM, port 25 | Not offered: the default front-end connector announces `AUTH NTLM` only. |
+| Usage report, 7 days, `-NoCollect -SendMail`, Basic | Sent in 6.9 s, `ExchangeLogs.html` (1.2 MB) attached. |
+| Detailed report, 24 hours, `Mail.Enabled`, Kerberos | Sent in 14.3 s, HTML (3.3 MB) attached. |
+| Detailed report, 7 days, `Attach = 'Zip'`, `MaxAttachmentMB = 1` | Sent in 34 s without attachment: the zip of the report (73.2 MB) is larger than the limit. The console and the message say so, and the message gives the folder of the report. |
 # Annexes
 
 <!-- icon: lifebuoy -->
@@ -666,10 +914,12 @@ Exchange Server SE Edge Transport server EDGE1 (workgroup, no IIS, subscribed to
 | No SMTP transaction | Protocol logging is off on the connectors (`Set-ReceiveConnector -ProtocolLoggingLevel Verbose`), or all sessions were probes (see *Connection without message* in `-Mode Status`). |
 | SMTP clients shows a front-end server as client | Submissions proxied by a front end are shown with their real client only when the mailbox server logs `XPROXY` (Exchange 2016 and later): check that protocol logging is on for the *Client Proxy* receive connector of the mailbox servers. |
 | Messages *In transit* | The next server of the route is not in the configuration, or its tracking logs are not readable yet. |
-| `Another execution is already collecting` | A collection is running (lock `…sqlite.lock`). Use `-NoCollect` for a report, or wait. |
+| `Another execution is already collecting` | A collection is running (lock `…sqlite.lock`): `-Mode Collect` or `-Collect` waited 30 s. Wait for it to finish; a report without `-Collect` never waits (it uses the data already collected). |
+| `No collection in the database yet` | A report never starts the first collection on its own: run `-Mode Collect` once, then schedule it (chapter 7). |
+| Every report says *more than 90 min (Report.MaxDataAgeMinutes)* | The hourly scheduled collection is not running: last result of the task (`Get-ScheduledTaskInfo`), *Log on as a batch job*, lock left by a stopped execution. |
 | `Unable to load the engine` / compilation error after an edit | Fix the C# error shown, or delete `bin\` to force a rebuild. |
 | The report is slow to open | More than ~200,000 rows: lower `MaxHtmlRows` and use the CSV, or narrow the period / users. |
-| Collection slow on remote servers | Administrative shares are slower than local disks: run one collector per site, or schedule hourly so that each run reads one hour only. |
+| Collection slow | The statistics line of the execution log says what limits it (chapter 12.3): processors, write thread or disk. Administrative shares are slower than local disks: run one collector per site, and schedule hourly so that each run reads one hour only. |
 
 <!-- icon: file -->
 ## Annex B — Exchange log fields used

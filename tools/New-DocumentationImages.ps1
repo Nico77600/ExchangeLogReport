@@ -11,6 +11,7 @@
 
         readme-banner     the hero of the guide, with three key figures
         readme-why        the two questions (cards block "Usage" / "Troubleshooting", chapter 1)
+    readme-path       the guided path (path block of the user guide, chapter 1): set up once, then A or B
         readme-how        the collection pipeline (first flow block, chapter 2) and the two reports
         readme-noise      what is removed before storage (cards block of chapter 3) and the lab figures
         readme-sessions   client session and message correlation (flow blocks of chapter 11)
@@ -31,7 +32,7 @@
 
 .NOTES
     Author  : Nicolas Fabert
-    Version : 1.6.1
+    Version : 2.0.0
     Part of : Exchange Log Report (repository tool, not in the package)
 #>
 [CmdletBinding()]
@@ -70,7 +71,11 @@ function Get-ReadmeAssets {
         $lines = @($m.Groups[2].Value -split "`n" | Where-Object { $_.Trim() })
         [pscustomobject]@{ Kind = $m.Groups[1].Value; Lines = $lines; First = $lines[0].Split('|')[1].Trim() }
     }
+    # The guided path, as rendered in the user guide (the builder marks it with <!--path--> ... <!--/path-->).
+    $userHtml = Join-Path $root 'docs\ExchangeLogReport-UserGuide.html'
+    $path = if (Test-Path $userHtml) { [regex]::Match([IO.File]::ReadAllText($userHtml), '(?s)<!--path-->(.*?)<!--/path-->').Groups[1].Value } else { '' }
     [pscustomobject]@{
+        Path    = $path
         Icons   = & ([scriptblock]::Create($assign.Right.Extent.Text))
         Css     = [regex]::Match([IO.File]::ReadAllText($guideHtml), '(?s)<style>(.*?)</style>').Groups[1].Value
         Version = [regex]::Match($md, '(?m)^version:\s*(\S+)').Groups[1].Value
@@ -240,12 +245,17 @@ $banner = "<header class=""hero rb-hero""><div class=""rb-hero-grid""><div>" +
     "<div class=""rb-stats"">" +
     "<div class=""rb-stat""><b>7</b><span><strong>log sources</strong>read incrementally</span></div>" +
     "<div class=""rb-stat""><b>99.9%</b><span><strong>noise removed</strong>before storage (lab)</span></div>" +
-    "<div class=""rb-stat""><b>2</b><span><strong>reports</strong>usage, troubleshooting</span></div>" +
+    "<div class=""rb-stat""><b>&times;49</b><span><strong>faster collection</strong>than 1.6 (lab)</span></div>" +
     "</div></div></header>"
 New-ReadmeGraphic -Name 'banner' -Body $banner
 
 # Why: the two questions of chapter 1.
 New-ReadmeGraphic -Name 'why' -Body (ConvertTo-ReadmeCards (Get-GuideBlock 'cards' 'Usage') 'rb-cards2')
+
+# The guided path of the user guide (chapter 1): set up once, then A or B.
+if (-not $assets.Path) { throw 'Guided path not found in docs\ExchangeLogReport-UserGuide.html: run tools\Build-Documentation.ps1 first.' }
+New-ReadmeGraphic -Name 'path' -Body $assets.Path
+
 
 # How it works: the pipeline of chapter 2 (vertical) and the two reports.
 $reports = @(

@@ -11,8 +11,11 @@
       1. COLLECT  Log files of every configured server -> local SQLite database.
                   Only the new part of each file is read. System mailboxes, health probes,
                   load balancer checks and other noise are removed BEFORE storage and
-                  counted by reason. Schedule it (for example every hour): -Mode Collect.
-      2. REPORT   SQLite database -> CSV + HTML files in a local folder.
+                  counted by reason. Schedule it every hour: -Mode Collect. The first
+                  collection reads the last Collection.BackfillDays days.
+      2. REPORT   SQLite database -> CSV + HTML files in a local folder, in seconds or minutes.
+                  The report reads the new log lines first only when the last collection is
+                  older than Report.MaxDataAgeMinutes (90 min) and does not cover the period.
                   Usage     : is each server really used, by whom, with which protocols,
                               clients, devices and operations (latency per operation).
                   Detailed  : + one row per client session with its timeline across the front-end
@@ -28,7 +31,9 @@
     Run the tool on the Edge itself (SYSTEM or a local administrator).
 
 .PARAMETER Mode
-    Report  (default) Collects what is new, then writes the report.
+    Report  (default) Writes the report from the database. When the last collection is older than
+                      Report.MaxDataAgeMinutes (90 min) and the period ends after it, the lines written since
+                      are read first. No collection yet: the report stops (run -Mode Collect first).
     Collect           Collects what is new (scheduled task). No report.
     Status            Shows what the database contains. Reads no log file.
     Discover          Reads the real log folders of every Exchange server (Exchange cmdlets in Windows
@@ -41,6 +46,10 @@
                       Every collection checks the IIS sites again and follows a moved IIS log folder.
                       On an Edge Transport server: its local Exchange Management Shell (SYSTEM is
                       accepted), SMTP log folders and message tracking only.
+    MailTest          Checks the Mail section of the configuration: connects to the SMTP server, shows the
+                      conversation (TLS, certificate, authentication) and sends a test message. With
+                      -Credential, first saves the account of the SMTP server to Mail.CredentialFile (Basic
+                      authentication, or Kerberos with another account), protected by DPAPI.
 
 .PARAMETER Range
     Period of the report (-Mode Report). Default: Report.DefaultRange.
@@ -84,8 +93,16 @@
 .PARAMETER IncludeSessionDetails
     Overrides Report.IncludeSessionDetails: timeline of each client session in the CSV files.
 
+.PARAMETER Collect
+    Report mode: reads the new log lines first, whatever the age of the data (the first collection reads the last
+    Collection.BackfillDays days).
+
 .PARAMETER NoCollect
-    Report mode: use only the data already in the database.
+    Report mode: uses only the data already in the database, whatever its age.
+
+.PARAMETER SendMail
+    Report mode: sends the report by e-mail (Mail section of the configuration), or with -SendMail:$false does not,
+    whatever Mail.Enabled says.
 
 .PARAMETER ConnectTo
     Discover mode: Exchange server used for remote PowerShell (http://<server>/PowerShell/, Kerberos).
@@ -94,6 +111,7 @@
 
 .PARAMETER Credential
     Discover mode: account for remote PowerShell, when it is not the account running the tool.
+    MailTest mode: account of the SMTP server, saved to Mail.CredentialFile (DPAPI) for the reports sent later.
 
 .EXAMPLE
     .\Invoke-ExchangeLogReport.ps1 -Mode Discover -ConnectTo EXCH01
@@ -101,7 +119,7 @@
 
 .EXAMPLE
     .\Invoke-ExchangeLogReport.ps1 -Mode Collect
-    Scheduled collection.
+    Scheduled collection, every hour. The first one reads the last Collection.BackfillDays days.
 
 .EXAMPLE
     .\Invoke-ExchangeLogReport.ps1 -Range Last30Days
@@ -115,18 +133,27 @@
     .\Invoke-ExchangeLogReport.ps1 -Start '2026-10-01 08:00' -End '2026-10-01 12:00' -ReportType Detailed -NoCollect
     An incident window (custom period, -Range Custom is implied) from the data already collected.
 
+.EXAMPLE
+    .\Invoke-ExchangeLogReport.ps1 -Mode MailTest
+    Checks the Mail section: TLS, authentication and a test message to Mail.To.
+
+.EXAMPLE
+    .\Invoke-ExchangeLogReport.ps1 -Range PreviousMonth -SendMail
+    Usage report of the previous month, sent by e-mail (monthly scheduled task).
+
 .NOTES
     Author  : Nicolas Fabert
-    Version : 1.6.1
+    Version : 2.0.0
     Exit codes : 0 = success, 1 = failure, 2 = finished with warnings (a server, a folder or a file could not
-                 be read, a source is stale, or the IIS log folders changed since -Mode Discover).
+                 be read, a source is stale, the IIS log folders changed since -Mode Discover, or the report
+                 could not be sent by e-mail).
     Documentation : docs\ExchangeLogReport-UserGuide.html (user guide: prerequisites, everyday commands) and
                     docs\ExchangeLogReport-Guide.html (developer guide); sources: docs\*.md
 #>
 [CmdletBinding(DefaultParameterSetName = 'Range')]
 param(
     [Parameter(Position = 0)]
-    [ValidateSet('Report', 'Collect', 'Status', 'Discover')]
+    [ValidateSet('Report', 'Collect', 'Status', 'Discover', 'MailTest')]
     [string]$Mode = 'Report',
 
     # Period of the report: one parameter set per kind of period, so that a period parameter is never ignored.
@@ -154,7 +181,9 @@ param(
 
     [string]$ConfigPath = (Join-Path $PSScriptRoot 'config\ExchangeLogReport.config.psd1'),
     [string]$OutputPath,
+    [switch]$Collect,
     [switch]$NoCollect,
+    [switch]$SendMail,
 
     [string]$ConnectTo,
     [pscredential]$Credential
@@ -194,6 +223,54 @@ try {
         $logPath = Start-ExlLog -Directory $settings.Logging.Path -RetentionDays $settings.Logging.RetentionDays
         $dot = [char]0x00B7
 
+        # ---- test of the e-mail settings (no database, no log file read) ------------------------------
+        if ($Mode -eq 'MailTest') {
+            $m = $settings.Mail
+            $banner = [ordered]@{}
+            $banner['Mode'] = @('Info', 'MailTest')
+            $banner['Server'] = @('Mail', ("{0}:{1} {2} encryption {3} {2} authentication {4}" -f $m.SmtpServer, $m.Port, $dot, $m.Encryption, $m.Authentication))
+            $banner['From'] = @('People', $m.From)
+            $banner['To'] = @('People', (@($m.To) + @($m.Cc | ForEach-Object { "$_ (Cc)" }) -join ', '))
+            $banner['Log'] = @('Log', $logPath)
+            Write-ExlBanner -Title 'Exchange Log Report' -Subtitle "Exchange Server SE $dot test of the e-mail settings" -Details $banner
+            foreach ($n in $ignored) { Write-ExlItem Warn $n }
+            $problems = @(Test-ExlMailReady -Settings $settings)
+            if ($problems.Count) { throw ('The Mail section of the configuration is not complete: ' + ($problems -join ' ')) }
+            Initialize-ExlEngine -Root $PSScriptRoot
+            $total = if ($Credential) { 2 } else { 1 }
+            $step = 0
+            if ($Credential) {
+                $step++
+                Write-ExlStep $step $total 'Saving the account of the SMTP server' -Icon File
+                Save-ExlMailCredential -Settings $settings -Credential $Credential
+                $who = if ($m.CredentialScope -eq 'Computer') { 'any account of this computer' } else { "$([Environment]::UserDomainName)\$([Environment]::UserName) on this computer only" }
+                Write-ExlItem Ok ("{0} {1} {2} {1} password protected by DPAPI, readable by {3}" -f $m.CredentialFile, $dot, $Credential.UserName, $who) -Icon File
+                if ($m.Authentication -eq 'Anonymous') { Write-ExlItem Warn "Mail.Authentication is 'Anonymous': the account is saved but not used." }
+            }
+            $step++
+            Write-ExlStep $step $total "Sending a test message through $($m.SmtpServer):$($m.Port)" -Icon Mail
+            $mail = Send-ExlTestMail -Settings $settings
+            foreach ($l in $mail.Transcript) { Write-ExlDetail $l }
+            foreach ($r in $mail.Refused) { Write-ExlItem Warn "Recipient refused: $r" }
+            $values = [ordered]@{}
+            $values['Server'] = @('Server', ("{0}:{1}" -f $m.SmtpServer, $m.Port))
+            $values['TLS'] = @($(if ($mail.Tls) { 'Ok' } else { 'Warn' }), $(if ($mail.Tls) { $mail.Tls } else { 'none: the message travels in clear' }))
+            if ($mail.Certificate) { $values['Certificate'] = @('File', $mail.Certificate) }
+            if ($mail.AuthenticationUsed) { $values['Account'] = @('People', $mail.AuthenticationUsed) }
+            if ($mail.Sent) {
+                $values['Message'] = @('Ok', ("{0} {1} {2} bytes {1} {3}" -f $mail.MessageId, $dot, (Format-ExlNumber $mail.MessageBytes), $mail.Response))
+                Write-ExlSummary -Title 'Test message sent' -Values $values -Status $(if ($mail.Refused.Count) { 'Warn' } else { 'Ok' })
+                $exitCode = if ($mail.Refused.Count) { 2 } else { 0 }
+            }
+            else {
+                $values['Error'] = @('Fail', $mail.Error)
+                Write-ExlSummary -Title 'Test message not sent' -Values $values -Status Fail
+                $exitCode = 1
+            }
+            $runStatus = 'Completed'
+            break
+        }
+
         # ---- discovery of the log paths (no database, no log file read) ------------------------------
         if ($Mode -eq 'Discover') {
             $banner = [ordered]@{}
@@ -221,21 +298,45 @@ try {
         }
         Initialize-ExlEngine -Root $PSScriptRoot
 
-        $collecting = $Mode -eq 'Collect' -or ($Mode -eq 'Report' -and -not $NoCollect)
-        $totalSteps = switch ($Mode) { 'Status' { 2 } 'Collect' { 4 } default { if ($collecting) { 5 } else { 2 } } }
         $period = if ($Mode -eq 'Report') { Resolve-ExlPeriod -Range $Range -Month $Month -Date $Date -Start $Start -End $End -Zone $zone }
+        # A report reads the database; it reads the new log lines first only when the data is too old for the period
+        # (Report.MaxDataAgeMinutes), or with -Collect. The hourly scheduled collection keeps the data fresh.
+        $collecting = $Mode -eq 'Collect'
+        $data = $null
+        if ($Mode -eq 'Report') {
+            $data = Resolve-ExlReportCollection -Settings $settings -Period $period -Collect:$Collect -NoCollect:$NoCollect
+            $collecting = $data.Collect
+            if ($collecting -and -not $Collect) {
+                # Decided by the age of the data: never wait for, nor fail on, a collection that is running.
+                $lock = Enter-ExlLock -Path ($settings.Storage.DatabasePath + '.lock') -NoWait
+                if (-not $lock) {
+                    $collecting = $false
+                    $owner = try { [IO.File]::ReadAllText($settings.Storage.DatabasePath + '.lock') } catch { 'another execution' }
+                    $data.Text = "$($data.Text -replace ': the new log lines are read first', '') $dot a collection is running ($owner): the report uses the data already collected"
+                }
+            }
+        }
+        # The report is sent by e-mail when Mail.Enabled is $true, or when -SendMail says so (-SendMail:$false never sends).
+        $mailing = $Mode -eq 'Report' -and $(if ($PSBoundParameters.ContainsKey('SendMail')) { [bool]$SendMail } else { $settings.Mail.Enabled })
+        $totalSteps = switch ($Mode) { 'Status' { 2 } 'Collect' { 4 } default { $(if ($collecting) { 5 } else { 2 }) + $(if ($mailing) { 1 } else { 0 }) } }
         $banner = [ordered]@{}
         $banner['Mode'] = @('Info', ($Mode + $(if ($period) { " $dot $ReportType $dot $Range" } else { '' })))
         if ($period) { $banner['Period'] = @('Calendar', "$(Format-ExlRange $period.StartMs $period.EndMs $zone)  ($($settings.Report.TimeZone), end excluded)") }
         $banner['Servers'] = @('Server', ($servers.Name -join ', '))
         if ($User) { $banner['Users'] = @('People', ($User -join ', ')) }
         $banner['Database'] = @('Database', $settings.Storage.DatabasePath)
+        if ($data) { $banner['Data'] = @($(if ($data.NoData) { 'Warn' } elseif ($collecting) { 'Download' } else { 'Clock' }), $data.Text) }
+        if ($mailing) { $banner['Mail'] = @('Mail', ("to {0} through {1}" -f (@($settings.Mail.To) -join ', '), $settings.Mail.SmtpServer)) }
         $banner['Paths'] = @('Folder', $(if ($settings.Discovery) { "found by -Mode Discover on $($settings.Discovery.When.Substring(0, [Math]::Min(16, $settings.Discovery.When.Length)).Replace('T', ' '))" } else { 'default folders (run -Mode Discover to check them)' }))
         $banner['Log'] = @('Log', $logPath)
         Write-ExlBanner -Title 'Exchange Log Report' -Subtitle "Exchange Server SE $dot usage and troubleshooting from the server logs" -Details $banner
         foreach ($n in $ignored) { Write-ExlItem Warn $n }
         if ($settings.Discovery -and $settings.Discovery.Collector -and $settings.Discovery.Collector -ne [Environment]::MachineName.ToUpperInvariant()) {
             Write-ExlItem Warn "The paths file was written on $($settings.Discovery.Collector): run -Mode Discover on this computer."
+        }
+
+        if ($data -and $data.NoData) {
+            throw ("No collection in the database yet: run '.\Invoke-ExchangeLogReport.ps1 -Mode Collect' first (it reads the last {0} days of logs; then schedule it every hour), or add -Collect to this command." -f $settings.Collection.BackfillDays)
         }
 
         # ---- step 1: database ------------------------------------------------------------------------
@@ -251,7 +352,7 @@ try {
             $exitCode = 0; $runStatus = 'Completed'
             break
         }
-        if ($collecting) { $lock = Enter-ExlLock -Path ($settings.Storage.DatabasePath + '.lock') }
+        if ($collecting -and -not $lock) { $lock = Enter-ExlLock -Path ($settings.Storage.DatabasePath + '.lock') }
         $store = Open-ExlStore -Settings $settings -ReadOnly:(-not $collecting)
         if ($collecting) {
             $closed = $store.CloseAbandonedRuns()
@@ -339,8 +440,30 @@ try {
         }
         $c = $report.Counts
         $edgeReport = $c.ContainsKey('smtpdestinations')
+        $periodText = Format-ExlRange $period.StartMs $period.EndMs $zone
+
+        # ---- e-mail -------------------------------------------------------------------------------------
+        $collectionWarnings = $incomplete
+        $mail = $null
+        if ($mailing) {
+            $step++
+            Write-ExlStep $step $totalSteps 'Sending the report by e-mail' -Icon Mail
+            $problems = @(Test-ExlMailReady -Settings $settings)
+            if ($problems.Count) { Write-ExlItem Warn ('The report is not sent: ' + ($problems -join ' ')); $incomplete = $true }
+            else {
+                try { $mail = Send-ExlReportMail -Settings $settings -Report $report -Period $periodText -ReportType $ReportType -Range $Range -Title $report.Title }
+                catch { $mail = [pscustomobject]@{ Sent = $false; Error = $_.Exception.Message; Refused = @(); Tls = $null; AuthenticationUsed = $null } }
+                if ($mail.Sent) {
+                    $attached = if (@($mail.Attached).Count) { (@($mail.Attached) -join ', ') + ' attached' } elseif ($mail.OmittedBytes) { 'report not attached' } else { 'no attachment' }
+                    Write-ExlItem Ok ("Sent to {0} {1} {2} {1} {3} {1} {4}" -f ((@($settings.Mail.To) + @($settings.Mail.Cc)) -join ', '), $dot, $(if ($mail.Tls) { $mail.Tls } else { 'no TLS' }), $mail.AuthenticationUsed, $attached) -Icon Mail
+                    if ($mail.OmittedBytes) { Write-ExlItem Info ("The report ({0}) is larger than Mail.MaxAttachmentMB ({1} MB): not attached, the message gives its folder." -f (Format-ExlBytes $mail.OmittedBytes), $settings.Mail.MaxAttachmentMB) }
+                    foreach ($r in $mail.Refused) { Write-ExlItem Warn "Recipient refused: $r"; $incomplete = $true }
+                }
+                else { Write-ExlItem Warn ("The report was not sent by e-mail: {0} (-Mode MailTest shows the SMTP conversation)." -f $mail.Error); $incomplete = $true }
+            }
+        }
         $values = [ordered]@{}
-        $values['Period'] = @('Calendar', (Format-ExlRange $period.StartMs $period.EndMs $zone))
+        $values['Period'] = @('Calendar', $periodText)
         $values['Servers'] = @('Server', ("{0} in the report{1}" -f (Format-ExlNumber $c['servers']), $(if ($edgeReport) { " $dot Edge Transport (mail flow only)" } else { '' })))
         if ($edgeReport) {
             $values['Clients'] = @('Mail', ("{0} SMTP client(s) {1} {2} SMTP destination(s)" -f (Format-ExlNumber $c['smtpclients']), $dot, (Format-ExlNumber $c['smtpdestinations'])))
@@ -356,8 +479,11 @@ try {
         }
         $values['Folder'] = @('Folder', $report.Folder)
         if ($report.HtmlPath) { $values['Open'] = @('Report', $report.HtmlPath) }
+        if ($mail) { $values['Mail'] = @($(if ($mail.Sent) { 'Mail' } else { 'Warn' }), $(if ($mail.Sent) { 'sent to ' + ((@($settings.Mail.To) + @($settings.Mail.Cc)) -join ', ') } else { 'not sent' })) }
         $values['Duration'] = @('Clock', (Format-ExlDuration $clock.Elapsed.TotalSeconds))
-        Write-ExlSummary -Title $(if ($incomplete) { 'Report ready (collection incomplete)' } else { 'Report ready' }) -Values $values -Status $(if ($incomplete) { 'Warn' } else { 'Ok' })
+        $mailFailed = $mailing -and -not ($mail -and $mail.Sent -and -not @($mail.Refused).Count)
+        $title = if ($collectionWarnings -and $mailFailed) { 'Report ready (collection incomplete, e-mail not sent)' } elseif ($collectionWarnings) { 'Report ready (collection incomplete)' } elseif ($mailFailed) { 'Report ready (e-mail not sent)' } else { 'Report ready' }
+        Write-ExlSummary -Title $title -Values $values -Status $(if ($incomplete) { 'Warn' } else { 'Ok' })
         $exitCode = if ($incomplete) { 2 } else { 0 }
         $runStatus = 'Completed'
     } while ($false)

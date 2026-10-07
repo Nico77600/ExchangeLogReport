@@ -8,19 +8,20 @@
 #
 @{
     RootModule        = 'ExchangeLogReport.psm1'
-    ModuleVersion     = '1.6.1'
+    ModuleVersion     = '2.0.0'
     GUID              = '7b1cdb50-cb32-4c85-8c8d-9d7a7c8eec14'
     Author            = 'Nicolas Fabert'
-    Description       = 'Exchange Log Report: collects the IIS / HTTP Proxy, SMTP protocol and message tracking logs of Exchange Server SE (on-premises) into a local SQLite database, without the noise of system mailboxes and probes, and produces usage and troubleshooting reports (CSV and HTML).'
+    Description       = 'Exchange Log Report: collects the IIS / HTTP Proxy, SMTP protocol and message tracking logs of Exchange Server SE (on-premises) into a local SQLite database, without the noise of system mailboxes and probes, and produces usage and troubleshooting reports (CSV and HTML), sent by e-mail on request.'
     PowerShellVersion = '7.4'
 
     # Functions called by Invoke-ExchangeLogReport.ps1 and by the tests. The other functions stay internal.
     FunctionsToExport = @(
         'Import-ExlConfiguration', 'Initialize-ExlEngine', 'Open-ExlStore', 'Enter-ExlLock', 'Exit-ExlLock'
         'Start-ExlLog', 'Stop-ExlLog', 'Write-ExlLog'
-        'Write-ExlBanner', 'Write-ExlStep', 'Write-ExlItem', 'Write-ExlSummary'
+        'Write-ExlBanner', 'Write-ExlStep', 'Write-ExlItem', 'Write-ExlDetail', 'Write-ExlSummary'
         'Format-ExlNumber', 'Format-ExlDuration', 'Format-ExlBytes', 'Format-ExlRange', 'Format-ExlLocalTime'
-        'Get-ExlTimeZone', 'Resolve-ExlRange', 'Resolve-ExlPeriod', 'Get-ExlIgnoredParameter', 'Get-ExlSources', 'Test-ExlServerAccess', 'Get-ExlPathOrigin', 'Test-ExlIisSites', 'Resolve-ExlServerRole'
+        'Get-ExlTimeZone', 'Resolve-ExlRange', 'Resolve-ExlPeriod', 'Resolve-ExlReportCollection', 'Get-ExlIgnoredParameter', 'Get-ExlSources', 'Test-ExlServerAccess', 'Get-ExlPathOrigin', 'Test-ExlIisSites', 'Resolve-ExlServerRole'
         'Invoke-ExlCollection', 'New-ExlReport', 'Show-ExlStatus', 'Invoke-ExlRetention', 'Invoke-ExlDiscovery'
+        'Test-ExlMailReady', 'Save-ExlMailCredential', 'Send-ExlReportMail', 'Send-ExlTestMail'
     )
 }

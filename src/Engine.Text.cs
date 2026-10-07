@@ -2,7 +2,7 @@
 //  Exchange Log Report - engine, part 1: text helpers
 // -----------------------------------------------------------------------------
 //  Author  : Nicolas Fabert
-//  Version : 1.6.1
+//  Version : 2.0.0
 //  The src\Engine.*.cs files are compiled together by ExchangeLogReport.psm1
 //  the first time they are used (and again whenever one of them changes).
 //
@@ -51,58 +51,101 @@ namespace ExchangeLogReport
     }
 
     /// <summary>
+    /// One line of a log file, as bytes in the read buffer (valid until the next line is read). Only the fields
+    /// that the parsers use are decoded: most lines are noise and are never turned into a string.
+    /// </summary>
+    public sealed class LogLine
+    {
+        static readonly UTF8Encoding Utf8 = new UTF8Encoding(false, false);
+        public byte[] Buffer;
+        public int Start, Length;
+        public long NextOffset;          // byte offset that follows the line: the resume point
+
+        public int First { get { return Length > 0 ? Buffer[Start] : -1; } }
+
+        public string Text() { return Length <= 0 ? string.Empty : Utf8.GetString(Buffer, Start, Length); }
+
+        /// <summary>The line starts with this ASCII text (case ignored).</summary>
+        public bool StartsWith(string ascii)
+        {
+            if (Length < ascii.Length) return false;
+            for (int i = 0; i < ascii.Length; i++)
+            {
+                int a = Buffer[Start + i], b = ascii[i];
+                if (a == b) continue;
+                if ((a | 0x20) != (b | 0x20) || (a | 0x20) < 'a' || (a | 0x20) > 'z') return false;
+            }
+            return true;
+        }
+
+        /// <summary>The line contains this ASCII text (case ignored).</summary>
+        public bool Contains(string ascii)
+        {
+            int first = ascii[0] | 0x20, end = Start + Length - ascii.Length;
+            for (int p = Start; p <= end; p++)
+            {
+                if ((Buffer[p] | 0x20) != first) continue;
+                int i = 1;
+                for (; i < ascii.Length; i++)
+                {
+                    int a = Buffer[p + i], b = ascii[i];
+                    if (a != b && ((a | 0x20) != (b | 0x20) || (a | 0x20) < 'a' || (a | 0x20) > 'z')) break;
+                }
+                if (i == ascii.Length) return true;
+            }
+            return false;
+        }
+    }
+
+    /// <summary>
     /// Reads the complete lines of a log file from a byte offset. The file is opened with full
     /// sharing: Exchange keeps the current log files open for writing. A last line without its
     /// end-of-line is not returned (still being written): it is read again at the next collection.
     /// Each line comes with the byte offset that follows it, which becomes the resume point.
+    /// The same LogLine object is returned for every line (no allocation per line).
     /// </summary>
     public static class LogReader
     {
-        static readonly UTF8Encoding Utf8 = new UTF8Encoding(false, false);
-
-        public static IEnumerable<KeyValuePair<string, long>> ReadLines(string path, long offset)
+        public static IEnumerable<LogLine> Lines(string path, long offset)
         {
-            using (var fs = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete, 1 << 16))
+            using (var fs = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete, 1, FileOptions.SequentialScan))
             {
                 if (offset < 0 || offset > fs.Length) offset = 0;
                 fs.Seek(offset, SeekOrigin.Begin);
-                var buffer = new byte[1 << 20];
-                var pending = new MemoryStream();
-                long position = offset;
+                var line = new LogLine { Buffer = new byte[1 << 20] };
+                byte[] buffer = line.Buffer;
+                int begin = 0, end = 0;          // unread data: buffer[begin..end)
+                long position = offset;          // file offset of buffer[begin]
                 bool first = offset == 0;
-                int read;
-                while ((read = fs.Read(buffer, 0, buffer.Length)) > 0)
+                while (true)
                 {
-                    int start = 0;
-                    if (first)
+                    int nl = end > begin ? Array.IndexOf(buffer, (byte)'\n', begin, end - begin) : -1;
+                    if (nl < 0)
                     {
-                        first = false;
-                        if (read >= 3 && buffer[0] == 0xEF && buffer[1] == 0xBB && buffer[2] == 0xBF) start = 3;
-                    }
-                    for (int i = start; i < read; i++)
-                    {
-                        if (buffer[i] != (byte)'\n') continue;
-                        string text;
-                        if (pending.Length > 0)
+                        // Move the partial line to the start of the buffer (grow it for a very long line), then read more.
+                        int pending = end - begin;
+                        if (pending > 0 && begin > 0) Buffer.BlockCopy(buffer, begin, buffer, 0, pending);
+                        else if (pending == buffer.Length) { Array.Resize(ref buffer, buffer.Length * 2); line.Buffer = buffer; }
+                        begin = 0; end = pending;
+                        int read = fs.Read(buffer, end, buffer.Length - end);
+                        if (read <= 0) yield break;
+                        if (first)
                         {
-                            pending.Write(buffer, start, i - start);
-                            text = Decode(pending.GetBuffer(), 0, (int)pending.Length);
-                            pending.SetLength(0);
+                            first = false;
+                            if (end + read >= 3 && buffer[0] == 0xEF && buffer[1] == 0xBB && buffer[2] == 0xBF) { begin = 3; position += 3; }
                         }
-                        else text = Decode(buffer, start, i - start);
-                        yield return new KeyValuePair<string, long>(text, position + i + 1);
-                        start = i + 1;
+                        end += read;
+                        continue;
                     }
-                    if (start < read) pending.Write(buffer, start, read - start);
-                    position += read;
+                    int length = nl - begin;
+                    if (length > 0 && buffer[nl - 1] == (byte)'\r') length--;
+                    line.Buffer = buffer; line.Start = begin; line.Length = length;
+                    position += nl + 1 - begin;
+                    line.NextOffset = position;
+                    begin = nl + 1;
+                    yield return line;
                 }
             }
-        }
-
-        static string Decode(byte[] bytes, int start, int length)
-        {
-            if (length > 0 && bytes[start + length - 1] == (byte)'\r') length--;
-            return length <= 0 ? string.Empty : Utf8.GetString(bytes, start, length);
         }
     }
 
@@ -143,13 +186,14 @@ namespace ExchangeLogReport
     }
 
     /// <summary>
-    /// Splits one line into fields without allocating a string per field: only the fields read
-    /// with Get are materialised (HttpProxy lines have more than 70 columns, the engine uses ~25).
+    /// Splits one line (bytes) into fields without allocating anything: only the fields read with Get are decoded
+    /// (HttpProxy lines have more than 70 columns, the engine uses ~25), numbers and times are read from the bytes.
     /// Comma lines follow the CSV rules of Exchange (quotes, doubled quotes).
     /// </summary>
     public sealed class FieldSplitter
     {
-        string _line = string.Empty;
+        static readonly UTF8Encoding Utf8 = new UTF8Encoding(false, false);
+        byte[] _line = new byte[0];
         int[] _start = new int[128], _end = new int[128];
         bool[] _doubled = new bool[128];
         public int Count;
@@ -160,18 +204,21 @@ namespace ExchangeLogReport
             Array.Resize(ref _start, n * 2); Array.Resize(ref _end, n * 2); Array.Resize(ref _doubled, n * 2);
         }
 
-        public void Split(string line, char separator)
+        public void Split(LogLine line, char separator)
         {
-            _line = line ?? string.Empty;
+            _line = line.Buffer;
             Count = 0;
-            int n = _line.Length, i = 0;
+            byte sep = (byte)separator;
+            int n = line.Start + line.Length, i = line.Start;
+            var b = _line;
             if (separator != ',')
             {
                 while (true)
                 {
                     Ensure(Count + 1);
                     int s = i;
-                    while (i < n && _line[i] != separator) i++;
+                    int next = i < n ? Array.IndexOf(b, sep, i, n - i) : -1;
+                    i = next < 0 ? n : next;
                     _start[Count] = s; _end[Count] = i; _doubled[Count] = false; Count++;
                     if (i >= n) return;
                     i++;
@@ -180,26 +227,27 @@ namespace ExchangeLogReport
             while (true)
             {
                 Ensure(Count + 1);
-                if (i < n && _line[i] == '"')
+                if (i < n && b[i] == (byte)'"')
                 {
                     int s = i + 1, j = s; bool doubled = false;
                     while (j < n)
                     {
-                        if (_line[j] == '"')
+                        if (b[j] == (byte)'"')
                         {
-                            if (j + 1 < n && _line[j + 1] == '"') { doubled = true; j += 2; continue; }
+                            if (j + 1 < n && b[j + 1] == (byte)'"') { doubled = true; j += 2; continue; }
                             break;
                         }
                         j++;
                     }
                     _start[Count] = s; _end[Count] = Math.Min(j, n); _doubled[Count] = doubled; Count++;
                     i = j + 1;
-                    while (i < n && _line[i] != ',') i++;
+                    while (i < n && b[i] != sep) i++;
                 }
                 else
                 {
                     int s = i;
-                    while (i < n && _line[i] != ',') i++;
+                    int next = i < n ? Array.IndexOf(b, sep, i, n - i) : -1;
+                    i = next < 0 ? n : next;
                     _start[Count] = s; _end[Count] = i; _doubled[Count] = false; Count++;
                 }
                 if (i >= n) return;
@@ -214,9 +262,37 @@ namespace ExchangeLogReport
             if (index < 0 || index >= Count) return null;
             int s = _start[index], e = _end[index];
             if (e <= s) return null;
-            if (e - s == 1 && _line[s] == '-') return null;
-            string v = _line.Substring(s, e - s);
+            if (e - s == 1 && _line[s] == (byte)'-') return null;
+            string v = Utf8.GetString(_line, s, e - s);
             return _doubled[index] ? v.Replace("\"\"", "\"") : v;
+        }
+
+        readonly string[] _cache = new string[16384];
+
+        /// <summary>
+        /// Same as Get, for the fields that repeat (accounts, agents, addresses, URLs): the same string is returned for the
+        /// same bytes (a small cache per thread), so that a value seen a million times is decoded once.
+        /// </summary>
+        public string GetCached(int index)
+        {
+            if (index < 0 || index >= Count) return null;
+            int s = _start[index], e = _end[index], n = e - s;
+            if (n <= 0) return null;
+            if (n == 1 && _line[s] == (byte)'-') return null;
+            if (_doubled[index] || n > 512) return Get(index);
+            uint h = 2166136261;
+            for (int i = s; i < e; i++) h = (h ^ _line[i]) * 16777619;
+            int slot = (int)((h ^ (uint)n) & (uint)(_cache.Length - 1));
+            string c = _cache[slot];
+            if (c != null && c.Length == n)
+            {
+                int i = 0;
+                while (i < n && c[i] == _line[s + i]) i++;
+                if (i == n) return c;
+            }
+            string v = Utf8.GetString(_line, s, n);
+            if (v.Length == n) _cache[slot] = v;   // ASCII only: one byte per character
+            return v;
         }
 
         /// <summary>Field value as written (keeps "-", the SMTP disconnect event); null when absent or empty.</summary>
@@ -224,19 +300,95 @@ namespace ExchangeLogReport
         {
             if (index < 0 || index >= Count) return null;
             int s = _start[index], e = _end[index];
-            return e <= s ? null : _line.Substring(s, e - s);
+            return e <= s ? null : Utf8.GetString(_line, s, e - s);
+        }
+
+        /// <summary>The field is exactly this ASCII text (no string is created).</summary>
+        public bool Is(int index, string ascii)
+        {
+            if (index < 0 || index >= Count) return false;
+            int s = _start[index], e = _end[index];
+            if (e - s != ascii.Length) return false;
+            for (int i = 0; i < ascii.Length; i++) if (_line[s + i] != ascii[i]) return false;
+            return true;
+        }
+
+        /// <summary>Whole number of a field (spaces and a sign allowed), else the fallback.</summary>
+        public long GetLong(int index, long fallback)
+        {
+            if (index < 0 || index >= Count) return fallback;
+            int s = _start[index], e = _end[index];
+            while (s < e && _line[s] == (byte)' ') s++;
+            while (e > s && _line[e - 1] == (byte)' ') e--;
+            if (s >= e) return fallback;
+            bool negative = false;
+            if (_line[s] == (byte)'-' || _line[s] == (byte)'+') { negative = _line[s] == (byte)'-'; s++; if (s >= e) return fallback; }
+            long v = 0;
+            for (int i = s; i < e; i++)
+            {
+                int d = _line[i] - '0';
+                if (d < 0 || d > 9 || v > (long.MaxValue - d) / 10) return fallback;
+                v = v * 10 + d;
+            }
+            return negative ? -v : v;
         }
 
         public int GetInt(int index, int fallback)
         {
-            string v = Get(index); int r;
-            return v != null && int.TryParse(v, NumberStyles.Integer, CultureInfo.InvariantCulture, out r) ? r : fallback;
+            long v = GetLong(index, long.MinValue);
+            return v == long.MinValue || v < int.MinValue || v > int.MaxValue ? fallback : (int)v;
         }
 
-        public long GetLong(int index, long fallback)
+        /// <summary>Time of a field "2026-10-01T08:03:55.018Z" (UTC) in Unix ms.</summary>
+        public bool TryTime(int index, out long ms)
         {
-            string v = Get(index); long r;
-            return v != null && long.TryParse(v, NumberStyles.Integer, CultureInfo.InvariantCulture, out r) ? r : fallback;
+            ms = 0;
+            if (index < 0 || index >= Count) return false;
+            return TimeUtil.TryParseUtc(_line, _start[index], _end[index] - _start[index], out ms);
+        }
+
+        /// <summary>Time of a W3C date field and time field ("2026-10-01", "08:03:42", UTC) in Unix ms.</summary>
+        public bool TryTime(int dateIndex, int timeIndex, out long ms)
+        {
+            ms = 0;
+            if (dateIndex < 0 || dateIndex >= Count || timeIndex < 0 || timeIndex >= Count) return false;
+            int ds = _start[dateIndex], ts = _start[timeIndex];
+            if (_end[dateIndex] - ds != 10 || _end[timeIndex] - ts < 8) return false;
+            return TimeUtil.TryParseUtc(_line, ds, ts, _end[timeIndex] - ts, out ms);
+        }
+    }
+
+    /// <summary>
+    /// Long texts stored compressed (SMTP transcripts, session timelines): a BLOB made of one header byte (1) and the
+    /// UTF-8 text compressed with Deflate, 5 to 10 times smaller than the text. Texts written by an older version stay
+    /// TEXT: readers accept both.
+    /// </summary>
+    public static class Packed
+    {
+        public static byte[] Pack(string text)
+        {
+            if (text == null) return null;
+            var bytes = Encoding.UTF8.GetBytes(text);
+            using (var ms = new MemoryStream(bytes.Length / 3 + 16))
+            {
+                ms.WriteByte(1);
+                using (var z = new System.IO.Compression.DeflateStream(ms, System.IO.Compression.CompressionLevel.Fastest, true)) z.Write(bytes, 0, bytes.Length);
+                return ms.ToArray();
+            }
+        }
+
+        /// <summary>The text of a value read from the database: a packed BLOB is decompressed, anything else is returned as is.</summary>
+        public static object Unpack(object value)
+        {
+            var b = value as byte[];
+            if (b == null || b.Length == 0 || b[0] != 1) return value;
+            using (var input = new MemoryStream(b, 1, b.Length - 1))
+            using (var z = new System.IO.Compression.DeflateStream(input, System.IO.Compression.CompressionMode.Decompress))
+            using (var output = new MemoryStream(b.Length * 4))
+            {
+                z.CopyTo(output);
+                return Encoding.UTF8.GetString(output.GetBuffer(), 0, (int)output.Length);
+            }
         }
     }
 
@@ -271,6 +423,60 @@ namespace ExchangeLogReport
             }
             try { ms = new DateTimeOffset(y, mo, d, h, mi, Math.Min(se, 59), frac, TimeSpan.Zero).ToUnixTimeMilliseconds(); return true; }
             catch (ArgumentOutOfRangeException) { return false; }
+        }
+
+        static int Digits(byte[] s, int start, int count)
+        {
+            int v = 0;
+            for (int i = start; i < start + count; i++)
+            {
+                int c = s[i] - '0';
+                if (c < 0 || c > 9) return -1;
+                v = v * 10 + c;
+            }
+            return v;
+        }
+
+        /// <summary>Unix ms of a UTC date and time (fields already checked); false for an impossible date.</summary>
+        static bool Compose(int y, int mo, int d, int h, int mi, int se, int frac, out long ms)
+        {
+            ms = 0;
+            if (y < 1900 || y > 9999 || mo < 1 || mo > 12 || d < 1 || d > DateTime.DaysInMonth(y, mo) || h < 0 || h > 23 || mi < 0 || mi > 59 || se < 0 || se > 60) return false;
+            // Days since 1970-01-01 (civil calendar, H. Hinnant's algorithm): no DateTime per line.
+            int yy = mo <= 2 ? y - 1 : y;
+            int era = yy / 400, yoe = yy - era * 400, mp = (mo + 9) % 12;
+            int doy = (153 * mp + 2) / 5 + d - 1, doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+            long days = (long)era * 146097 + doe - 719468;
+            ms = ((days * 24 + h) * 60 + mi) * 60000L + Math.Min(se, 59) * 1000L + frac;
+            return true;
+        }
+
+        static int Fraction(byte[] s, int p, int end)
+        {
+            int frac = 0, digits = 0;
+            if (p < end && s[p] == (byte)'.')
+            {
+                p++;
+                while (p < end && s[p] >= (byte)'0' && s[p] <= (byte)'9') { if (digits < 3) { frac = frac * 10 + (s[p] - '0'); digits++; } p++; }
+                while (digits < 3) { frac *= 10; digits++; }
+            }
+            return frac;
+        }
+
+        /// <summary>Same as TryParseUtc(string), on the bytes of a field.</summary>
+        public static bool TryParseUtc(byte[] s, int start, int length, out long ms)
+        {
+            ms = 0;
+            if (length < 19) return false;
+            return Compose(Digits(s, start, 4), Digits(s, start + 5, 2), Digits(s, start + 8, 2), Digits(s, start + 11, 2), Digits(s, start + 14, 2), Digits(s, start + 17, 2),
+                Fraction(s, start + 19, start + length), out ms);
+        }
+
+        /// <summary>W3C date ("2026-10-01") and time ("08:03:42") fields, UTC.</summary>
+        public static bool TryParseUtc(byte[] s, int dateStart, int timeStart, int timeLength, out long ms)
+        {
+            return Compose(Digits(s, dateStart, 4), Digits(s, dateStart + 5, 2), Digits(s, dateStart + 8, 2), Digits(s, timeStart, 2), Digits(s, timeStart + 3, 2), Digits(s, timeStart + 6, 2),
+                Fraction(s, timeStart + 8, timeStart + timeLength), out ms);
         }
 
         /// <summary>Wall-clock time of the zone to Unix ms (gaps of summer time are moved forward one hour).</summary>

@@ -2,7 +2,7 @@
 #  Exchange Log Report - configuration file
 #  --------------------------------------------------------------------------
 #  Author  : Nicolas Fabert
-#  Version : 1.6.1
+#  Version : 2.0.0
 #
 #  This file is read by Invoke-ExchangeLogReport.ps1. It is a PowerShell data
 #  file: text between quotes, $true / $false, numbers, and @( ) for lists.
@@ -99,6 +99,13 @@
         # file older than N hours means that logging stopped or that the logs were moved (0 = no check).
         # SMTP and message tracking are not checked: a server without mail flow writes nothing there.
         StaleSourceHours       = 24
+        # Log files read at the same time, every server and source together (one thread each); one more thread writes
+        # the database. 0 = one per processor (2 to 16). They run at below-normal priority: on an Exchange server,
+        # Exchange keeps the processors it needs.
+        Parallelism            = 0
+        # Files of one server read at the same time (0 = no limit): the threads spread over the servers, and no
+        # server - nor the local disk when the tool runs on an Exchange server - serves all of them.
+        MaxFilesPerServer      = 4
     }
 
     # ---------------------------------------------------------------------
@@ -126,6 +133,10 @@
         IncludeSessionDetails = $true            # timeline of each client session in the CSV files (always behind a click in HTML)
         CsvDelimiter          = ';'              # ';' opens directly in Excel with French regional settings
         MaxHtmlRows           = 200000           # per table in the HTML file; the CSV files are always complete
+        # A report reads the database. It reads the new log lines first only when the last collection is older
+        # than this and the period ends after it (-Collect / -NoCollect decide for one run). With the hourly
+        # scheduled collection, a report never waits for a collection. 0 = never on its own.
+        MaxDataAgeMinutes     = 90
         Title                 = 'Exchange Server usage and troubleshooting'
     }
 
@@ -135,5 +146,43 @@
     Logging = @{
         Path          = '.\logs'
         RetentionDays = 14
+    }
+
+    # ---------------------------------------------------------------------
+    # Sending the report by e-mail (SMTP). Every -Mode Report sends it when Enabled
+    # is $true; -SendMail / -SendMail:$false decide for one execution.
+    # Check the settings first: .\Invoke-ExchangeLogReport.ps1 -Mode MailTest
+    #   Encryption      None      plain SMTP (trusted network only)
+    #                   StartTls  STARTTLS required: never sent in clear (ports 25, 587)
+    #                   Tls       TLS from the first byte (SMTPS, port 465)
+    #   Authentication  Anonymous no account (receive connector open to the collector)
+    #                   Basic     AUTH LOGIN / PLAIN with the account of CredentialFile,
+    #                             over TLS only. Write the file once, with the account
+    #                             that runs the tool: -Mode MailTest -Credential (Get-Credential)
+    #                   Kerberos  AUTH GSSAPI, Kerberos only: the account that runs the tool
+    #                             (the computer account for SYSTEM), or the account of
+    #                             CredentialFile when it exists. SmtpServer must be a name
+    #                             (SPN SMTPSVC/<SmtpServer>, or TargetName behind a load balancer).
+    # The certificate of the server is checked (trusted chain, name = SmtpServer), unless
+    # its thumbprint is set in CertificateThumbprint (self-signed Exchange certificate).
+    # ---------------------------------------------------------------------
+    Mail = @{
+        Enabled               = $false
+        SmtpServer            = ''                 # e.g. 'smtp.contoso.com' (a name, not an address, for TLS and Kerberos)
+        Port                  = 0                  # 0: 25, or 465 with Encryption 'Tls'
+        Encryption            = 'StartTls'         # None | StartTls | Tls
+        Authentication        = 'Anonymous'        # Anonymous | Basic | Kerberos
+        CredentialFile        = '.\config\ExchangeLogReport.mail.credential'
+        CredentialScope       = 'User'             # User: readable by the account that wrote it only | Computer: by any account of this computer
+        TargetName            = ''                 # Kerberos SPN when it is not SMTPSVC/<SmtpServer> (load balancer)
+        CertificateThumbprint = ''                 # pin the certificate of the server instead of checking its chain
+        From                  = ''                 # e.g. 'exchange-log-report@contoso.com'
+        FromName              = 'Exchange Log Report'
+        To                    = @()                # e.g. @('messaging-team@contoso.com')
+        Cc                    = @()
+        Subject               = '{Title} - {Type} report - {Period}'   # also {Range}, {Servers}, {Computer}
+        Attach                = 'Html'             # Html (zipped when too large) | Zip (every file) | None
+        MaxAttachmentMB       = 7                  # larger: not attached, the body gives the folder of the report
+        TimeoutSeconds        = 60
     }
 }

@@ -12,10 +12,14 @@
       - sticky sidebar with the parts and chapters, highlighting the chapter being read,
       - each chapter ("## ...") in its own card, with an icon and a number badge,
       - callouts from GitHub alerts (> [!NOTE], [!TIP], [!IMPORTANT], [!WARNING], [!CAUTION]),
-      - three custom blocks written as fenced code in the Markdown:
+      - "### 1 · Title" headings shown with the number badge of the guided path,
+      - custom blocks written as fenced code in the Markdown:
           ```cards   icon | title | text          (grid of small cards)
           ```steps   title | text                 (numbered timeline)
           ```flow    icon | title | subtitle      (diagram; "arrow | label | text" = connector)
+          ```path    the guided path: a trunk of numbered steps, then two branches
+                     group | icon | title           (header of a group: the first group is the trunk)
+                     group | n | title | text       (a numbered step of that group)
       - code blocks with a language label and a Copy button,
       - images embedded (the HTML file can be sent alone) with a zoom on click,
       - light / dark theme, print layout.
@@ -37,7 +41,7 @@
 
 .NOTES
     Author  : Nicolas Fabert
-    Version : 1.6.1
+    Version : 2.0.0
     PowerShell pitfall: never name a variable $matches — every -match overwrites the automatic
     $Matches, and variable names are case-insensitive.
 #>
@@ -119,7 +123,7 @@ if ($front.Success) {
 $html = (ConvertFrom-Markdown -InputObject $markdown).Html
 
 # ---- Custom blocks -----------------------------------------------------------------------------------
-$html = [regex]::Replace($html, '(?s)<pre><code class="language-(cards|steps|flow)">(.*?)</code></pre>', {
+$html = [regex]::Replace($html, '(?s)<pre><code class="language-(cards|steps|flow|path)">(.*?)</code></pre>', {
         param($m)
         $kind = $m.Groups[1].Value
         $lines = [System.Net.WebUtility]::HtmlDecode($m.Groups[2].Value) -split "`n" | Where-Object { $_.Trim() }
@@ -151,6 +155,33 @@ $html = [regex]::Replace($html, '(?s)<pre><code class="language-(cards|steps|flo
                 }
                 "<div class=""flow"">$($items -join '')</div>"
             }
+            'path' {
+                # Groups in their order of appearance: the first is the trunk (horizontal), the others the branches.
+                $groups = [ordered]@{}
+                foreach ($l in $lines) {
+                    $parts = $l.Split('|').ForEach({ $_.Trim() })
+                    $g = $parts[0]
+                    if (-not $groups.Contains($g)) { $groups[$g] = [pscustomobject]@{ Icon = 'flow'; Title = $g; Steps = [Collections.Generic.List[object]]::new() } }
+                    if ($parts.Count -ge 4 -and $parts[1] -match '^\d+$') { $groups[$g].Steps.Add([pscustomobject]@{ N = $parts[1]; Title = $parts[2]; Text = ($parts[3..($parts.Count - 1)] -join '|') }) }
+                    else { $groups[$g].Icon = $parts[1]; $groups[$g].Title = ($parts[2..($parts.Count - 1)] -join '|') }
+                }
+                $arrow = '<div class="path-arrow"><svg viewBox="0 0 12 40" aria-hidden="true"><path d="M2 6l6 14-6 14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg></div>'
+                $node = { param($s) "<div class=""path-node""><span class=""path-num"">$($s.N)</span><div><div class=""path-title"">$(ConvertTo-Inline $s.Title)</div><div class=""path-sub"">$(ConvertTo-Inline $s.Text)</div></div></div>" }
+                $keys = @($groups.Keys)
+                $trunk = $groups[$keys[0]]
+                $out = "<!--path--><div class=""path""><div class=""path-caption"">$(Get-Icon $trunk.Icon 'icon-sm')<span>$(ConvertTo-Inline $trunk.Title)</span></div><div class=""path-row"">" + (($trunk.Steps | ForEach-Object { & $node $_ }) -join $arrow) + '</div>'
+                if ($keys.Count -gt 1) {
+                    $down = '<div><svg viewBox="0 0 14 26" aria-hidden="true"><path d="M7 1v22M2 18l5 6 5-6" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg></div>'
+                    $out += "<div class=""path-fork"">$($down * ($keys.Count - 1))</div><div class=""path-branches"">"
+                    foreach ($k in $keys[1..($keys.Count - 1)]) {
+                        $grp = $groups[$k]
+                        $steps = ($grp.Steps | ForEach-Object { "<li><span class=""path-num"">$($_.N)</span><div><div class=""path-title"">$(ConvertTo-Inline $_.Title)</div><div class=""path-sub"">$(ConvertTo-Inline $_.Text)</div></div></li>" }) -join ''
+                        $out += "<div class=""path-branch""><div class=""path-head""><span class=""path-letter"">$(& $enc $k)</span><span class=""path-icon"">$(Get-Icon $grp.Icon 'icon-sm')</span><span>$(ConvertTo-Inline $grp.Title)</span></div><ol class=""path-steps"">$steps</ol></div>"
+                    }
+                    $out += '</div>'
+                }
+                $out + '</div><!--/path-->'
+            }
         }
     })
 
@@ -162,6 +193,9 @@ $html = [regex]::Replace($html, '(?s)<pre><code(?: class="language-([\w-]+)")?>(
         $label = if ($languages.ContainsKey($lang)) { $languages[$lang] } else { $lang }
         "<div class=""code""><div class=""code-head""><span>$label</span><button type=""button"" class=""copy"">$(Get-Icon 'copy' 'icon-sm')<span>Copy</span></button></div><pre><code>$($m.Groups[2].Value)</code></pre></div>"
     })
+
+# ---- Numbered steps of the guided path: "### 1 · List the servers" gets the number badge of the path -----------
+$html = [regex]::Replace($html, '<h3 id="([^"]*)">(\d{1,2}) (?:·|&middot;|&#183;) (.*?)</h3>', '<h3 id="$1" class="step-h"><span class="path-num">$2</span><span>$3</span></h3>')
 
 # ---- Tables, images, links, alerts -------------------------------------------------------------------------
 $html = $html.Replace('<table>', '<div class="table-wrap"><table>').Replace('</table>', '</table></div>')
@@ -312,6 +346,8 @@ main { padding: 40px 56px 80px; max-width: 1080px; width: 100%; }
 .section h2 { font-size: 25px; font-weight: 700; letter-spacing: -0.02em; margin: 2px 0 0; line-height: 1.2; }
 .section-body > :first-child { margin-top: 16px; }
 h3 { font-size: 17.5px; font-weight: 650; margin: 36px 0 12px; padding-left: 12px; border-left: 3px solid var(--cp-accent); line-height: 1.3; }
+h3.step-h { display: flex; align-items: center; gap: 12px; padding-left: 0; border-left: 0; margin-top: 32px; }
+h3.step-h .path-num { width: 32px; height: 32px; font-size: 14.5px; }
 p { margin: 12px 0; } ul, ol { padding-left: 22px; } li { margin: 6px 0; } li::marker { color: var(--cp-accent); }
 strong { font-weight: 650; }
 code { font-family: Consolas, "Courier New", Courier, monospace; font-size: 0.88em; background: var(--cp-surface-soft); border: 1px solid var(--cp-border); padding: 1px 6px; border-radius: 6px; }
@@ -367,6 +403,30 @@ td code { white-space: nowrap; }
 .flow-arrow { flex: 0 0 auto; min-width: 70px; display: flex; flex-direction: column; align-items: center; justify-content: center; color: var(--cp-border-strong); padding: 0 2px; }
 .flow-arrow svg { width: 44px; height: 14px; color: var(--cp-accent); }
 .flow-label { font-size: 12px; font-weight: 700; color: var(--cp-accent); } .flow-sub { font-size: 11px; color: var(--cp-text-muted); text-align: center; max-width: 110px; line-height: 1.3; }
+
+/* Path (guided path: trunk, then branches) */
+.path { margin: 20px 0 26px; padding: 20px 22px 22px; border-radius: 16px; background: var(--cp-surface-soft); border: 1px dashed var(--cp-border-strong); }
+.path-caption { display: flex; align-items: center; gap: 8px; margin: 0 0 12px; font-size: 12px; font-weight: 700; letter-spacing: 0.08em; text-transform: uppercase; color: var(--cp-accent); }
+.path-row { display: flex; align-items: stretch; }
+.path-node { flex: 1 1 0; min-width: 0; display: flex; gap: 10px; align-items: flex-start; padding: 12px; border-radius: 12px; background: var(--cp-surface); border: 1px solid var(--cp-border); }
+.path-arrow { flex: 0 0 18px; display: grid; place-items: center; color: var(--cp-accent); }
+.path-arrow svg { width: 10px; height: 34px; }
+.path-num { flex-shrink: 0; width: 28px; height: 28px; border-radius: 50%; display: grid; place-items: center; font-weight: 700; font-size: 13px; line-height: 1; background: var(--cp-accent); color: var(--cp-accent-fg); box-shadow: 0 0 0 3px var(--cp-accent-soft); }
+.path-title { font-weight: 700; font-size: 13.5px; line-height: 1.3; padding-top: 3px; }
+.path-sub { font-size: 12.5px; line-height: 1.4; color: var(--cp-text-muted); margin-top: 3px; }
+.path-sub code { font-size: 0.92em; padding: 0 4px; }
+.path-fork { display: grid; grid-auto-flow: column; grid-auto-columns: 1fr; gap: 16px; color: var(--cp-accent); }
+.path-fork > div { display: grid; place-items: center; height: 34px; }
+.path-fork svg { width: 14px; height: 26px; }
+.path-branches { display: grid; grid-auto-flow: column; grid-auto-columns: 1fr; gap: 16px; }
+.path-branch { border: 1px solid var(--cp-border); border-top: 3px solid var(--cp-accent); border-radius: 14px; background: var(--cp-surface); padding: 14px 16px 6px; }
+.path-head { display: flex; align-items: center; gap: 10px; font-weight: 700; font-size: 15.5px; margin: 0 0 12px; }
+.path-letter { width: 28px; height: 28px; border-radius: 8px; display: grid; place-items: center; font-size: 14px; background: var(--cp-text); color: var(--cp-surface); }
+.path-icon { width: 30px; height: 30px; border-radius: 9px; display: grid; place-items: center; background: var(--cp-accent-soft); color: var(--cp-accent); }
+.path-steps { list-style: none; padding: 0; margin: 0; }
+.path-steps li { position: relative; display: flex; gap: 12px; margin: 0; padding: 0 0 12px; }
+.path-steps li:not(:last-child)::before { content: ""; position: absolute; left: 13px; top: 30px; bottom: 0; width: 2px; background: var(--cp-border); }
+@media (max-width: 900px) { .path-row { flex-direction: column; } .path-arrow { transform: rotate(90deg); height: 18px; } .path-branches, .path-fork { grid-auto-flow: row; } }
 
 /* Figures */
 figure { margin: 18px 0 24px; }

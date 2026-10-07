@@ -2,12 +2,18 @@
 //  Exchange Log Report - engine, part 3: collector (log files -> SQLite)
 // -----------------------------------------------------------------------------
 //  Author  : Nicolas Fabert
-//  Version : 1.6.1
+//  Version : 2.0.0
 //
-//  One call of ProcessFile reads the new part of one log file, keeps the lines of
-//  real users / real messages, counts the others by reason ("noise"), and saves
-//  the new read position in the same transaction: an interrupted collection
-//  restarts exactly where it stopped, without duplicates.
+//  A collection has two stages (Engine.Pipeline.cs runs them):
+//    1. PARSE  (several threads, one file each): reads the new part of a log file,
+//              removes and counts the noise, and turns the lines of real users and
+//              real messages into records. Nothing is shared between files: the
+//              parsers only read the noise rules.
+//    2. APPLY  (one thread, the only one that uses the database): client access
+//              aggregates, client sessions, recoveries, then the rows, in batched
+//              transactions. The read position of a file is saved in the same
+//              transaction as its rows: an interrupted collection restarts exactly
+//              where it stopped, without duplicates.
 //
 //  Kinds of log files
 //    HttpProxy    Logging\HttpProxy\<protocol>\*.log    main source of client access
@@ -56,6 +62,10 @@ namespace ExchangeLogReport
         public string[] LongRunningPatterns = new string[0]; // "Protocol|Action|Url" of long-polling requests (never slow)
         public int SessionDetailRequests = 40;    // first requests of a session always kept in its timeline
         public int MaxSegmentSteps = 80;          // timeline steps written per session and log file
+        public int Parallelism;                   // files read at the same time (0: one per processor, 2 to 16)
+        public int MaxFilesPerServer = 4;         // files of one server read at the same time (0: no limit)
+        public double BatchSeconds = 30;          // a transaction is committed at least this often...
+        public int BatchRows = 500000;            // ...or after this many rows
     }
 
     /// <summary>Outcome of one file.</summary>
@@ -76,8 +86,6 @@ namespace ExchangeLogReport
         readonly Regex _systemUsers, _probeAgents, _probeUrls, _probeSenders, _longRunning;
         readonly HashSet<string> _ignoredEvents, _watched;
         readonly DayCache _days;
-        readonly Dictionary<string, List<long[]>> _pending = new Dictionary<string, List<long[]>>(StringComparer.Ordinal);
-        readonly List<long[]> _recovered = new List<long[]>();
 
         static readonly Regex QueuedRx = new Regex(@"<([^>\s]+)>[^\[]*\[InternalId=(\d+)", RegexOptions.Compiled);
         static readonly Regex AcceptedIdRx = new Regex(@"^2\d\d\s+[\d.]+\s+\S*\s*<([^>\s]+@[^>\s]+)>", RegexOptions.Compiled);
@@ -85,7 +93,7 @@ namespace ExchangeLogReport
         static readonly Regex TlsRx = new Regex(@"SP_PROT_(TLS|SSL)(\d)_(\d)", RegexOptions.Compiled);
         static readonly Regex CafeRx = new Regex(@"cafeReqId=([0-9a-fA-F-]{36})", RegexOptions.Compiled);
 
-        public long RecoveredCount { get { return _recovered.Count; } }
+        public long RecoveredCount { get; private set; }
 
         public Collector(Store store, CollectorOptions options)
         {
@@ -101,6 +109,7 @@ namespace ExchangeLogReport
             _days = new DayCache(options.Zone);
             LoadPendingFailures();
             LoadAccounts();
+            LoadStoredDays();
         }
 
         static Regex Build(string[] patterns)
@@ -110,7 +119,7 @@ namespace ExchangeLogReport
             return new Regex(string.Join("|", list.Select(p => "(?:" + p + ")")), RegexOptions.IgnoreCase | RegexOptions.CultureInvariant | RegexOptions.Compiled);
         }
 
-        // ================================================================ noise rules
+        // ================================================================ noise rules (read only: used by the parse threads)
 
         bool IsSystemIdentity(string identity)
         {
@@ -143,6 +152,62 @@ namespace ExchangeLogReport
             return null;
         }
 
+        /// <summary>
+        /// Per parse thread: the values and verdicts already computed. Logs repeat the same accounts, agents, URLs and
+        /// addresses millions of times (probes above all): each is normalised and tested against the noise rules once.
+        /// </summary>
+        sealed class Memo
+        {
+            public readonly FieldSplitter Split = new FieldSplitter();
+            public DayCache Days;
+            public readonly Dictionary<string, string> Users = new Dictionary<string, string>(StringComparer.Ordinal);
+            public readonly Dictionary<string, string> Mailboxes = new Dictionary<string, string>(StringComparer.Ordinal);
+            public readonly Dictionary<string, string> PlusAgents = new Dictionary<string, string>(StringComparer.Ordinal);
+            public readonly Dictionary<string, bool> ProbeAgents = new Dictionary<string, bool>(StringComparer.Ordinal);
+            public readonly Dictionary<string, bool> SystemIdentities = new Dictionary<string, bool>(StringComparer.Ordinal);
+            public readonly Dictionary<string, bool> ProbeUrls = new Dictionary<string, bool>(StringComparer.Ordinal);
+            public readonly Dictionary<string, bool> ExcludedIps = new Dictionary<string, bool>(StringComparer.Ordinal);
+            public readonly Dictionary<string, bool> SystemAddresses = new Dictionary<string, bool>(StringComparer.Ordinal);
+
+            /// <summary>Bounded memory: the dictionaries are emptied when one grows too large.</summary>
+            public void Trim()
+            {
+                const int max = 100000;
+                if (Users.Count > max || Mailboxes.Count > max || PlusAgents.Count > max || ProbeAgents.Count > max || SystemIdentities.Count > max || ProbeUrls.Count > max || ExcludedIps.Count > max || SystemAddresses.Count > max)
+                {
+                    Users.Clear(); Mailboxes.Clear(); PlusAgents.Clear(); ProbeAgents.Clear(); SystemIdentities.Clear(); ProbeUrls.Clear(); ExcludedIps.Clear(); SystemAddresses.Clear();
+                }
+            }
+        }
+
+        static TValue Remember<TValue>(Dictionary<string, TValue> d, string key, Func<string, TValue> compute)
+        {
+            TValue v;
+            if (d.TryGetValue(key, out v)) return v;
+            v = compute(key);
+            d[key] = v;
+            return v;
+        }
+
+        string UserOf(Memo m, string raw) { return raw == null ? null : Remember(m.Users, raw, Identity.User); }
+        string MailboxOf(Memo m, string raw) { return raw == null ? null : Remember(m.Mailboxes, raw, Identity.Mailbox); }
+        static string PlusAgent(Memo m, string raw) { return raw == null ? null : Remember(m.PlusAgents, raw, x => x.Replace('+', ' ')); }
+
+        /// <summary>ClientNoise with the verdicts of this thread already known.</summary>
+        string ClientNoise(Memo m, string user, string mailbox, string agent, string ip, string url, int status)
+        {
+            if (_probeAgents != null && !string.IsNullOrEmpty(agent) && Remember(m.ProbeAgents, agent, x => _probeAgents.IsMatch(x))) return "Monitoring probe (user agent)";
+            if (_systemUsers != null)
+            {
+                if (!string.IsNullOrEmpty(user) && Remember(m.SystemIdentities, user, IsSystemIdentity)) return "System or health mailbox";
+                if (user == null && !string.IsNullOrEmpty(mailbox) && Remember(m.SystemIdentities, mailbox, IsSystemIdentity)) return "System or health mailbox";
+            }
+            if (_probeUrls != null && !string.IsNullOrEmpty(url) && Remember(m.ProbeUrls, url, x => _probeUrls.IsMatch(x))) return "Health check URL";
+            if (!string.IsNullOrEmpty(ip) && _o.ExcludedClientIps != null && _o.ExcludedClientIps.Length > 0 && Remember(m.ExcludedIps, ip, ExcludedIp)) return "Excluded client address";
+            if (user == null) return status == 401 ? "Authentication challenge (anonymous 401)" : "Anonymous request";
+            return null;
+        }
+
         static string Outcome(int status)
         {
             if (status >= 100 && status < 400) return "Success";
@@ -157,29 +222,56 @@ namespace ExchangeLogReport
             return (user != null && (_watched.Contains(user) || _watched.Contains(Identity.Bare(user)))) || (mailbox != null && _watched.Contains(mailbox));
         }
 
-        // ================================================================ file processing
+        // ================================================================ records
 
-        sealed class FileContext
+        /// <summary>One file being parsed by one thread: its new lines become records, nothing else is touched.</summary>
+        sealed class ParseContext
         {
-            public FileState State;
+            public FileWork Work;
             public FileResult Result;
-            public SqliteTransaction Tx;
-            public string Server, Role, Path;
-            public long LastWriteMs, FileId;
+            public string Server, Role, Path, Fields;
+            public long StartOffset, LastWriteMs;
             public FieldMap Map = new FieldMap();
-            public FieldSplitter Split = new FieldSplitter();
-            public Dictionary<string, UsageAcc> Usage = new Dictionary<string, UsageAcc>(StringComparer.Ordinal);
-            public Dictionary<string, ActionAcc> Actions = new Dictionary<string, ActionAcc>(StringComparer.Ordinal);
-            public Dictionary<string, ClientAcc> Clients = new Dictionary<string, ClientAcc>(StringComparer.Ordinal);
-            public HashSet<ClientSession> Touched = new HashSet<ClientSession>();
-            public SqliteCommand InsertEvent, InsertIis, InsertSmtp, InsertMessage;
+            public FieldSplitter Split;
+            public Memo Memo;
+            public DayCache Days;
+            public readonly List<AccessRecord> Access = new List<AccessRecord>();
+            public readonly List<object[]> IisStatus = new List<object[]>();
+            public readonly List<BackEndLine> BackEnd = new List<BackEndLine>();
+            public readonly List<object[]> Smtp = new List<object[]>();
+            public readonly List<object[]> Messages = new List<object[]>();
+            public readonly List<PiConnection> PopImap = new List<PiConnection>();
+            public bool PopImapBackEnd;
+            // Aggregates of the file, by the account as logged (the apply thread makes it canonical when it merges them).
+            public readonly Dictionary<string, UsageAcc> Usage = new Dictionary<string, UsageAcc>(StringComparer.Ordinal);
+            public readonly Dictionary<string, ActionAcc> Actions = new Dictionary<string, ActionAcc>(StringComparer.Ordinal);
+            public readonly Dictionary<string, ClientAcc> Clients = new Dictionary<string, ClientAcc>(StringComparer.Ordinal);
+            public readonly Dictionary<string, List<long>> Successes = new Dictionary<string, List<long>>(StringComparer.Ordinal);
+        }
+
+        /// <summary>One file being applied (apply thread).</summary>
+        sealed class ApplyFile
+        {
+            public string Server, Role, Kind, Path;
+            public long FileId;
+            public FileResult Result;
         }
 
         sealed class UsageAcc
         {
             public string Day, Server, User, Protocol, Mailbox, ClientIp, UserAgent;
             public long Requests, Successes, ClientErrors, ServerErrors, BytesIn, BytesOut, TotalMs, MaxMs, LastSuccessMs, LastFailureMs, Slow;
-            public long FirstMs = long.MaxValue, LastMs;
+            public long FirstMs = long.MaxValue, LastMs, ClientMs;
+
+            public void Merge(UsageAcc o)
+            {
+                Requests += o.Requests; Successes += o.Successes; ClientErrors += o.ClientErrors; ServerErrors += o.ServerErrors; Slow += o.Slow;
+                BytesIn += o.BytesIn; BytesOut += o.BytesOut; TotalMs += o.TotalMs; MaxMs = Math.Max(MaxMs, o.MaxMs);
+                LastSuccessMs = Math.Max(LastSuccessMs, o.LastSuccessMs); LastFailureMs = Math.Max(LastFailureMs, o.LastFailureMs);
+                FirstMs = Math.Min(FirstMs, o.FirstMs); LastMs = Math.Max(LastMs, o.LastMs);
+                if (o.ClientMs > 0 && o.ClientMs >= ClientMs) { ClientMs = o.ClientMs; ClientIp = o.ClientIp; UserAgent = o.UserAgent; }
+                if (o.Mailbox != null) Mailbox = o.Mailbox;
+            }
         }
 
         sealed class AccessRecord
@@ -192,9 +284,12 @@ namespace ExchangeLogReport
             public string Needle, Needle2;    // text that finds the raw line in its log file (default: RequestId)
             public bool FromBackEnd;          // back-end log line (IMAP/POP back end): no client address of its own
             public ClientSession Session;     // session already resolved by the caller
+            // Computed once (by the parse thread for HttpProxy and IIS, Prepared; by the apply thread otherwise).
+            public bool Prepared, Failure, Slow;
+            public string Outcome, Day, Agent, Why, Back, KeyRest;
         }
 
-        static void Noise(FileContext c, string reason, long lines)
+        static void Noise(ParseContext c, string reason, long lines)
         {
             long n;
             c.Result.NoiseReasons.TryGetValue(reason, out n);
@@ -202,84 +297,35 @@ namespace ExchangeLogReport
             c.Result.Noise += lines;
         }
 
-        static void Seen(FileContext c, long t)
+        static void Seen(ParseContext c, long t)
         {
             if (c.Result.FirstMs == 0 || t < c.Result.FirstMs) c.Result.FirstMs = t;
             if (t > c.Result.LastMs) c.Result.LastMs = t;
         }
 
-        /// <summary>Reads the new part of one file. Kind: HttpProxy, Iis, SmtpReceive, SmtpSend, Tracking, MapiBackEnd, EasBackEnd, Imap4 or Pop3.</summary>
-        public FileResult ProcessFile(string server, string kind, string role, string path)
+        /// <summary>Parse stage of one file (any thread). Returns the new read position.</summary>
+        long Parse(ParseContext c, string kind)
         {
-            var result = new FileResult { Server = server, Kind = kind, Path = path };
-            var clock = Stopwatch.StartNew();
-            int deferredMark = _deferred.Count;
-            try
+            switch (kind)
             {
-                var info = new FileInfo(path);
-                if (!info.Exists) { result.Error = "File not found"; return result; }
-                var state = _store.GetFile(server, kind, path) ?? new FileState { Server = server, Kind = kind, Path = path };
-                long length = info.Length;
-                if (length < state.Offset) { state.Offset = 0; state.Fields = null; result.Reset = true; }
-                if (length == state.Offset) { result.Unchanged = true; return result; }
-                long startOffset = state.Offset, newOffset;
-                using (var tx = _store.Begin())
-                {
-                    _tx = tx;
-                    var c = new FileContext
-                    {
-                        State = state, Result = result, Tx = tx, Server = server, Role = role, Path = path,
-                        LastWriteMs = new DateTimeOffset(info.LastWriteTimeUtc).ToUnixTimeMilliseconds()
-                    };
-                    c.FileId = _store.FileId(state, tx);
-                    switch (kind)
-                    {
-                        case "HttpProxy": newOffset = ParseHttpProxy(c); break;
-                        case "Iis": newOffset = ParseIis(c); break;
-                        case "SmtpReceive": newOffset = ParseSmtp(c, "Receive"); break;
-                        case "SmtpSend": newOffset = ParseSmtp(c, "Send"); break;
-                        case "Tracking": newOffset = ParseTracking(c); break;
-                        case "MapiBackEnd": newOffset = ParseMapiBackEnd(c); break;
-                        case "EasBackEnd": newOffset = ParseEasBackEnd(c); break;
-                        case "Imap4": newOffset = ParsePopImap(c, "Imap4"); break;
-                        case "Pop3": newOffset = ParsePopImap(c, "Pop3"); break;
-                        default: throw new ArgumentException("Unknown log kind: " + kind);
-                    }
-                    FlushUsage(c);
-                    FlushActions(c);
-                    FlushClients(c);
-                    FlushSessions(c);
-                    foreach (var cmd in new[] { c.InsertEvent, c.InsertIis, c.InsertSmtp, c.InsertMessage }) if (cmd != null) cmd.Dispose();
-                    state.Offset = newOffset;
-                    state.Size = length;
-                    state.LastWriteMs = c.LastWriteMs;
-                    state.Lines += result.Lines; state.Kept += result.Kept; state.Noise += result.Noise;
-                    if (result.FirstMs > 0 && (state.FirstMs == 0 || result.FirstMs < state.FirstMs)) state.FirstMs = result.FirstMs;
-                    if (result.LastMs > state.LastMs) state.LastMs = result.LastMs;
-                    _store.SaveFile(state, tx);
-                    _store.AddNoise(_o.RunId, server, kind, result.NoiseReasons, tx);
-                    tx.Commit();
-                    _tx = null;
-                }
-                result.BytesRead = newOffset - startOffset;
+                case "HttpProxy": return ParseHttpProxy(c);
+                case "Iis": return ParseIis(c);
+                case "SmtpReceive": return ParseSmtp(c, "Receive");
+                case "SmtpSend": return ParseSmtp(c, "Send");
+                case "Tracking": return ParseTracking(c);
+                case "MapiBackEnd": return ParseMapiBackEnd(c);
+                case "EasBackEnd": return ParseEasBackEnd(c);
+                case "Imap4": return ParsePopImap(c, "Imap4");
+                case "Pop3": return ParsePopImap(c, "Pop3");
+                default: throw new ArgumentException("Unknown log kind: " + kind);
             }
-            catch (Exception ex)
-            {
-                _tx = null;
-                result.Error = ex.GetType().Name + ": " + ex.Message;
-                // The transaction was rolled back: sessions in memory may hold lines that are not saved.
-                ResetSessions();
-                if (_deferred.Count > deferredMark) _deferred.RemoveRange(deferredMark, _deferred.Count - deferredMark);
-            }
-            result.Seconds = clock.Elapsed.TotalSeconds;
-            return result;
         }
 
         // ================================================================ HttpProxy
 
-        long ParseHttpProxy(FileContext c)
+        long ParseHttpProxy(ParseContext c)
         {
-            long offset = c.State.Offset;
+            long offset = c.StartOffset;
             int iTime = -1, iReq = -1, iProto = -1, iStem = -1, iAction = -1, iAuthType = -1, iUser = -1, iAnchor = -1, iAgent = -1, iIp = -1,
                 iStatus = -1, iBack = -1, iError = -1, iMethod = -1, iTarget = -1, iRouting = -1, iReqBytes = -1, iRespBytes = -1, iTotal = -1, iErrors = -1,
                 iClientReq = -1, iQuery = -1;
@@ -293,33 +339,33 @@ namespace ExchangeLogReport
                 iRouting = m.Index("RoutingType"); iReqBytes = m.Index("RequestBytes"); iRespBytes = m.Index("ResponseBytes");
                 iTotal = m.Index("TotalRequestTime"); iErrors = m.Index("GenericErrors"); iClientReq = m.Index("ClientRequestId"); iQuery = m.Index("UrlQuery");
             };
-            if (c.Map.Load(c.State.Fields)) bind();
+            if (c.Map.Load(c.Fields)) bind();
             string folder = Path.GetFileName(Path.GetDirectoryName(c.Path));
-            foreach (var kv in LogReader.ReadLines(c.Path, offset))
+            foreach (var line in LogReader.Lines(c.Path, offset))
             {
-                string line = kv.Key;
-                offset = kv.Value;
+                offset = line.NextOffset;
                 c.Result.Lines++;
                 if (line.Length == 0) { Noise(c, "Empty line", 1); continue; }
-                if (line[0] == '#')
+                if (line.First == '#')
                 {
-                    if (line.StartsWith("#Fields:", StringComparison.OrdinalIgnoreCase)) { c.Map.Load(line); c.State.Fields = line; bind(); }
+                    if (line.StartsWith("#Fields:")) { string text = line.Text(); c.Map.Load(text); c.Fields = text; bind(); }
                     Noise(c, "Header", 1);
                     continue;
                 }
-                if (line.StartsWith("DateTime,", StringComparison.Ordinal)) { Noise(c, "Header", 1); continue; }
+                if (line.StartsWith("DateTime,")) { Noise(c, "Header", 1); continue; }
                 if (iTime < 0) { Noise(c, "No #Fields header", 1); continue; }
                 c.Split.Split(line, ',');
                 long t;
-                if (!TimeUtil.TryParseUtc(c.Split.Get(iTime), out t)) { Noise(c, "Unreadable line", 1); continue; }
+                if (!c.Split.TryTime(iTime, out t)) { Noise(c, "Unreadable line", 1); continue; }
                 Seen(c, t);
                 if (t < _o.RetentionCutoffMs) { Noise(c, "Older than retention", 1); continue; }
                 int status = c.Split.GetInt(iStatus, 0);
-                string user = Identity.User(c.Split.Get(iUser));
-                string mailbox = Identity.Mailbox(c.Split.Get(iAnchor));
-                string agent = c.Split.Get(iAgent), ip = c.Split.Get(iIp), url = c.Split.Get(iStem);
+                var memo = c.Memo;
+                string user = UserOf(memo, c.Split.GetCached(iUser));
+                string mailbox = MailboxOf(memo, c.Split.GetCached(iAnchor));
+                string agent = c.Split.GetCached(iAgent), ip = c.Split.GetCached(iIp), url = c.Split.GetCached(iStem);
                 if (status == 0 && user == null && url == null) { Noise(c, "Unreadable line", 1); continue; }
-                string why = ClientNoise(user, mailbox, agent, ip, url, status);
+                string why = ClientNoise(memo, user, mailbox, agent, ip, url, status);
                 if (why != null) { Noise(c, why, 1); continue; }
                 c.Result.Kept++;
                 string anchor = c.Split.Get(iAnchor), query = c.Split.Get(iQuery), clientReq = c.Split.Get(iClientReq);
@@ -335,16 +381,17 @@ namespace ExchangeLogReport
                 Enrich(r, query, clientReq, anchor);
                 int back = c.Split.GetInt(iBack, 0);
                 if (back > 0) r.BackEndStatus = back;
-                HandleAccess(c, r);
+                Prepare(c, r);
+                c.Access.Add(r);
             }
             return offset;
         }
 
         // ================================================================ IIS (front end)
 
-        long ParseIis(FileContext c)
+        long ParseIis(ParseContext c)
         {
-            long offset = c.State.Offset;
+            long offset = c.StartOffset;
             int iDate = -1, iTime = -1, iMethod = -1, iStem = -1, iQuery = -1, iUser = -1, iIp = -1, iAgent = -1, iStatus = -1, iSub = -1, iWin = -1, iOut = -1, iIn = -1, iTaken = -1;
             Action bind = () =>
             {
@@ -354,32 +401,32 @@ namespace ExchangeLogReport
                 iStatus = m.Index("sc-status"); iSub = m.Index("sc-substatus"); iWin = m.Index("sc-win32-status");
                 iOut = m.Index("sc-bytes"); iIn = m.Index("cs-bytes"); iTaken = m.Index("time-taken");
             };
-            if (c.Map.Load(c.State.Fields)) bind();
-            foreach (var kv in LogReader.ReadLines(c.Path, offset))
+            if (c.Map.Load(c.Fields)) bind();
+            foreach (var line in LogReader.Lines(c.Path, offset))
             {
-                string line = kv.Key;
-                offset = kv.Value;
+                offset = line.NextOffset;
                 c.Result.Lines++;
                 if (line.Length == 0) { Noise(c, "Empty line", 1); continue; }
-                if (line[0] == '#')
+                if (line.First == '#')
                 {
-                    if (line.StartsWith("#Fields:", StringComparison.OrdinalIgnoreCase)) { c.Map.Load(line); c.State.Fields = line; bind(); }
+                    if (line.StartsWith("#Fields:")) { string text = line.Text(); c.Map.Load(text); c.Fields = text; bind(); }
                     Noise(c, "Header", 1);
                     continue;
                 }
                 if (iDate < 0 || iTime < 0) { Noise(c, "No #Fields header", 1); continue; }
                 c.Split.Split(line, ' ');
                 long t;
-                if (!TimeUtil.TryParseUtc(c.Split.Get(iDate) + " " + c.Split.Get(iTime), out t)) { Noise(c, "Unreadable line", 1); continue; }
+                if (!c.Split.TryTime(iDate, iTime, out t)) { Noise(c, "Unreadable line", 1); continue; }
                 Seen(c, t);
                 if (t < _o.RetentionCutoffMs) { Noise(c, "Older than retention", 1); continue; }
                 int status = c.Split.GetInt(iStatus, 0);
-                string user = Identity.User(c.Split.Get(iUser));
-                string agent = c.Split.Get(iAgent);
-                if (agent != null) agent = agent.Replace('+', ' ');
-                string ip = c.Split.Get(iIp), url = c.Split.Get(iStem), query = c.Split.Get(iQuery);
-                string why = ClientNoise(user, null, agent, ip, url, status);
+                var memo = c.Memo;
+                string user = UserOf(memo, c.Split.GetCached(iUser));
+                string agent = PlusAgent(memo, c.Split.GetCached(iAgent));
+                string ip = c.Split.GetCached(iIp), url = c.Split.GetCached(iStem);
+                string why = ClientNoise(memo, user, null, agent, ip, url, status);
                 if (why != null) { Noise(c, why, 1); continue; }
+                string query = c.Split.Get(iQuery);
                 var cafe = query == null ? null : CafeRx.Match(query);
                 if (cafe != null && cafe.Success)
                 {
@@ -389,16 +436,8 @@ namespace ExchangeLogReport
                     bool denied = status == 401 && user != null && (c.Split.GetInt(iSub, 0) > 0 || c.Split.GetLong(iWin, 0) != 0);
                     if (status >= 400 && t >= _o.DetailCutoffMs)
                     {
-                        if (c.InsertIis == null)
-                        {
-                            c.InsertIis = _store.Command("INSERT OR REPLACE INTO iis_status(server,request_id,time_ms,status,sub_status,win32,time_taken) VALUES(@s,@r,@t,@st,@sub,@w,@tt);", c.Tx);
-                            foreach (var p in new[] { "@s", "@r", "@t", "@st", "@sub", "@w", "@tt" }) c.InsertIis.Parameters.Add(p, SqliteType.Text);
-                        }
-                        var ps = c.InsertIis.Parameters;
-                        ps["@s"].Value = c.Server; ps["@r"].Value = cafe.Groups[1].Value; ps["@t"].Value = t; ps["@st"].Value = status;
-                        ps["@sub"].Value = c.Split.GetInt(iSub, 0); ps["@w"].Value = c.Split.GetLong(iWin, 0); ps["@tt"].Value = c.Split.GetLong(iTaken, 0);
-                        c.InsertIis.ExecuteNonQuery();
-                        c.Result.Kept++; c.Result.Stored++;
+                        c.IisStatus.Add(new object[] { c.Server, cafe.Groups[1].Value, t, (long)status, (long)c.Split.GetInt(iSub, 0), c.Split.GetLong(iWin, 0), c.Split.GetLong(iTaken, 0) });
+                        c.Result.Kept++;
                     }
                     else if (denied) c.Result.Kept++;
                     else Noise(c, "Already in HttpProxy log", 1);
@@ -414,7 +453,8 @@ namespace ExchangeLogReport
                             DurationMs = c.Split.GetLong(iTaken, 0), RequestId = cafe.Groups[1].Value, ErrorCode = LogonError((int)c.Split.GetLong(iWin, 0))
                         };
                         Enrich(rejected, query, null, null);
-                        HandleAccess(c, rejected);
+                        Prepare(c, rejected);
+                        c.Access.Add(rejected);
                     }
                     continue;
                 }
@@ -431,59 +471,10 @@ namespace ExchangeLogReport
                 r.Needle = c.Split.Get(iDate) + " " + c.Split.Get(iTime) + " ";
                 r.Needle2 = c.Split.Get(iUser);
                 Enrich(r, query, null, null);
-                HandleAccess(c, r);
+                Prepare(c, r);
+                c.Access.Add(r);
             }
             return offset;
-        }
-
-        // ================================================================ client access: aggregates, details, recovery
-
-        void HandleAccess(FileContext c, AccessRecord r)
-        {
-            r.User = Canonical(r.User);
-            string outcome = Outcome(r.Status);
-            bool failure = outcome != "Success";
-            bool slow = !failure && _o.SlowRequestMs > 0 && r.DurationMs >= _o.SlowRequestMs && !LongRunning(r);
-            string day = _days.Day(r.TimeMs);
-            string key = day + "|" + r.User + "|" + r.Protocol;
-            UsageAcc u;
-            if (!c.Usage.TryGetValue(key, out u))
-            {
-                u = new UsageAcc { Day = day, Server = c.Server, User = r.User, Protocol = r.Protocol };
-                c.Usage[key] = u;
-            }
-            u.Requests++;
-            if (outcome == "Success") { u.Successes++; if (r.TimeMs > u.LastSuccessMs) u.LastSuccessMs = r.TimeMs; }
-            else
-            {
-                if (outcome == "ServerError") u.ServerErrors++; else u.ClientErrors++;
-                if (r.TimeMs > u.LastFailureMs) u.LastFailureMs = r.TimeMs;
-            }
-            if (slow) u.Slow++;
-            u.BytesIn += r.BytesIn; u.BytesOut += r.BytesOut; u.TotalMs += r.DurationMs;
-            if (r.DurationMs > u.MaxMs) u.MaxMs = r.DurationMs;
-            if (r.TimeMs < u.FirstMs) u.FirstMs = r.TimeMs;
-            if (r.TimeMs >= u.LastMs)
-            {
-                u.LastMs = r.TimeMs;
-                if (!r.FromBackEnd) { u.ClientIp = r.ClientIp; u.UserAgent = Identity.Cap(r.UserAgent, 300); }
-            }
-            if (r.Mailbox != null) u.Mailbox = r.Mailbox;
-            CountAction(c, day, r, failure, slow);
-            if (!r.FromBackEnd) CountClient(c, day, r, failure);
-            if (r.TimeMs >= _o.DetailCutoffMs) AddToSession(c, r, failure, slow);
-
-            string recoveryKey = r.User + "|" + r.Protocol;
-            if (!failure) Resolve(recoveryKey, r.TimeMs);
-            bool keepDetail = failure || slow || _o.StoreAllRequests || Watched(r.User, r.Mailbox);
-            if (!keepDetail || r.TimeMs < _o.DetailCutoffMs) return;
-            long id = InsertEvent(c, r, slow ? "Slow" : outcome);
-            if (failure && id > 0) AddPending(recoveryKey, id, r.TimeMs);
-        }
-
-        bool LongRunning(AccessRecord r)
-        {
-            return _longRunning != null && _longRunning.IsMatch(r.Protocol + "|" + (r.Action ?? "") + "|" + (r.Url ?? ""));
         }
 
         static string LogonError(int win32)
@@ -501,50 +492,180 @@ namespace ExchangeLogReport
             }
         }
 
-        long InsertEvent(FileContext c, AccessRecord r, string outcome)
+        // ================================================================ client access: aggregates, details, recovery
+
+        /// <summary>What does not depend on the other files: outcome, slow, day, session key without the account.</summary>
+        void Compute(AccessRecord r, DayCache days, string server)
         {
-            if (c.InsertEvent == null)
+            r.Outcome = Outcome(r.Status);
+            r.Failure = r.Outcome != "Success";
+            r.Slow = !r.Failure && _o.SlowRequestMs > 0 && r.DurationMs >= _o.SlowRequestMs && !LongRunning(r);
+            r.Day = days.Day(r.TimeMs);
+            r.Agent = Identity.Cap(r.UserAgent, 300);
+            if (r.Failure) r.Why = Describe(r);
+            r.Back = r.FromBackEnd ? server : Identity.ServerName(r.TargetServer);
+            r.KeyRest = SessionKeyRest(r.Protocol, r.ClientIp, r.UserAgent, r.DeviceId, r.MailboxGuid, r.ClientInstance);
+        }
+
+        /// <summary>Counts a request in usage, operations, clients and successes (by the account as given).</summary>
+        static void Count(AccessRecord r, string server, Dictionary<string, UsageAcc> usage, Dictionary<string, ActionAcc> actions, Dictionary<string, ClientAcc> clients, Dictionary<string, List<long>> successes)
+        {
+            string key = r.Day + "|" + server + "|" + r.User + "|" + r.Protocol;
+            UsageAcc u;
+            if (!usage.TryGetValue(key, out u)) { u = new UsageAcc { Day = r.Day, Server = server, User = r.User, Protocol = r.Protocol }; usage[key] = u; }
+            u.Requests++;
+            if (!r.Failure) { u.Successes++; if (r.TimeMs > u.LastSuccessMs) u.LastSuccessMs = r.TimeMs; }
+            else
             {
-                c.InsertEvent = _store.Command(@"INSERT OR IGNORE INTO access_event(time_ms,server,source,protocol,user,mailbox,client_ip,user_agent,method,url,action,status,sub_status,win32,backend_status,error_code,target_server,auth_type,routing,bytes_in,bytes_out,duration_ms,outcome,request_id,errors)
-VALUES(@t,@s,@src,@p,@u,@m,@ip,@ua,@me,@url,@a,@st,@sub,@w,@b,@e,@ts,@at,@ro,@bi,@bo,@d,@o,@rid,@err) RETURNING id;", c.Tx);
-                foreach (var p in new[] { "@t", "@s", "@src", "@p", "@u", "@m", "@ip", "@ua", "@me", "@url", "@a", "@st", "@sub", "@w", "@b", "@e", "@ts", "@at", "@ro", "@bi", "@bo", "@d", "@o", "@rid", "@err" })
-                    c.InsertEvent.Parameters.Add(p, SqliteType.Text);
+                if (r.Outcome == "ServerError") u.ServerErrors++; else u.ClientErrors++;
+                if (r.TimeMs > u.LastFailureMs) u.LastFailureMs = r.TimeMs;
             }
-            var ps = c.InsertEvent.Parameters;
-            Func<object, object> v = x => x ?? DBNull.Value;
-            ps["@t"].Value = r.TimeMs; ps["@s"].Value = c.Server; ps["@src"].Value = r.Source; ps["@p"].Value = v(r.Protocol);
-            ps["@u"].Value = v(r.User); ps["@m"].Value = v(r.Mailbox); ps["@ip"].Value = v(r.ClientIp); ps["@ua"].Value = v(Identity.Cap(r.UserAgent, 300));
-            ps["@me"].Value = v(r.Method); ps["@url"].Value = v(Identity.Cap(r.Url, 300)); ps["@a"].Value = v(r.Action); ps["@st"].Value = r.Status;
-            ps["@sub"].Value = v(r.SubStatus); ps["@w"].Value = v(r.Win32); ps["@b"].Value = v(r.BackEndStatus); ps["@e"].Value = v(r.ErrorCode);
-            ps["@ts"].Value = v(r.TargetServer); ps["@at"].Value = v(r.AuthType); ps["@ro"].Value = v(r.Routing); ps["@bi"].Value = r.BytesIn;
-            ps["@bo"].Value = r.BytesOut; ps["@d"].Value = r.DurationMs; ps["@o"].Value = outcome; ps["@rid"].Value = v(r.RequestId); ps["@err"].Value = v(r.Errors);
-            object id = c.InsertEvent.ExecuteScalar();
+            if (r.Slow) u.Slow++;
+            u.BytesIn += r.BytesIn; u.BytesOut += r.BytesOut; u.TotalMs += r.DurationMs;
+            if (r.DurationMs > u.MaxMs) u.MaxMs = r.DurationMs;
+            if (r.TimeMs < u.FirstMs) u.FirstMs = r.TimeMs;
+            if (r.TimeMs >= u.LastMs) u.LastMs = r.TimeMs;
+            // Address and client of the latest front-end request (back-end lines have no client address of their own).
+            if (!r.FromBackEnd && r.TimeMs >= u.ClientMs) { u.ClientMs = r.TimeMs; u.ClientIp = r.ClientIp; u.UserAgent = r.Agent; }
+            if (r.Mailbox != null) u.Mailbox = r.Mailbox;
+
+            string action = r.Action ?? "?";
+            string ak = r.Day + "|" + server + "|" + r.Protocol + "|" + action;
+            ActionAcc a;
+            if (!actions.TryGetValue(ak, out a)) { a = new ActionAcc { Day = r.Day, Server = server, Protocol = r.Protocol ?? "Other", Action = action }; actions[ak] = a; }
+            a.Requests++;
+            if (r.Failure) a.Failures++;
+            if (r.Slow) a.Slow++;
+            a.TotalMs += r.DurationMs; a.MaxMs = Math.Max(a.MaxMs, r.DurationMs);
+
+            if (!r.FromBackEnd)
+            {
+                string agent = r.Agent ?? "", device = r.DeviceId ?? "", ip = r.ClientIp ?? "";
+                string ck = r.Day + "|" + r.User + "|" + r.Protocol + "|" + ip + "|" + agent + "|" + device + "|" + server;
+                ClientAcc cl;
+                if (!clients.TryGetValue(ck, out cl)) { cl = new ClientAcc { Day = r.Day, Server = server, User = r.User, Protocol = r.Protocol ?? "Other", Ip = ip, Agent = agent, DeviceId = device }; clients[ck] = cl; }
+                cl.Requests++;
+                if (r.Failure) cl.Failures++;
+                if (r.DeviceType != null) cl.DeviceType = r.DeviceType;
+                cl.First = Math.Min(cl.First, r.TimeMs); cl.Last = Math.Max(cl.Last, r.TimeMs);
+            }
+
+            if (!r.Failure)
+            {
+                string sk = r.User + "\u0001" + r.Protocol;
+                List<long> list;
+                if (!successes.TryGetValue(sk, out list)) { list = new List<long>(); successes[sk] = list; }
+                list.Add(r.TimeMs);
+            }
+        }
+
+        /// <summary>Parse thread: computes and counts a client access record of the file.</summary>
+        void Prepare(ParseContext c, AccessRecord r)
+        {
+            if (c.Days == null) c.Days = new DayCache(_o.Zone);
+            Compute(r, c.Days, c.Server);
+            Count(r, c.Server, c.Usage, c.Actions, c.Clients, c.Successes);
+            r.Prepared = true;
+        }
+
+        /// <summary>Apply thread: the aggregates of a file, with the canonical form of the accounts, into the batch.</summary>
+        void MergeAggregates(ParseContext c)
+        {
+            var b = _batch;
+            foreach (var u in c.Usage.Values)
+            {
+                string user = Canonical(u.User);
+                string key = u.Day + "|" + u.Server + "|" + user + "|" + u.Protocol;
+                UsageAcc into;
+                if (!b.Usage.TryGetValue(key, out into)) { u.User = user; b.Usage[key] = u; }
+                else into.Merge(u);
+            }
+            foreach (var a in c.Actions.Values)
+            {
+                string key = a.Day + "|" + a.Server + "|" + a.Protocol + "|" + a.Action;
+                ActionAcc into;
+                if (!b.Actions.TryGetValue(key, out into)) b.Actions[key] = a;
+                else { into.Requests += a.Requests; into.Failures += a.Failures; into.Slow += a.Slow; into.TotalMs += a.TotalMs; into.MaxMs = Math.Max(into.MaxMs, a.MaxMs); }
+            }
+            foreach (var cl in c.Clients.Values)
+            {
+                string user = Canonical(cl.User);
+                string key = cl.Day + "|" + user + "|" + cl.Protocol + "|" + cl.Ip + "|" + cl.Agent + "|" + cl.DeviceId + "|" + cl.Server;
+                ClientAcc into;
+                if (!b.Clients.TryGetValue(key, out into)) { cl.User = user; b.Clients[key] = cl; }
+                else
+                {
+                    into.Requests += cl.Requests; into.Failures += cl.Failures; into.DeviceType = cl.DeviceType ?? into.DeviceType;
+                    into.First = Math.Min(into.First, cl.First); into.Last = Math.Max(into.Last, cl.Last);
+                }
+            }
+            foreach (var kv in c.Successes)
+            {
+                int sep = kv.Key.IndexOf('\u0001');
+                string key = Canonical(kv.Key.Substring(0, sep)) + "|" + kv.Key.Substring(sep + 1);
+                List<long> list;
+                if (!_successes.TryGetValue(key, out list)) _successes[key] = kv.Value;
+                else list.AddRange(kv.Value);
+            }
+        }
+
+        /// <summary>
+        /// Apply thread: the part of a client access record that depends on the other files (canonical account,
+        /// client session, failures kept with their id for the recoveries). A record not prepared by its parse
+        /// thread (IMAP, POP) is computed and counted here.
+        /// </summary>
+        void HandleAccess(ApplyFile f, AccessRecord r)
+        {
+            r.User = Canonical(r.User);
+            if (!r.Prepared)
+            {
+                Compute(r, _days, f.Server);
+                var b = _batch;
+                var successes = new Dictionary<string, List<long>>(StringComparer.Ordinal);
+                Count(r, f.Server, b.Usage, b.Actions, b.Clients, successes);
+                foreach (var kv in successes) foreach (var t in kv.Value) AddSuccess(r.User + "|" + r.Protocol, t);
+            }
+            if (r.TimeMs >= _o.DetailCutoffMs) AddToSession(f, r, r.Failure, r.Slow);
+            bool keepDetail = r.Failure || r.Slow || _o.StoreAllRequests || Watched(r.User, r.Mailbox);
+            if (!keepDetail || r.TimeMs < _o.DetailCutoffMs) return;
+            long id = InsertEvent(f, r, r.Slow ? "Slow" : r.Outcome);
+            if (r.Failure && id > 0) _failures.Add(new PendingFailure { Id = id, Key = r.User + "|" + r.Protocol, TimeMs = r.TimeMs });
+        }
+        bool LongRunning(AccessRecord r)
+        {
+            return _longRunning != null && _longRunning.IsMatch(r.Protocol + "|" + (r.Action ?? "") + "|" + (r.Url ?? ""));
+        }
+
+        long InsertEvent(ApplyFile f, AccessRecord r, string outcome)
+        {
+            var w = _writer.InsertEvent;
+            w.Set(0, r.TimeMs); w.Set(1, f.Server); w.Set(2, r.Source); w.Set(3, r.Protocol); w.Set(4, r.User); w.Set(5, r.Mailbox); w.Set(6, r.ClientIp);
+            w.Set(7, r.Agent); w.Set(8, r.Method); w.Set(9, Identity.Cap(r.Url, 300)); w.Set(10, r.Action); w.Set(11, (long)r.Status);
+            w.Set(12, r.SubStatus.HasValue ? (object)(long)r.SubStatus.Value : null); w.Set(13, r.Win32.HasValue ? (object)(long)r.Win32.Value : null);
+            w.Set(14, r.BackEndStatus.HasValue ? (object)(long)r.BackEndStatus.Value : null); w.Set(15, r.ErrorCode); w.Set(16, r.TargetServer); w.Set(17, r.AuthType);
+            w.Set(18, r.Routing); w.Set(19, r.BytesIn); w.Set(20, r.BytesOut); w.Set(21, r.DurationMs); w.Set(22, outcome); w.Set(23, r.RequestId); w.Set(24, r.Errors);
+            object id = w.Scalar();
+            _batch.Rows++;
             if (id == null || id is DBNull) return 0;
-            c.Result.Stored++;
+            f.Result.Stored++;
             return Convert.ToInt64(id);
         }
 
-        void AddPending(string key, long id, long t)
+        // ---------------------------------------------------------------- recoveries
+
+        sealed class PendingFailure { public long Id, TimeMs; public string Key; }
+
+        readonly List<PendingFailure> _failures = new List<PendingFailure>();
+        readonly Dictionary<string, List<long>> _successes = new Dictionary<string, List<long>>(StringComparer.Ordinal);
+
+        void AddSuccess(string key, long t)
         {
-            List<long[]> list;
-            if (!_pending.TryGetValue(key, out list)) { list = new List<long[]>(); _pending[key] = list; }
-            list.Add(new[] { id, t });
+            List<long> list;
+            if (!_successes.TryGetValue(key, out list)) { list = new List<long>(); _successes[key] = list; }
+            list.Add(t);
         }
 
-        /// <summary>A success of the same user and protocol after a failure (within the window) marks the failure as recovered.</summary>
-        void Resolve(string key, long t)
-        {
-            List<long[]> list;
-            if (!_pending.TryGetValue(key, out list)) return;
-            for (int i = list.Count - 1; i >= 0; i--)
-            {
-                long failedAt = list[i][1];
-                if (t >= failedAt && t - failedAt <= _o.RecoveryWindowMs) { _recovered.Add(new[] { list[i][0], t }); list.RemoveAt(i); }
-                else if (t - failedAt > _o.RecoveryWindowMs) list.RemoveAt(i);
-            }
-            if (list.Count == 0) _pending.Remove(key);
-        }
-
+        /// <summary>Failures of the last two days not recovered yet: a success of this collection can recover them.</summary>
         void LoadPendingFailures()
         {
             if (_store.ReadOnly) return;
@@ -552,56 +673,63 @@ VALUES(@t,@s,@src,@p,@u,@m,@ip,@ua,@me,@url,@a,@st,@sub,@w,@b,@e,@ts,@at,@ro,@bi
             {
                 c.Parameters.AddWithValue("@since", _o.NowMs - 2 * 86400000L);
                 using (var r = c.ExecuteReader())
-                    while (r.Read()) if (!r.IsDBNull(1)) AddPending(r.GetString(1) + "|" + (r.IsDBNull(2) ? "" : r.GetString(2)), r.GetInt64(0), r.GetInt64(3));
+                    while (r.Read()) if (!r.IsDBNull(1)) _failures.Add(new PendingFailure { Id = r.GetInt64(0), Key = r.GetString(1) + "|" + (r.IsDBNull(2) ? "" : r.GetString(2)), TimeMs = r.GetInt64(3) });
             }
+        }
+
+        /// <summary>
+        /// A failure followed, within the recovery window, by a success of the same user and protocol (on any server)
+        /// is recovered at the time of the first such success. Computed once all files are read, so that the order in
+        /// which the files were read does not matter.
+        /// </summary>
+        List<long[]> ResolveRecoveries()
+        {
+            var recovered = new List<long[]>();
+            foreach (var list in _successes.Values) list.Sort();
+            foreach (var f in _failures)
+            {
+                List<long> list;
+                if (!_successes.TryGetValue(f.Key, out list) || list.Count == 0) continue;
+                int i = list.BinarySearch(f.TimeMs);
+                if (i < 0) i = ~i;
+                else while (i > 0 && list[i - 1] == f.TimeMs) i--;
+                if (i < list.Count && list[i] - f.TimeMs <= _o.RecoveryWindowMs) recovered.Add(new[] { f.Id, list[i] });
+            }
+            return recovered;
         }
 
         /// <summary>Writes the back-end connections and the recoveries found during the collection. Call once, after the last file.</summary>
         public long Complete()
         {
             CompleteBackEnd();
-            if (_recovered.Count == 0) return 0;
+            var recovered = ResolveRecoveries();
+            _failures.Clear();
+            _successes.Clear();
+            if (recovered.Count == 0) return RecoveredCount = 0;
             using (var tx = _store.Begin())
             using (var c = _store.Command("UPDATE access_event SET recovered_ms=@r WHERE id=@id AND recovered_ms IS NULL;", tx))
             {
                 var pr = c.Parameters.Add("@r", SqliteType.Integer); var pid = c.Parameters.Add("@id", SqliteType.Integer);
-                foreach (var x in _recovered) { pid.Value = x[0]; pr.Value = x[1]; c.ExecuteNonQuery(); }
+                long n = 0;
+                foreach (var x in recovered) { pid.Value = x[0]; pr.Value = x[1]; n += c.ExecuteNonQuery(); }
                 tx.Commit();
+                return RecoveredCount = n;
             }
-            long n = _recovered.Count;
-            _recovered.Clear();
-            return n;
         }
 
-        void FlushUsage(FileContext c)
+        // ---------------------------------------------------------------- aggregates of a batch
+
+        void FlushUsage()
         {
-            if (c.Usage.Count == 0) return;
-            using (var cmd = _store.Command(@"INSERT INTO access_usage(day,server,user,protocol,mailbox,requests,successes,client_errors,server_errors,bytes_in,bytes_out,total_ms,max_ms,first_ms,last_ms,last_success_ms,last_failure_ms,client_ip,user_agent,slow)
-VALUES(@d,@s,@u,@p,@m,@rq,@ok,@ce,@se,@bi,@bo,@tm,@mx,@f,@l,@ls,@lf,@ip,@ua,@sl)
-ON CONFLICT(day,server,user,protocol) DO UPDATE SET
- mailbox=COALESCE(excluded.mailbox,mailbox), requests=requests+excluded.requests, successes=successes+excluded.successes,
- client_errors=client_errors+excluded.client_errors, server_errors=server_errors+excluded.server_errors, slow=slow+excluded.slow,
- bytes_in=bytes_in+excluded.bytes_in, bytes_out=bytes_out+excluded.bytes_out, total_ms=total_ms+excluded.total_ms,
- max_ms=MAX(max_ms,excluded.max_ms), first_ms=MIN(first_ms,excluded.first_ms),
- client_ip=CASE WHEN excluded.client_ip IS NULL THEN client_ip WHEN client_ip IS NULL OR excluded.last_ms>=last_ms THEN excluded.client_ip ELSE client_ip END,
- user_agent=CASE WHEN excluded.user_agent IS NULL THEN user_agent WHEN user_agent IS NULL OR excluded.last_ms>=last_ms THEN excluded.user_agent ELSE user_agent END,
- last_ms=MAX(last_ms,excluded.last_ms), last_success_ms=MAX(last_success_ms,excluded.last_success_ms),
- last_failure_ms=MAX(last_failure_ms,excluded.last_failure_ms);", c.Tx))
+            var w = _writer.Usage;
+            foreach (var u in _batch.Usage.Values)
             {
-                var names = new[] { "@d", "@s", "@u", "@p", "@m", "@rq", "@ok", "@ce", "@se", "@bi", "@bo", "@tm", "@mx", "@f", "@l", "@ls", "@lf", "@ip", "@ua", "@sl" };
-                foreach (var n in names) cmd.Parameters.Add(n, SqliteType.Text);
-                var ps = cmd.Parameters;
-                foreach (var u in c.Usage.Values)
-                {
-                    ps["@d"].Value = u.Day; ps["@s"].Value = u.Server; ps["@u"].Value = u.User; ps["@p"].Value = u.Protocol ?? "Other";
-                    ps["@m"].Value = (object)u.Mailbox ?? DBNull.Value; ps["@rq"].Value = u.Requests; ps["@ok"].Value = u.Successes;
-                    ps["@ce"].Value = u.ClientErrors; ps["@se"].Value = u.ServerErrors; ps["@bi"].Value = u.BytesIn; ps["@bo"].Value = u.BytesOut;
-                    ps["@tm"].Value = u.TotalMs; ps["@mx"].Value = u.MaxMs; ps["@f"].Value = u.FirstMs; ps["@l"].Value = u.LastMs;
-                    ps["@ls"].Value = u.LastSuccessMs; ps["@lf"].Value = u.LastFailureMs;
-                    ps["@ip"].Value = (object)u.ClientIp ?? DBNull.Value; ps["@ua"].Value = (object)u.UserAgent ?? DBNull.Value; ps["@sl"].Value = u.Slow;
-                    cmd.ExecuteNonQuery();
-                }
+                w.Set(0, u.Day); w.Set(1, u.Server); w.Set(2, u.User); w.Set(3, u.Protocol ?? "Other"); w.Set(4, u.Mailbox); w.Set(5, u.Requests); w.Set(6, u.Successes);
+                w.Set(7, u.ClientErrors); w.Set(8, u.ServerErrors); w.Set(9, u.BytesIn); w.Set(10, u.BytesOut); w.Set(11, u.TotalMs); w.Set(12, u.MaxMs);
+                w.Set(13, u.FirstMs); w.Set(14, u.LastMs); w.Set(15, u.LastSuccessMs); w.Set(16, u.LastFailureMs); w.Set(17, u.ClientIp); w.Set(18, u.UserAgent); w.Set(19, u.Slow);
+                w.Run();
             }
+            _batch.Usage.Clear();
         }
 
         // ================================================================ SMTP protocol logs
@@ -635,10 +763,10 @@ ON CONFLICT(day,server,user,protocol) DO UPDATE SET
         /// Sessions still open at the end of the active file are not written: the read position stays
         /// at their first line so that the next collection reads them complete.
         /// </summary>
-        long ParseSmtp(FileContext c, string direction)
+        long ParseSmtp(ParseContext c, string direction)
         {
             var sessions = new Dictionary<string, SmtpSession>(StringComparer.Ordinal);
-            long offset = c.State.Offset, lineStart = offset, fileLastMs = 0;
+            long offset = c.StartOffset, lineStart = offset, fileLastMs = 0;
             int iTime = -1, iConn = -1, iSess = -1, iLocal = -1, iRemote = -1, iEvt = -1, iData = -1, iCtx = -1;
             Action bind = () =>
             {
@@ -646,26 +774,25 @@ ON CONFLICT(day,server,user,protocol) DO UPDATE SET
                 iTime = m.Index("date-time"); iConn = m.Index("connector-id"); iSess = m.Index("session-id"); iLocal = m.Index("local-endpoint");
                 iRemote = m.Index("remote-endpoint"); iEvt = m.Index("event"); iData = m.Index("data"); iCtx = m.Index("context");
             };
-            if (c.Map.Load(c.State.Fields)) bind();
+            if (c.Map.Load(c.Fields)) bind();
             bool receive = direction == "Receive";
-            foreach (var kv in LogReader.ReadLines(c.Path, offset))
+            foreach (var line in LogReader.Lines(c.Path, offset))
             {
-                string line = kv.Key;
                 long start = lineStart;
-                lineStart = kv.Value;
-                offset = kv.Value;
+                lineStart = line.NextOffset;
+                offset = line.NextOffset;
                 c.Result.Lines++;
                 if (line.Length == 0) { Noise(c, "Empty line", 1); continue; }
-                if (line[0] == '#')
+                if (line.First == '#')
                 {
-                    if (line.StartsWith("#Fields:", StringComparison.OrdinalIgnoreCase)) { c.Map.Load(line); c.State.Fields = line; bind(); }
+                    if (line.StartsWith("#Fields:")) { string text = line.Text(); c.Map.Load(text); c.Fields = text; bind(); }
                     Noise(c, "Header", 1);
                     continue;
                 }
                 if (iSess < 0 || iEvt < 0) { Noise(c, "No #Fields header", 1); continue; }
                 c.Split.Split(line, ',');
                 long t;
-                if (!TimeUtil.TryParseUtc(c.Split.Get(iTime), out t)) { Noise(c, "Unreadable line", 1); continue; }
+                if (!c.Split.TryTime(iTime, out t)) { Noise(c, "Unreadable line", 1); continue; }
                 Seen(c, t);
                 if (t > fileLastMs) fileLastMs = t;
                 string sid = c.Split.Get(iSess) ?? "";
@@ -782,7 +909,8 @@ ON CONFLICT(day,server,user,protocol) DO UPDATE SET
             return "Incomplete";
         }
 
-        void EmitSession(FileContext c, SmtpSession s, string direction)
+        /// <summary>One smtp_transaction row per mail transaction of the session (columns of Writer.InsertSmtp).</summary>
+        void EmitSession(ParseContext c, SmtpSession s, string direction)
         {
             FinishTxn(s);
             if (s.Done.Count == 0)
@@ -802,32 +930,19 @@ ON CONFLICT(day,server,user,protocol) DO UPDATE SET
             {
                 if (x.StartMs < _o.RetentionCutoffMs) continue;
                 if (IsSystemAddress(x.MailFrom)) continue;
-                if (c.InsertSmtp == null)
-                {
-                    c.InsertSmtp = _store.Command(@"INSERT OR IGNORE INTO smtp_transaction(time_ms,end_ms,server,direction,role,connector,session_id,local_ep,remote_ep,helo,tls,auth,mail_from,rcpt_count,rcpts,message_id,internal_id,status,response,transcript)
-VALUES(@t,@e,@s,@d,@ro,@c,@sid,@l,@r,@h,@tls,@a,@f,@n,@rc,@m,@i,@st,@resp,@tr);", c.Tx);
-                    foreach (var p in new[] { "@t", "@e", "@s", "@d", "@ro", "@c", "@sid", "@l", "@r", "@h", "@tls", "@a", "@f", "@n", "@rc", "@m", "@i", "@st", "@resp", "@tr" })
-                        c.InsertSmtp.Parameters.Add(p, SqliteType.Text);
-                }
-                Func<object, object> v = o => o ?? DBNull.Value;
-                var ps = c.InsertSmtp.Parameters;
-                ps["@t"].Value = x.StartMs; ps["@e"].Value = x.EndMs > 0 ? (object)x.EndMs : DBNull.Value; ps["@s"].Value = c.Server;
-                ps["@d"].Value = direction; ps["@ro"].Value = v(c.Role); ps["@c"].Value = v(s.Connector); ps["@sid"].Value = s.Id;
-                ps["@l"].Value = v(s.Local);
+                string remote, helo, auth;
                 if (s.ProxyIp != null)
                 {
                     // Show the real client of a proxied submission, not the front end that relayed it.
-                    ps["@r"].Value = s.ProxyIp + (s.ProxyPort != null ? ":" + s.ProxyPort : "");
-                    ps["@h"].Value = v(s.ProxyHelo);
-                    ps["@a"].Value = "Authenticated client (proxied by " + (Identity.ServerName(s.Helo) ?? "front end") + ")";
+                    remote = s.ProxyIp + (s.ProxyPort != null ? ":" + s.ProxyPort : "");
+                    helo = s.ProxyHelo;
+                    auth = "Authenticated client (proxied by " + (Identity.ServerName(s.Helo) ?? "front end") + ")";
                 }
-                else { ps["@r"].Value = v(s.Remote); ps["@h"].Value = v(s.Helo); ps["@a"].Value = v(s.Auth); }
-                ps["@tls"].Value = v(s.Tls);
-                ps["@f"].Value = v(x.MailFrom); ps["@n"].Value = x.Rcpts.Count;
-                ps["@rc"].Value = v(Identity.Cap(string.Join(";", x.Rcpts), 4000)); ps["@m"].Value = v(x.MessageId); ps["@i"].Value = v(x.InternalId);
-                ps["@st"].Value = TxnStatus(x, direction); ps["@resp"].Value = v(Identity.Cap(x.Response ?? x.LastError, 500));
-                ps["@tr"].Value = x.StartMs >= _o.DetailCutoffMs ? (object)Transcript(s, x) : DBNull.Value;
-                if (c.InsertSmtp.ExecuteNonQuery() > 0) c.Result.Stored++;
+                else { remote = s.Remote; helo = s.Helo; auth = s.Auth; }
+                c.Smtp.Add(new object[] {
+                    x.StartMs, x.EndMs > 0 ? (object)x.EndMs : null, c.Server, direction, c.Role, s.Connector, s.Id, s.Local, remote, helo, s.Tls, auth,
+                    x.MailFrom, (long)x.Rcpts.Count, Identity.Cap(string.Join(";", x.Rcpts), 4000), x.MessageId, x.InternalId, TxnStatus(x, direction),
+                    Identity.Cap(x.Response ?? x.LastError, 500), x.StartMs >= _o.DetailCutoffMs ? Packed.Pack(Transcript(s, x)) : null });
                 kept = true;
             }
             if (kept) c.Result.Kept += s.Lines;
@@ -850,63 +965,63 @@ VALUES(@t,@e,@s,@d,@ro,@c,@sid,@l,@r,@h,@tls,@a,@f,@n,@rc,@m,@i,@st,@resp,@tr);"
 
         // ================================================================ message tracking
 
-        long ParseTracking(FileContext c)
+        static readonly string[] TrackingNames = { "date-time", "client-ip", "client-hostname", "server-ip", "server-hostname", "source-context", "connector-id", "source",
+            "event-id", "internal-message-id", "message-id", "network-message-id", "recipient-address", "recipient-status", "total-bytes",
+            "recipient-count", "related-recipient-address", "reference", "message-subject", "sender-address", "return-path", "message-info",
+            "directionality", "log-id" };
+
+        /// <summary>One message_event row per tracking event of a real message (columns of Writer.InsertMessage).</summary>
+        long ParseTracking(ParseContext c)
         {
-            long offset = c.State.Offset;
-            var idx = new Dictionary<string, int>();
-            string[] names = { "date-time", "client-ip", "client-hostname", "server-ip", "server-hostname", "source-context", "connector-id", "source",
-                "event-id", "internal-message-id", "message-id", "network-message-id", "recipient-address", "recipient-status", "total-bytes",
-                "recipient-count", "related-recipient-address", "reference", "message-subject", "sender-address", "return-path", "message-info",
-                "directionality", "log-id" };
-            Action bind = () => { foreach (var n in names) idx[n] = c.Map.Index(n); };
-            if (c.Map.Load(c.State.Fields)) bind();
-            Func<string, string> get = n => { int i; return idx.TryGetValue(n, out i) ? c.Split.Get(i) : null; };
-            foreach (var kv in LogReader.ReadLines(c.Path, offset))
+            long offset = c.StartOffset;
+            var idx = new int[TrackingNames.Length];
+            Action bind = () => { for (int i = 0; i < TrackingNames.Length; i++) idx[i] = c.Map.Index(TrackingNames[i]); };
+            if (c.Map.Load(c.Fields)) bind();
+            Func<int, string> get = i => c.Split.Get(idx[i]);
+            Func<string, object> v = o => string.IsNullOrEmpty(o) ? null : o;
+            foreach (var line in LogReader.Lines(c.Path, offset))
             {
-                string line = kv.Key;
-                offset = kv.Value;
+                offset = line.NextOffset;
                 c.Result.Lines++;
                 if (line.Length == 0) { Noise(c, "Empty line", 1); continue; }
-                if (line[0] == '#')
+                if (line.First == '#')
                 {
-                    if (line.StartsWith("#Fields:", StringComparison.OrdinalIgnoreCase)) { c.Map.Load(line); c.State.Fields = line; bind(); }
+                    if (line.StartsWith("#Fields:")) { string text = line.Text(); c.Map.Load(text); c.Fields = text; bind(); }
                     Noise(c, "Header", 1);
                     continue;
                 }
                 if (!c.Map.Loaded) { Noise(c, "No #Fields header", 1); continue; }
                 c.Split.Split(line, ',');
                 long t;
-                if (!TimeUtil.TryParseUtc(get("date-time"), out t)) { Noise(c, "Unreadable line", 1); continue; }
+                if (!c.Split.TryTime(idx[0], out t)) { Noise(c, "Unreadable line", 1); continue; }
                 Seen(c, t);
                 if (t < _o.RetentionCutoffMs) { Noise(c, "Older than retention", 1); continue; }
-                string evt = (get("event-id") ?? "").ToUpperInvariant();
+                string evt = (get(8) ?? "").ToUpperInvariant();
                 if (_ignoredEvents.Contains(evt)) { Noise(c, "Shadow redundancy event (" + evt + ")", 1); continue; }
-                string sender = (get("sender-address") ?? "").ToLowerInvariant();
-                string recipients = (get("recipient-address") ?? "").ToLowerInvariant();
-                if (IsSystemAddress(sender)) { Noise(c, "System or probe message", 1); continue; }
-                if (recipients.Length > 0 && recipients.Split(';').All(a => a.Length == 0 || IsSystemAddress(a))) { Noise(c, "System or probe message", 1); continue; }
+                string sender = (c.Split.GetCached(idx[19]) ?? "").ToLowerInvariant();
+                string recipients = (get(12) ?? "").ToLowerInvariant();
+                if (sender.Length > 0 && Remember(c.Memo.SystemAddresses, sender, IsSystemAddress)) { Noise(c, "System or probe message", 1); continue; }
+                if (recipients.Length > 0 && AllSystem(recipients)) { Noise(c, "System or probe message", 1); continue; }
                 c.Result.Kept++;
-                if (c.InsertMessage == null)
-                {
-                    c.InsertMessage = _store.Command(@"INSERT OR IGNORE INTO message_event(time_ms,server,event_id,source,message_id,internal_id,network_id,sender,recipients,recipient_status,recipient_count,total_bytes,subject,client_ip,client_host,server_ip,server_host,connector,source_context,related_recipient,reference,directionality,message_info,return_path,log_id)
-VALUES(@t,@s,@e,@src,@m,@i,@n,@snd,@r,@rs,@rc,@b,@subj,@cip,@ch,@sip,@sh,@con,@ctx,@rel,@ref,@dir,@info,@ret,@log);", c.Tx);
-                    foreach (var p in new[] { "@t", "@s", "@e", "@src", "@m", "@i", "@n", "@snd", "@r", "@rs", "@rc", "@b", "@subj", "@cip", "@ch", "@sip", "@sh", "@con", "@ctx", "@rel", "@ref", "@dir", "@info", "@ret", "@log" })
-                        c.InsertMessage.Parameters.Add(p, SqliteType.Text);
-                }
-                Func<object, object> v = o => o == null || (o is string && ((string)o).Length == 0) ? DBNull.Value : o;
-                var ps = c.InsertMessage.Parameters;
-                ps["@t"].Value = t; ps["@s"].Value = c.Server; ps["@e"].Value = evt; ps["@src"].Value = v(get("source"));
-                ps["@m"].Value = v(get("message-id")); ps["@i"].Value = v(get("internal-message-id")); ps["@n"].Value = v(get("network-message-id"));
-                ps["@snd"].Value = v(sender); ps["@r"].Value = v(Identity.Cap(recipients, 8000)); ps["@rs"].Value = v(Identity.Cap(get("recipient-status"), 2000));
-                ps["@rc"].Value = c.Split.GetInt(idx["recipient-count"], 0); ps["@b"].Value = c.Split.GetLong(idx["total-bytes"], 0);
-                ps["@subj"].Value = v(Identity.Cap(get("message-subject"), 300)); ps["@cip"].Value = v(get("client-ip")); ps["@ch"].Value = v(get("client-hostname"));
-                ps["@sip"].Value = v(get("server-ip")); ps["@sh"].Value = v(get("server-hostname")); ps["@con"].Value = v(get("connector-id"));
-                ps["@ctx"].Value = v(Identity.Cap(get("source-context"), 400)); ps["@rel"].Value = v(Identity.Cap(get("related-recipient-address"), 1000));
-                ps["@ref"].Value = v(Identity.Cap(get("reference"), 300)); ps["@dir"].Value = v(get("directionality"));
-                ps["@info"].Value = v(Identity.Cap(get("message-info"), 400)); ps["@ret"].Value = v(get("return-path")); ps["@log"].Value = v(get("log-id"));
-                if (c.InsertMessage.ExecuteNonQuery() > 0) c.Result.Stored++;
+                c.Messages.Add(new object[] {
+                    t, c.Server, evt, v(get(7)), v(get(10)), v(get(9)), v(get(11)), v(sender), v(Identity.Cap(recipients, 8000)), v(Identity.Cap(get(13), 2000)),
+                    (long)c.Split.GetInt(idx[15], 0), c.Split.GetLong(idx[14], 0), v(Identity.Cap(get(18), 300)), v(get(1)), v(get(2)), v(get(3)), v(get(4)), v(get(6)),
+                    v(Identity.Cap(get(5), 400)), v(Identity.Cap(get(16), 1000)), v(Identity.Cap(get(17), 300)), v(get(22)), v(Identity.Cap(get(21), 400)), v(get(20)), v(get(23)) });
             }
             return offset;
+        }
+
+        bool AllSystem(string recipients)
+        {
+            int start = 0;
+            while (start <= recipients.Length)
+            {
+                int end = recipients.IndexOf(';', start);
+                if (end < 0) end = recipients.Length;
+                if (end > start && !IsSystemAddress(recipients.Substring(start, end - start))) return false;
+                start = end + 1;
+            }
+            return true;
         }
     }
 }

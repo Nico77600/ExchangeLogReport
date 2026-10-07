@@ -6,11 +6,11 @@
 </p>
 
 <p align="center">
+  <a href="#get-started"><b>Get started</b></a> &nbsp;&middot;&nbsp;
   <a href="#how-it-works"><b>How it works</b></a> &nbsp;&middot;&nbsp;
   <a href="#noise-removed-before-storage"><b>Noise removed</b></a> &nbsp;&middot;&nbsp;
   <a href="#sessions-and-messages"><b>Sessions and messages</b></a> &nbsp;&middot;&nbsp;
   <a href="#reports"><b>Reports</b></a> &nbsp;&middot;&nbsp;
-  <a href="#quick-start"><b>Quick start</b></a> &nbsp;&middot;&nbsp;
   <a href="docs/ExchangeLogReport-UserGuide.md"><b>User guide</b></a> &nbsp;&middot;&nbsp;
   <a href="docs/ExchangeLogReport-Guide.md"><b>Developer guide</b></a>
 </p>
@@ -33,6 +33,95 @@ Exchange writes gigabytes of logs per day and per server, and almost none of it 
   <img alt="Usage: is this server really used, by whom, with which protocols, clients and devices, can it be decommissioned. Troubleshooting: what happened to this user, this client or this message, which requests failed, did the client recover, which servers did the message go through" src="docs/images/readme-why-light.png">
 </picture>
 
+## Get started
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/images/readme-path-dark.png">
+  <img alt="The guided path. Set up once: 1 list the servers, 2 find the log folders with -Mode Discover, 3 collect every hour with a scheduled task whose first run reads 14 days, 4 check with -Mode Status. Then branch A, recurring reporting: 5 schedule the reports, 6 open the HTML report, 7 option: receive them by e-mail. Or branch B, troubleshooting on demand: 5 run a Detailed report on the user and the period, 6 open the client session, 7 follow the timeline to the raw log lines" src="docs/images/readme-path-light.png">
+</picture>
+
+One path for everyone. Set the tool up once (**1 to 4**), then take branch **A** to have reports made for you every day and every month, branch **B** to investigate a problem, or both. **A · Recurring reporting** is for the messaging manager, the architects and operations: which servers can go, which old clients and applications remain, what keeps failing — without anyone running a command; the reports are HTML files, and can be sent by e-mail too. **B · Troubleshooting** is for the Exchange administrators and support: a user, a message or an incident answered in minutes.
+
+The commands use one example — servers `EXCH01` to `EXCH04`, the tool in `E:\Tools\ExchangeLogReport` on EXCH01 run as SYSTEM, `contoso.com`, `alice`. Copy them as they are and only change these names to yours; the [user guide](docs/ExchangeLogReport-UserGuide.md) explains each step, what you should see and what to do if not.
+
+### Set up once · 1 to 4
+
+```powershell
+# On EXCH01, in PowerShell 7 as administrator: the tool (git clone, or the zip of the latest release) in E:\Tools\ExchangeLogReport
+cd E:\Tools\ExchangeLogReport
+
+# 1 · List the servers: Servers = @( @{ Name = 'EXCH01' } @{ Name = 'EXCH02' } @{ Name = 'EXCH03' } @{ Name = 'EXCH04' } )
+notepad .\config\ExchangeLogReport.config.psd1
+
+# 2 · Find the log folders: with your administrator account (View-Only Organization Management), not as SYSTEM
+.\Invoke-ExchangeLogReport.ps1 -Mode Discover
+
+# 3 · Collect every hour: a scheduled task as SYSTEM; its first run, started now, reads the last 14 days of logs
+$pwsh = 'E:\Tools\pwsh\pwsh.exe'
+$tool = 'E:\Tools\ExchangeLogReport\Invoke-ExchangeLogReport.ps1'
+$run  = "$pwsh -NoProfile -ExecutionPolicy Bypass -File $tool"
+schtasks /Create /F /RU SYSTEM /RL HIGHEST /TN "Exchange Log Report - collect" /SC HOURLY /TR "$run -Mode Collect"
+schtasks /Run /TN "Exchange Log Report - collect"
+
+# 4 · Check: once the first run is over, every server and every source has data
+.\Invoke-ExchangeLogReport.ps1 -Mode Status
+```
+
+### A · Recurring reporting · 5 to 7
+
+```powershell
+# 5 · Schedule the reports: every day at 07:00 the last 24 hours, the 1st of every month the last month; the daily one now
+$pwsh = 'E:\Tools\pwsh\pwsh.exe'
+$tool = 'E:\Tools\ExchangeLogReport\Invoke-ExchangeLogReport.ps1'
+$run  = "$pwsh -NoProfile -ExecutionPolicy Bypass -File $tool"
+schtasks /Create /F /RU SYSTEM /RL HIGHEST /TN "Exchange Log Report - daily report" `
+    /SC DAILY /ST 07:00 /TR "$run -Range Last24Hours -ReportType Detailed"
+schtasks /Create /F /RU SYSTEM /RL HIGHEST /TN "Exchange Log Report - monthly report" `
+    /SC MONTHLY /D 1 /ST 07:00 /TR "$run -Range PreviousMonth"
+schtasks /Run /TN "Exchange Log Report - daily report"
+
+# 6 · Open the newest report (an HTML file in the reports folder: it works offline and can be sent as is)
+Get-ChildItem .\reports -Recurse -Filter ExchangeLogs.html |
+    Sort-Object LastWriteTime | Select-Object -Last 1 | Invoke-Item
+
+# 7 · Option: by e-mail too. Fill the Mail section (here: mail.contoso.com, port 25, STARTTLS, anonymous,
+#     To = @('messaging-team@contoso.com')), send a test message, then create the two tasks again with -SendMail
+notepad .\config\ExchangeLogReport.config.psd1
+.\Invoke-ExchangeLogReport.ps1 -Mode MailTest
+```
+
+<details>
+<summary><b>What you get every month</b> · the usage of every server: EXCH04 used by nobody, EXCH03 by 7 users and a scanner only — the people to contact before it goes</summary>
+<br>
+<a href="docs/images/readme-report-overview.png?raw=true"><img alt="Usage report over a month: 3 of 4 servers really used; EXCH03 used by 7 users only; EXCH04 without real usage" src="docs/images/readme-report-overview.png"></a>
+</details>
+
+<details>
+<summary><b>With the e-mail option, every morning</b> · the main problems of the last 24 hours in the body, the report attached</summary>
+<br>
+<a href="docs/images/readme-mail-daily.png?raw=true"><img alt="E-mail of the daily Detailed report: figures, one line per server, then the users with unresolved failures, the client sessions that failed and the SMTP clients with refused mail" src="docs/images/readme-mail-daily.png" width="720"></a>
+</details>
+
+### B · Troubleshooting · 5 to 7
+
+```powershell
+# 5 · Alice says that Outlook and her phone kept failing this morning: a Detailed report on her, on that period
+.\Invoke-ExchangeLogReport.ps1 -Start '2026-10-07 08:00' -End '2026-10-07 12:00' -ReportType Detailed -User alice@contoso.com
+
+# 6 · Open the HTML file shown at the end, tab Client sessions, and click the session that failed
+# 7 · Follow the timeline: each step shows what failed, front end and back end, and the command that finds its raw log lines
+```
+
+<details>
+<summary><b>What you see</b> · the timeline of the session, front end and back end; a step shows its fields and where its raw lines are</summary>
+<br>
+<a href="docs/images/readme-report-session.png?raw=true"><img alt="Client session of a blocked ActiveSync device: each FolderSync answered HTTP 200 but UserDisabledForSync in the back end, with the request fields and the commands that find the raw lines on the front-end and back-end servers" src="docs/images/readme-report-session.png"></a>
+</details>
+
+A message that did not arrive (`-User bob@contoso.com`, tab **Messages**) or an incident on some servers (`-Server EXCH01, EXCH02`, tab **Failed and slow requests**) follow the same three steps: [user guide, chapter 5](docs/ExchangeLogReport-UserGuide.md#5-b--troubleshooting).
+
+Reports read the database: they take seconds to minutes, never wait for the collection, and read the new log lines first only when the last collection is older than 90 minutes. The database keeps 60 days of usage and 14 days of detail (client sessions, failed and slow requests, SMTP transcripts).
+
 ## How it works
 
 <picture>
@@ -41,10 +130,11 @@ Exchange writes gigabytes of logs per day and per server, and almost none of it 
 </picture>
 
 - **Nothing to install on Exchange.** One collector — an Exchange server running the tool as SYSTEM, or an administration server — reads the log folders of every server over the administrative shares, every hour, and only the **new lines** of each file.
+- **Fast, even on months of logs.** Every server and every source is read at the same time, and a single thread writes the database in large transactions. On the same lab collector and the same 14 days of logs of two servers (14.6 GB), 2.0.0 collects in **6 minutes** where 1.6 took **4 h 56 min**, and a 30-day usage report takes 2 min 30 s instead of 15 minutes. The hourly collection reads one hour of logs: a few seconds per server.
 - **The real log folders, checked at every run.** `-Mode Discover` asks Exchange where each server really writes its logs — Exchange on another drive, SMTP logs moved per role, message tracking, POP/IMAP — and reads the IIS sites from `applicationHost.config`, including a second OWA/ECP site. Every collection then follows a moved IIS log folder and warns when an expected folder is missing or a source has stopped writing.
-- **One entry point, one configuration file.** `Invoke-ExchangeLogReport.ps1` finds the log folders (`-Mode Discover`), collects (`-Mode Collect`), builds a report (`-Range`, `-Date`, `-Month`, `-Start` / `-End`, `-ReportType`, `-User`, `-Server`) or shows what the database holds (`-Mode Status`). No parameter is ignored silently: a period that contradicts another is an error, and a parameter that the mode does not use is shown with the reason.
+- **One entry point, one configuration file.** `Invoke-ExchangeLogReport.ps1` finds the log folders (`-Mode Discover`), collects (`-Mode Collect`), builds a report from the database (`-Range`, `-Date`, `-Month`, `-Start` / `-End`, `-ReportType`, `-User`, `-Server`), sends it by e-mail (`-SendMail`, `-Mode MailTest`) or shows what the database holds (`-Mode Status`). No parameter is ignored silently: a period that contradicts another is an error, and a parameter that the mode does not use is shown with the reason.
 - **Edge Transport servers too.** Run on the Edge itself, the tool reads only its SMTP protocol logs and message tracking, and builds an **Edge report**: messages, SMTP clients (who sends to the Edge) and SMTP destinations (Exchange Online, internet MX, the mailbox servers).
-- **Read-only** for Exchange: the tool only reads log files and settings (`Get-*` cmdlets, IIS configuration), never changes a setting and never sends anything; the reports stay on the local disk.
+- **Read-only** for Exchange: the tool only reads log files and settings (`Get-*` cmdlets, IIS configuration) and never changes a setting. The reports stay on the local disk, unless the `Mail` section sends them by e-mail: anonymous, Basic or Kerberos (GSSAPI) authentication, STARTTLS or TLS.
 
 ## Noise removed before storage
 
@@ -109,33 +199,17 @@ Six tabs — **Client sessions**, **Failed and slow requests**, **Users**, **Ope
 | Network | SMB (445) from the collector to every server; from an administration server, also HTTP (80) to one Exchange server for `-Mode Discover` (remote PowerShell, Kerberos) |
 | Logging | SMTP protocol logging `Verbose` on the connectors to analyse; POP/IMAP protocol logs optional. HTTP Proxy, IIS, MAPI and message tracking logs are on by default |
 | Edge Transport | Its own copy of the tool on the Edge itself, as SYSTEM or a local administrator |
+| E-mail (optional) | SMTP (25, 587 or 465) from the collector to a receive connector that accepts it: anonymous, Basic or Kerberos |
 | SQLite | Bundled in `lib\sqlite` — nothing to install |
-
-## Quick start
-
-```powershell
-git clone https://github.com/Nico77600/ExchangeLogReport.git
-cd ExchangeLogReport
-notepad .\config\ExchangeLogReport.config.psd1            # list the Exchange servers (names only)
-
-.\Invoke-ExchangeLogReport.ps1 -Mode Status               # checks the configuration
-.\Invoke-ExchangeLogReport.ps1 -Mode Discover             # real log folders of every server (View-Only Organization Management)
-.\Invoke-ExchangeLogReport.ps1 -Mode Collect              # first collection, then every hour (scheduled task)
-.\Invoke-ExchangeLogReport.ps1 -Range Last30Days          # usage: which servers are really used, by whom
-.\Invoke-ExchangeLogReport.ps1 -Range Last24Hours -ReportType Detailed -User alice@contoso.com
-.\Invoke-ExchangeLogReport.ps1 -Start '2026-10-05 08:00' -End '2026-10-05 12:00' -ReportType Detailed -NoCollect
-```
-
-One command per everyday question — unused server, user problem, missing message, incident, monthly review, Edge: see the [user guide](docs/ExchangeLogReport-UserGuide.md).
-
-The database keeps 60 days of usage and 14 days of detail (client sessions, failed and slow requests, SMTP transcripts). The zip of each [release](https://github.com/Nico77600/ExchangeLogReport/releases) contains only the files needed to run, with both guides in HTML; `.\tools\New-ExchangeLogReportPackage.ps1` builds the same package from the repository.
 
 ## Documentation
 
+The zip of each [release](https://github.com/Nico77600/ExchangeLogReport/releases) contains only the files needed to run, with both guides in HTML; `.\tools\New-ExchangeLogReportPackage.ps1` builds the same package from the repository.
+
 | Guide | Content |
 |---|---|
-| **[User guide](docs/ExchangeLogReport-UserGuide.md)** | For the people who run the reports: **prerequisites** and **everyday commands only** — is this server still used, what happened to this user, where did this message go, what failed during this incident, is the collection working. |
-| **[Developer guide](docs/ExchangeLogReport-Guide.md)** | Everything else: the principles, where to run the tool and with which account, installation, configuration (servers and log folders found by `-Mode Discover`, sources, noise rules, slow-request threshold, retention), the scheduled collection, how to read each tab of the report, the correlation rules, the data model, volumes, troubleshooting, how to modify and validate the tool. |
+| **[User guide](docs/ExchangeLogReport-UserGuide.md)** | **The guided path**, step by step: set up once (**1 to 4**), then **A · Recurring reporting** (scheduled HTML reports, e-mail as an option) or **B · Troubleshooting** (a user, a message, an incident). Each step gives the command to copy, what you should see and what to do if not; then how to keep it running and how to change the examples. |
+| **[Developer guide](docs/ExchangeLogReport-Guide.md)** | Everything else: the principles, where to run the tool and with which account, installation, configuration (servers and log folders found by `-Mode Discover`, sources, noise rules, slow-request threshold, retention), the scheduled collection and reports, the e-mail settings, how to read each tab of the report, the correlation rules, the data model, volumes and performance, troubleshooting, how to modify and validate the tool. |
 
 Both guides also exist as a single HTML file with a light and a dark theme (`docs/ExchangeLogReport-UserGuide.html`, `docs/ExchangeLogReport-Guide.html`): download them and open them locally, or use the copies in the release zip.
 
@@ -144,6 +218,8 @@ Both guides also exist as a single HTML file with a light and a dark theme (`doc
 ```powershell
 Invoke-Pester -Path .\tests      # Pester 5+, logs generated in the exact Exchange formats, no Exchange server needed
 ```
+
+`tools\New-ExlSyntheticLogs.ps1` writes logs with the volumes of a production server (or a decommissioning case), and `tools\Measure-ExlCollection.ps1` measures a collection on them: the performance figures above come from these tools, on a PC and on the lab ([developer guide, chapter 12](docs/ExchangeLogReport-Guide.md#12-volumes-and-performance)).
 
 The tool was also validated on a lab of four Exchange Server SE servers (two sites, one DAG) and an Edge Transport server with generated traffic: Outlook, iPhone and Android ActiveSync, OWA, EWS, Outlook for Mac, IMAP, POP, SMTP submission and relay, wrong passwords, blocked devices, internet mail through the Edge; and with a collector on an administration server, log folders moved to another drive and a second OWA/ECP web site (developer guide, chapter 14).
 

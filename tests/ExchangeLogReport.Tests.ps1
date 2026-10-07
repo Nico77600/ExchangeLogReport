@@ -3,7 +3,7 @@
 <#
     Exchange Log Report - automated tests (Pester 5 or later).
     Author  : Nicolas Fabert
-    Version : 1.6.1
+    Version : 2.0.0
 
     Run:  Invoke-Pester -Path .\tests\ExchangeLogReport.Tests.ps1 -Output Detailed
 
@@ -847,7 +847,7 @@ Describe 'Collection and noise removal' {
         @($rows[1]) | Should -Be @('Send', 'alice@contoso.test', 1, '<msg-001@contoso.test>', '2002', 'Sent', $null)
         @($rows[2])[3] | Should -Be '<msg-001@contoso.test>'
         $rows[3][5] | Should -Be 'Rejected'
-        (Query $script:Settings "SELECT transcript FROM smtp_transaction WHERE direction='Receive' AND status='Accepted'")[0][0] | Should -Match 'BDAT 2048 LAST'
+        (Query $script:Settings "SELECT transcript FROM smtp_transaction WHERE direction='Receive' AND status='Accepted' AND message_id='<msg-001@contoso.test>'")[0][0] | Should -Match 'BDAT 2048 LAST'
     }
     It 'reads only the new lines at the next collection' {
         $again = Invoke-TestCollection $script:Settings
@@ -870,7 +870,7 @@ Describe 'Collection and noise removal' {
         [IO.File]::AppendAllText($file.FullName, "$now,$c,08DF0000000000FF,0,10.0.0.1:25,10.1.1.60:5000,+,,`r`n$now,$c,08DF0000000000FF,1,10.0.0.1:25,10.1.1.60:5000,<,MAIL FROM:<eve@contoso.test>,`r`n")
         [void](Invoke-TestCollection $s)
         (Query $s "SELECT COUNT(*) FROM smtp_transaction WHERE mail_from='eve@contoso.test'")[0][0] | Should -Be 0
-        $state = (Query $s "SELECT offset, size FROM source_file WHERE kind='SmtpReceive'")[0]
+        $state = (Query $s "SELECT offset, size FROM source_file WHERE kind='SmtpReceive' AND path LIKE '%\FrontEnd\%'")[0]
         $state[0] | Should -BeLessThan $state[1]
         [IO.File]::AppendAllText($file.FullName, "$now,$c,08DF0000000000FF,2,10.0.0.1:25,10.1.1.60:5000,<,RCPT TO:<bob@contoso.test>,`r`n$now,$c,08DF0000000000FF,3,10.0.0.1:25,10.1.1.60:5000,<,DATA,`r`n$now,$c,08DF0000000000FF,4,10.0.0.1:25,10.1.1.60:5000,>,""250 2.6.0 <msg-009@contoso.test> [InternalId=9, Hostname=EXCH01] Queued mail for delivery"",`r`n$now,$c,08DF0000000000FF,5,10.0.0.1:25,10.1.1.60:5000,-,,Local`r`n")
         [void](Invoke-TestCollection $s)
@@ -907,7 +907,7 @@ Describe 'Collection and noise removal' {
         $again.Lines | Should -Be 0
         (Query $s "SELECT COUNT(*) FROM source_file WHERE file_key IS NULL")[0][0] | Should -Be 2
         (Query $s "SELECT COUNT(*) FROM source_file WHERE file_key IS NOT NULL AND path LIKE '\\EXCH01\%'")[0][0] | Should -Be (Query $s "SELECT COUNT(*) FROM source_file WHERE file_key IS NOT NULL")[0][0]
-        (Query $s "SELECT value FROM metadata WHERE key = 'schema_version'")[0][0] | Should -Be '3'
+        (Query $s "SELECT value FROM metadata WHERE key = 'schema_version'")[0][0] | Should -Be ([ExchangeLogReport.Store]::SchemaVersion)
     }
 }
 
@@ -1172,7 +1172,8 @@ Describe 'Command line and periods' {
         $collect = @(Get-ExlIgnoredParameter -Mode Collect -Name 'Mode', 'Start', 'End', 'Server', 'ConfigPath')
         $collect.Count | Should -Be 1
         $collect[0] | Should -BeLike '-Start, -End ignored with -Mode Collect: a collection reads every new log line, whatever its date*'
-        @(Get-ExlIgnoredParameter -Mode Report -Name 'Range', 'Start', 'End', 'User', 'Server', 'NoCollect', 'OutputPath').Count | Should -Be 0
+        @(Get-ExlIgnoredParameter -Mode Report -Name 'Range', 'Start', 'End', 'User', 'Server', 'Collect', 'NoCollect', 'OutputPath').Count | Should -Be 0
+        @(Get-ExlIgnoredParameter -Mode Collect -Name 'Collect')[0] | Should -Be '-Collect ignored with -Mode Collect: used by -Mode Report only.'
         $status = @(Get-ExlIgnoredParameter -Mode Status -Name 'Range', 'User', 'Server')
         $status.Count | Should -Be 3
         $status[0] | Should -BeLike '-Range ignored with -Mode Status: *whole database*'
@@ -1193,12 +1194,12 @@ Describe 'Entry script' {
         $output | Should -Not -Match 'ignored with'
         Test-Path -LiteralPath (Join-Path $dir 'data') | Should -BeFalse
     }
-    It 'Report collects, reports and returns 2 when a server cannot be read' {
+    It 'Report with -Collect collects, reports and returns 2 when a server cannot be read' {
         $dir = Join-Path $TestDrive 'script'
         $cfg = New-TestConfig $dir
         $start = $script:Base.AddHours(-1); $end = $script:Base.AddHours(2)
         # -Start / -End alone: custom period (-Range Custom implied), never the default range.
-        $output = & pwsh -NoProfile -File (Join-Path $script:Root 'Invoke-ExchangeLogReport.ps1') -Start $start.ToString('o') -End $end.ToString('o') -ReportType Detailed -ConfigPath $cfg 2>&1 | Out-String
+        $output = & pwsh -NoProfile -File (Join-Path $script:Root 'Invoke-ExchangeLogReport.ps1') -Start $start.ToString('o') -End $end.ToString('o') -ReportType Detailed -Collect -ConfigPath $cfg 2>&1 | Out-String
         $LASTEXITCODE | Should -Be 2
         $output | Should -Match 'Report \W Detailed \W Custom'
         $zone = (Import-ExlConfiguration -Path $cfg -Root $script:Root).Zone
@@ -1226,6 +1227,444 @@ Describe 'Entry script' {
         { & $entry -Date 2026-09-28 -Month 2026-09 -ConfigPath $cfg } | Should -Throw -ErrorId 'AmbiguousParameterSet*'
         $syntax = (Get-Command $entry).ParameterSets
         ($syntax | Where-Object Name -eq 'Custom').Parameters | Where-Object Name -in 'Start', 'End' | ForEach-Object IsMandatory | Should -Be $true, $true
+    }
+}
+
+Describe 'Report and age of the data' {
+    BeforeAll {
+        $script:AgeDir = Join-Path $TestDrive 'age'
+        $script:AgeCfg = New-TestConfig $script:AgeDir
+        $script:AgeEntry = Join-Path $script:Root 'Invoke-ExchangeLogReport.ps1'
+        $script:AgeSettings = Import-ExlConfiguration -Path $script:AgeCfg -Root $script:Root
+        function Set-LastCollection([long]$EndedMs) {
+            $store = Open-ExlStore -Settings $script:AgeSettings
+            try { $store.Exec("UPDATE run SET ended_ms = $EndedMs, started_ms = MIN(started_ms, $EndedMs);") } finally { $store.Dispose() }
+        }
+    }
+    It 'stops with the next step when nothing has been collected yet' {
+        $output = & pwsh -NoProfile -File $script:AgeEntry -Range Last7Days -ConfigPath $script:AgeCfg 2>&1 | Out-String
+        $LASTEXITCODE | Should -Be 1
+        $output | Should -Match 'No collection in the database yet: run .*-Mode Collect.* first'
+        $output | Should -Not -Match 'Reading the new log lines'
+        Test-Path -LiteralPath (Join-Path $script:AgeDir 'data') | Should -BeFalse
+    }
+    It 'reads the database without collecting after a recent collection' {
+        $null = & pwsh -NoProfile -File $script:AgeEntry -Mode Collect -ConfigPath $script:AgeCfg 2>&1
+        $output = & pwsh -NoProfile -File $script:AgeEntry -Range Last7Days -ConfigPath $script:AgeCfg 2>&1 | Out-String
+        $LASTEXITCODE | Should -Be 0 -Because $output
+        $output | Should -Match 'Data\s+collected until .* ago\)'
+        $output | Should -Not -Match 'Reading the new log lines'
+        $output | Should -Match 'Report ready'
+    }
+    It 'reads the new log lines first when the last collection is older than MaxDataAgeMinutes' {
+        $now = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()
+        Set-LastCollection ($now - 3 * 3600000)
+        $output = & pwsh -NoProfile -File $script:AgeEntry -Range Last7Days -ConfigPath $script:AgeCfg 2>&1 | Out-String
+        $output | Should -Match 'more than 90 min \(Report.MaxDataAgeMinutes\): the new log lines are read first'
+        $output | Should -Match 'Reading the new log lines'
+        $output | Should -Match 'Report ready'
+    }
+    It 'does not collect for a period that ends before the last collection, nor with -NoCollect or MaxDataAgeMinutes = 0' {
+        $now = [DateTimeOffset]::UtcNow
+        Set-LastCollection ($now.AddHours(-3).ToUnixTimeMilliseconds())
+        $output = & pwsh -NoProfile -File $script:AgeEntry -Start $now.AddHours(-6).ToString('o') -End $now.AddHours(-4).ToString('o') -ConfigPath $script:AgeCfg 2>&1 | Out-String
+        $output | Should -Match 'the period is complete'
+        $output | Should -Not -Match 'Reading the new log lines'
+        $output = & pwsh -NoProfile -File $script:AgeEntry -Range Last7Days -NoCollect -ConfigPath $script:AgeCfg 2>&1 | Out-String
+        $output | Should -Match '-NoCollect'
+        $output | Should -Not -Match 'Reading the new log lines'
+        $never = Join-Path $script:AgeDir 'never.config.psd1'
+        [IO.File]::WriteAllText($never, [IO.File]::ReadAllText($script:AgeCfg).Replace('MaxDataAgeMinutes     = 90', 'MaxDataAgeMinutes     = 0'), [Text.UTF8Encoding]::new($true))
+        $output = & pwsh -NoProfile -File $script:AgeEntry -Range Last7Days -ConfigPath $never 2>&1 | Out-String
+        $output | Should -Match 'add -Collect to read the new log lines first'
+        $output | Should -Not -Match 'Reading the new log lines'
+    }
+    It 'collects with -Collect whatever the age, refuses -Collect with -NoCollect, and never waits for a running collection' {
+        $output = & pwsh -NoProfile -File $script:AgeEntry -Range Last7Days -Collect -ConfigPath $script:AgeCfg 2>&1 | Out-String
+        $output | Should -Match '-Collect: the new log lines are read first'
+        $output | Should -Match 'Reading the new log lines'
+        $output = & pwsh -NoProfile -File $script:AgeEntry -Range Last7Days -Collect -NoCollect -ConfigPath $script:AgeCfg 2>&1 | Out-String
+        $LASTEXITCODE | Should -Be 1
+        $output | Should -Match '-Collect and -NoCollect cannot be used together'
+        # Old data and a collection running (its lock is held): the report uses the data as it is.
+        Set-LastCollection ([DateTimeOffset]::UtcNow.AddHours(-3).ToUnixTimeMilliseconds())
+        $held = [IO.FileStream]::new($script:AgeSettings.Storage.DatabasePath + '.lock', [IO.FileMode]::OpenOrCreate, [IO.FileAccess]::ReadWrite, [IO.FileShare]::Read)
+        try {
+            $output = & pwsh -NoProfile -File $script:AgeEntry -Range Last7Days -ConfigPath $script:AgeCfg 2>&1 | Out-String
+        }
+        finally { $held.Dispose() }
+        $output | Should -Match 'a collection is running .*: the report uses the data already collected'
+        $output | Should -Not -Match 'Reading the new log lines'
+        $output | Should -Match 'Report ready'
+    }
+}
+Describe 'Parallel collection' {
+    It 'gives the same data with one thread, with several threads, one file per server, and the client sessions evicted from memory' {
+        $counts = foreach ($run in @(@{ Threads = 1; Evict = 20000; PerServer = 4 }, @{ Threads = 6; Evict = 20000; PerServer = 4 }, @{ Threads = 6; Evict = 1; PerServer = 1 })) {
+            $threads = $run.Threads
+            $dir = Join-Path $TestDrive "parallel$threads-$($run.Evict)"
+            $s = Import-ExlConfiguration -Path (New-TestConfig $dir @{ 'PopImap         = $false' = 'PopImap         = $true'; 'Parallelism            = 0' = "Parallelism            = $threads"; 'MaxFilesPerServer      = 4' = "MaxFilesPerServer      = $($run.PerServer)" }) -Root $script:Root
+            $s.Collection.Parallelism | Should -Be $threads
+            $s.Collection.MaxFilesPerServer | Should -Be $run.PerServer
+            [ExchangeLogReport.Collector]::EvictAboveKeys = $run.Evict
+            try { $r = Invoke-TestCollection $s } finally { [ExchangeLogReport.Collector]::EvictAboveKeys = 20000 }
+            $r.Statistics | Should -Match "$threads parse thread"
+            if ($run.PerServer -eq 1) { $r.Statistics | Should -Match 'at most 1 file\(s\) of one server' }
+            (Query $s "SELECT (SELECT COUNT(*) FROM access_usage), (SELECT SUM(requests) FROM access_usage), (SELECT COUNT(*) FROM access_event), (SELECT COUNT(*) FROM access_event WHERE recovered_ms IS NOT NULL),
+                (SELECT COUNT(*) FROM client_session), (SELECT SUM(requests) FROM client_session), (SELECT COUNT(*) FROM smtp_transaction), (SELECT COUNT(*) FROM message_event),
+                (SELECT COUNT(*) FROM access_client), (SELECT COUNT(*) FROM access_action), (SELECT SUM(lines) FROM noise)")[0] -join ','
+        }
+        $counts[0] | Should -Be $counts[1]
+        $counts[0] | Should -Be $counts[2]
+    }
+    It 'refuses a number of threads out of range' {
+        $dir = Join-Path $TestDrive 'parallelbad'
+        { Import-ExlConfiguration -Path (New-TestConfig $dir @{ 'Parallelism            = 0' = 'Parallelism            = 99' }) -Root $script:Root } | Should -Throw '*Collection.Parallelism must be a whole number between 0 and 64*'
+    }
+}
+
+Describe 'E-mail' {
+    BeforeAll {
+        if (-not ('ElrTest.FakeSmtp' -as [type])) {
+            Add-Type -IgnoreWarnings -WarningAction SilentlyContinue -TypeDefinition @'
+using System;
+using System.Collections.Generic;
+using System.IO;
+using System.Net;
+using System.Net.Security;
+using System.Net.Sockets;
+using System.Security.Cryptography.X509Certificates;
+using System.Text;
+using System.Threading;
+
+namespace ElrTest
+{
+    /// <summary>A minimal SMTP server for the tests: EHLO, STARTTLS or implicit TLS, AUTH LOGIN / PLAIN, MAIL, RCPT, DATA, QUIT.</summary>
+    public sealed class FakeSmtp : IDisposable
+    {
+        readonly TcpListener _listener = new TcpListener(IPAddress.Loopback, 0);
+        readonly Thread _thread;
+        public int Port;
+        public X509Certificate2 Certificate;
+        public bool OfferStartTls, ImplicitTls, OfferLogin = true, OfferPlain = true;
+        public string User, Password, RefuseRecipient;
+        public string AuthUser, AuthPassword, Mechanism, From;
+        public bool UsedTls;
+        public List<string> Commands = new List<string>(), Recipients = new List<string>(), Messages = new List<string>();
+
+        public FakeSmtp()
+        {
+            _listener.Start();
+            Port = ((IPEndPoint)_listener.LocalEndpoint).Port;
+            _thread = new Thread(Loop) { IsBackground = true };
+            _thread.Start();
+        }
+
+        void Loop()
+        {
+            while (true)
+            {
+                TcpClient client;
+                try { client = _listener.AcceptTcpClient(); } catch { return; }
+                try { using (client) Serve(client.GetStream()); } catch { }
+            }
+        }
+
+        Stream _s;
+        string Line()
+        {
+            var b = new List<byte>();
+            while (true) { int x = _s.ReadByte(); if (x < 0) return null; if (x == '\n') break; if (x != '\r') b.Add((byte)x); }
+            return Encoding.ASCII.GetString(b.ToArray());
+        }
+        void Send(string l) { var b = Encoding.ASCII.GetBytes(l + "\r\n"); _s.Write(b, 0, b.Length); _s.Flush(); }
+        bool _tls;
+        void Secure() { var ssl = new SslStream(_s, false); ssl.AuthenticateAsServer(Certificate, false, false); _s = ssl; UsedTls = true; _tls = true; }
+
+        void Serve(Stream stream)
+        {
+            _s = stream;
+            _tls = false;
+            if (ImplicitTls) Secure();
+            Send("220 fake.test ESMTP ready");
+            while (true)
+            {
+                string l = Line();
+                if (l == null) return;
+                lock (Commands) Commands.Add(l.StartsWith("AUTH PLAIN ") ? "AUTH PLAIN ***" : l);
+                string u = l.ToUpperInvariant();
+                if (u.StartsWith("EHLO"))
+                {
+                    Send("250-fake.test Hello");
+                    Send("250-SIZE 10000000");
+                    if (OfferStartTls && !_tls) Send("250-STARTTLS");
+                    var auth = new List<string>();
+                    if (OfferLogin) auth.Add("LOGIN");
+                    if (OfferPlain) auth.Add("PLAIN");
+                    if (auth.Count > 0) Send("250-AUTH " + string.Join(" ", auth));
+                    Send("250 8BITMIME");
+                }
+                else if (u == "STARTTLS") { Send("220 2.0.0 ready for TLS"); Secure(); }
+                else if (u == "AUTH LOGIN")
+                {
+                    Mechanism = "LOGIN";
+                    Send("334 VXNlcm5hbWU6"); AuthUser = Encoding.UTF8.GetString(Convert.FromBase64String(Line()));
+                    Send("334 UGFzc3dvcmQ6"); AuthPassword = Encoding.UTF8.GetString(Convert.FromBase64String(Line()));
+                    Send(AuthUser == User && AuthPassword == Password ? "235 2.7.0 Authentication successful" : "535 5.7.3 Authentication unsuccessful");
+                }
+                else if (u.StartsWith("AUTH PLAIN "))
+                {
+                    Mechanism = "PLAIN";
+                    var parts = Encoding.UTF8.GetString(Convert.FromBase64String(l.Substring(11))).Split('\0');
+                    AuthUser = parts[1]; AuthPassword = parts[2];
+                    Send(AuthUser == User && AuthPassword == Password ? "235 2.7.0 Authentication successful" : "535 5.7.3 Authentication unsuccessful");
+                }
+                else if (u.StartsWith("MAIL FROM:")) { From = l.Substring(10); Send("250 2.1.0 Sender OK"); }
+                else if (u.StartsWith("RCPT TO:"))
+                {
+                    string r = l.Substring(8).Trim('<', '>', ' ');
+                    if (RefuseRecipient != null && r == RefuseRecipient) Send("550 5.1.10 RESOLVER.ADR.RecipientNotFound; Recipient not found");
+                    else { Recipients.Add(r); Send("250 2.1.5 Recipient OK"); }
+                }
+                else if (u == "DATA")
+                {
+                    Send("354 Start mail input; end with <CRLF>.<CRLF>");
+                    var sb = new StringBuilder();
+                    string d;
+                    while ((d = Line()) != null && d != ".") sb.Append(d.StartsWith("..") ? d.Substring(1) : d).Append("\r\n");
+                    lock (Messages) Messages.Add(sb.ToString());
+                    Send("250 2.6.0 <fake-1@fake.test> [InternalId=1] Queued mail for delivery");
+                }
+                else if (u == "QUIT") { Send("221 2.0.0 Bye"); return; }
+                else Send("500 5.3.3 Unrecognized command");
+            }
+        }
+
+        public void Dispose() { try { _listener.Stop(); } catch { } }
+
+        /// <summary>Self-signed certificate of the server (exportable key, as SslStream needs on Windows).</summary>
+        public static X509Certificate2 NewCertificate(string name)
+        {
+            using (var rsa = System.Security.Cryptography.RSA.Create(2048))
+            {
+                var req = new System.Security.Cryptography.X509Certificates.CertificateRequest("CN=" + name, rsa, System.Security.Cryptography.HashAlgorithmName.SHA256, System.Security.Cryptography.RSASignaturePadding.Pkcs1);
+                var san = new SubjectAlternativeNameBuilder(); san.AddDnsName(name); req.CertificateExtensions.Add(san.Build());
+                using (var c = req.CreateSelfSigned(DateTimeOffset.UtcNow.AddDays(-1), DateTimeOffset.UtcNow.AddDays(30)))
+                    return new X509Certificate2(c.Export(X509ContentType.Pfx, "t"), "t", X509KeyStorageFlags.Exportable);
+            }
+        }
+    }
+}
+'@
+        }
+        $script:Cert = [ElrTest.FakeSmtp]::NewCertificate('localhost')
+        function New-MailSettings([int]$Port, [string]$Encryption = 'None', [string]$Authentication = 'Anonymous', [string]$User, [string]$Password, [string]$Thumbprint) {
+            $m = [ExchangeLogReport.MailSettings]::new()
+            $m.Server = 'localhost'; $m.Port = $Port; $m.Encryption = $Encryption; $m.Authentication = $Authentication; $m.UserName = $User; $m.Password = $Password
+            $m.CertificateThumbprint = $Thumbprint; $m.From = 'elr@contoso.test'; $m.To = [string[]]@('team@contoso.test'); $m.Cc = [string[]]@('boss@contoso.test'); $m.TimeoutSeconds = 10
+            return $m
+        }
+        function New-Content([string]$Subject = 'Test') {
+            $c = [ExchangeLogReport.MailContent]::new(); $c.Subject = $Subject; $c.Text = "line 1`r`n.line starting with a dot"; $c.Html = '<p>html</p>'
+            return $c
+        }
+        function Set-MailBlock([string]$Text, [string]$Values) {
+            # The Mail section of a configuration replaced by these values.
+            return [regex]::Replace($Text, '(?ms)^    Mail = @\{.*?^    \}', ('    Mail = @{ ' + $Values.Replace('$', '$$') + ' }'))
+        }
+        function Get-Part([string]$Message, [string]$ContentType) {
+            # Decoded body of the first MIME part of this type.
+            $m = [regex]::Match($Message, "Content-Type: $([regex]::Escape($ContentType))[^\r\n]*\r\n(?:[^\r\n]+\r\n)*\r\n([A-Za-z0-9+/=\r\n]+?)\r\n--")
+            if (-not $m.Success) { return $null }
+            return [Convert]::FromBase64String(($m.Groups[1].Value -replace '\s', ''))
+        }
+    }
+
+    It 'loads a configuration without Mail section, and checks every Mail value' {
+        $s = Import-ExlConfiguration -Path (Join-Path $script:Root 'config\ExchangeLogReport.config.psd1') -Root $script:Root
+        $s.Mail.Enabled | Should -BeFalse
+        $s.Mail.Port | Should -Be 25
+        $dir = Join-Path $TestDrive 'mailcfg'
+        $cfg = New-TestConfig $dir
+        $text = [IO.File]::ReadAllText($cfg)
+        $bad = Set-MailBlock $text "Enabled = `$true; Encryption = 'None'; Authentication = 'Basic'; From = 'Report <elr@contoso.test>'; To = @('team@contoso.test', 'not an address'); Colour = 'red'"
+        [IO.File]::WriteAllText($cfg, $bad)
+        $err = $null
+        try { Import-ExlConfiguration -Path $cfg -Root $script:Root } catch { $err = $_.Exception.Message }
+        $err | Should -Match 'Mail.Colour is not a known setting'
+        $err | Should -Match "Mail.Authentication = 'Basic' sends a password: it needs Mail.Encryption = 'StartTls' or 'Tls'"
+        $err | Should -Match "'Report <elr@contoso.test>' is not an e-mail address"
+        $err | Should -Match "'not an address' is not an e-mail address"
+        $err | Should -Match 'Mail.Enabled is \$true but Mail.SmtpServer is not set'
+        [IO.File]::WriteAllText($cfg, (Set-MailBlock $text "SmtpServer = 'smtp.contoso.test'; Encryption = 'Tls'; From = 'elr@contoso.test'; To = @('team@contoso.test')"))
+        $ok = Import-ExlConfiguration -Path $cfg -Root $script:Root
+        $ok.Mail.Port | Should -Be 465
+        $ok.Mail.Subject | Should -Be '{Title} - {Type} report - {Period}'
+    }
+
+    It 'sends anonymously in clear: MIME message with text, HTML, attachment and dot-stuffing' {
+        $server = [ElrTest.FakeSmtp]::new()
+        try {
+            $content = New-Content 'Rapport Exchange – septembre'
+            $a = [ExchangeLogReport.MailAttachment]::new(); $a.Name = 'rapport été.zip'; $a.ContentType = 'application/zip'; $a.Content = [byte[]](1..200)
+            $content.Attachments.Add($a)
+            $r = [ExchangeLogReport.SmtpSender]::Send((New-MailSettings $server.Port), $content)
+            $r.Sent | Should -BeTrue -Because $r.Error
+            $r.AuthenticationUsed | Should -Be 'Anonymous'
+            $r.Tls | Should -BeNullOrEmpty
+            $server.Recipients | Should -Be @('team@contoso.test', 'boss@contoso.test')
+            $message = $server.Messages[0]
+            $message | Should -Match 'Subject: =\?utf-8\?B\?'
+            $message | Should -Match 'filename\*=utf-8''''rapport%20%C3%A9t%C3%A9\.zip'
+            [Text.Encoding]::UTF8.GetString((Get-Part $message 'text/plain')) | Should -Be "line 1`r`n.line starting with a dot"
+            [Text.Encoding]::UTF8.GetString((Get-Part $message 'text/html')) | Should -Be '<p>html</p>'
+            (Get-Part $message 'application/zip') | Should -Be ([byte[]](1..200))
+            $server.Commands | Should -Contain 'QUIT'
+        } finally { $server.Dispose() }
+    }
+
+    It 'uses STARTTLS and Basic authentication (AUTH LOGIN), the certificate pinned by its thumbprint' {
+        $server = [ElrTest.FakeSmtp]::new(); $server.Certificate = $script:Cert; $server.OfferStartTls = $true; $server.User = 'CONTOSO\svc-smtp'; $server.Password = 'P@ss w0rd!'
+        try {
+            $r = [ExchangeLogReport.SmtpSender]::Send((New-MailSettings $server.Port 'StartTls' 'Basic' 'CONTOSO\svc-smtp' 'P@ss w0rd!' $script:Cert.Thumbprint), (New-Content))
+            $r.Sent | Should -BeTrue -Because $r.Error
+            $server.UsedTls | Should -BeTrue
+            $server.Mechanism | Should -Be 'LOGIN'
+            $r.Tls | Should -Match '^TLS 1\.[23], '
+            $r.AuthenticationUsed | Should -Be 'Basic (AUTH LOGIN, CONTOSO\svc-smtp)'
+            $r.Certificate | Should -Match ([regex]::Escape($script:Cert.Thumbprint))
+            ($r.Transcript -join "`n") | Should -Not -Match ([regex]::Escape([Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes('P@ss w0rd!'))))
+            ($r.Transcript -join "`n") | Should -Match '\(password\)'
+        } finally { $server.Dispose() }
+    }
+
+    It 'uses TLS from the first byte (SMTPS) and AUTH PLAIN when LOGIN is not offered' {
+        $server = [ElrTest.FakeSmtp]::new(); $server.Certificate = $script:Cert; $server.ImplicitTls = $true; $server.OfferLogin = $false; $server.User = 'relay@contoso.test'; $server.Password = 'secret'
+        try {
+            $r = [ExchangeLogReport.SmtpSender]::Send((New-MailSettings $server.Port 'Tls' 'Basic' 'relay@contoso.test' 'secret' $script:Cert.Thumbprint), (New-Content))
+            $r.Sent | Should -BeTrue -Because $r.Error
+            $server.Mechanism | Should -Be 'PLAIN'
+            $server.AuthPassword | Should -Be 'secret'
+        } finally { $server.Dispose() }
+    }
+
+    It 'never sends in clear when STARTTLS is required, and refuses an untrusted certificate' {
+        $server = [ElrTest.FakeSmtp]::new()
+        try {
+            $r = [ExchangeLogReport.SmtpSender]::Send((New-MailSettings $server.Port 'StartTls'), (New-Content))
+            $r.Sent | Should -BeFalse
+            $r.Error | Should -Match 'does not offer STARTTLS'
+            @($server.Commands | Where-Object { $_ -like 'MAIL FROM*' }).Count | Should -Be 0
+        } finally { $server.Dispose() }
+        $server = [ElrTest.FakeSmtp]::new(); $server.Certificate = $script:Cert; $server.OfferStartTls = $true
+        try {
+            $r = [ExchangeLogReport.SmtpSender]::Send((New-MailSettings $server.Port 'StartTls'), (New-Content))
+            $r.Sent | Should -BeFalse
+            $r.Error | Should -Match 'certificate of the server is not trusted'
+            $r = [ExchangeLogReport.SmtpSender]::Send((New-MailSettings $server.Port 'StartTls' -Thumbprint ('0' * 40)), (New-Content))
+            $r.Error | Should -Match 'not the one of Mail.CertificateThumbprint'
+        } finally { $server.Dispose() }
+    }
+
+    It 'explains a wrong password, a server without Kerberos and a refused recipient' {
+        $server = [ElrTest.FakeSmtp]::new(); $server.Certificate = $script:Cert; $server.OfferStartTls = $true; $server.User = 'u'; $server.Password = 'right'; $server.RefuseRecipient = 'boss@contoso.test'
+        try {
+            $r = [ExchangeLogReport.SmtpSender]::Send((New-MailSettings $server.Port 'StartTls' 'Basic' 'u' 'wrong' $script:Cert.Thumbprint), (New-Content))
+            $r.Sent | Should -BeFalse
+            $r.Error | Should -Match '535 5.7.3'
+            $r = [ExchangeLogReport.SmtpSender]::Send((New-MailSettings $server.Port 'StartTls' 'Kerberos' -Thumbprint $script:Cert.Thumbprint), (New-Content))
+            $r.Error | Should -Match 'does not offer Kerberos \(AUTH GSSAPI\); it offers LOGIN, PLAIN'
+            $r = [ExchangeLogReport.SmtpSender]::Send((New-MailSettings $server.Port 'StartTls' 'Basic' 'u' 'right' $script:Cert.Thumbprint), (New-Content))
+            $r.Sent | Should -BeTrue
+            $r.Refused | Should -Match '^boss@contoso.test: 550 5.1.10'
+        } finally { $server.Dispose() }
+    }
+
+    It 'keeps the password of the SMTP account protected by DPAPI, readable by this account only' {
+        $dir = Join-Path $TestDrive 'mailcred'
+        $s = Import-ExlConfiguration -Path (New-TestConfig $dir) -Root $script:Root
+        $s.Mail.CredentialFile = Join-Path $dir 'mail.credential'
+        $credential = [pscredential]::new('CONTOSO\svc-smtp', (ConvertTo-SecureString 'Sup3r-secret' -AsPlainText -Force))
+        Save-ExlMailCredential -Settings $s -Credential $credential
+        $raw = Get-Content -LiteralPath $s.Mail.CredentialFile -Raw
+        $raw | Should -Not -Match 'Sup3r-secret'
+        ($raw | ConvertFrom-Json).UserName | Should -Be 'CONTOSO\svc-smtp'
+        $back = & (Get-Module ExchangeLogReport) { param($x) Read-ExlMailCredential -Settings $x } $s
+        $back.Password | Should -Be 'Sup3r-secret'
+        (Get-Acl -LiteralPath $s.Mail.CredentialFile).AreAccessRulesProtected | Should -BeTrue
+        $s.Mail.Authentication = 'Basic'; $s.Mail.Encryption = 'StartTls'
+        $smtp = & (Get-Module ExchangeLogReport) { param($x) New-ExlMailSettings -Settings $x } $s
+        $smtp.UserName | Should -Be 'CONTOSO\svc-smtp'
+    }
+
+    It 'lists the main problems of a Detailed report in the body, and the kinds without any' {
+        $report = [ExchangeLogReport.ReportResult]::new(); $report.Folder = $TestDrive; $report.Title = 'Exchange Log Report'
+        $users = [ExchangeLogReport.ReportHighlight]::new(); $users.Title = 'Users with unresolved failures'; $users.Hint = 'h'; $users.Columns = [string[]]@('User', 'Unresolved'); $users.Total = 12
+        foreach ($i in 1..10) { $users.Rows.Add([string[]]@("contoso\user$i", '1')) }
+        $smtp = [ExchangeLogReport.ReportHighlight]::new(); $smtp.Title = 'SMTP clients with refused or deferred mail'; $smtp.Hint = 'h'; $smtp.Columns = [string[]]@('Client'); $smtp.Total = 0
+        $report.Highlights.Add($users); $report.Highlights.Add($smtp)
+        $mail = [ExchangeLogReport.ReportMail]::Build($report, 's', 'Exchange Log Report', 'p', 'Detailed', 'PC1', 'None', 1MB)
+        $mail.Html | Should -Match 'Users with unresolved failures \(12, first 10\)'
+        $mail.Html | Should -Match 'contoso\\user10'
+        $mail.Html | Should -Match 'None in this period: smtp clients with refused or deferred mail'
+        $mail.Text | Should -Match 'MAIN PROBLEMS'
+        # A Usage report has no highlights: no section.
+        $usage = [ExchangeLogReport.ReportMail]::Build([ExchangeLogReport.ReportResult]@{ Folder = $TestDrive; Title = 't' }, 's', 't', 'p', 'Usage', 'PC1', 'None', 1MB)
+        $usage.Html | Should -Not -Match 'Main problems'
+    }
+    It 'leaves out a report larger than MaxAttachmentMB, and says where it is' {
+        $folder = Join-Path $TestDrive 'bigreport'
+        [void][IO.Directory]::CreateDirectory($folder)
+        $htmlPath = Join-Path $folder 'ExchangeLogs.html'
+        $random = [byte[]]::new(300000); [Random]::new(1).NextBytes($random)
+        [IO.File]::WriteAllBytes($htmlPath, $random)
+        $report = [ExchangeLogReport.ReportResult]::new(); $report.Folder = $folder; $report.HtmlPath = $htmlPath; $report.Title = 'Exchange Log Report'
+        $small = [ExchangeLogReport.ReportMail]::Build($report, 's', 'Exchange Log Report', 'p', 'Usage', 'PC1', 'Html', 1MB)
+        $small.Attachments.Count | Should -Be 1
+        $small.Attachments[0].Name | Should -Be 'ExchangeLogs.html'
+        $small.OmittedBytes | Should -Be 0
+        $big = [ExchangeLogReport.ReportMail]::Build($report, 's', 'Exchange Log Report', 'p', 'Usage', 'PC1', 'Html', 100000)
+        $big.Attachments.Count | Should -Be 0
+        $big.OmittedBytes | Should -BeGreaterThan 100000
+        $big.Html | Should -Match 'larger than Mail.MaxAttachmentMB'
+        $big.Text | Should -Match ([regex]::Escape($folder))
+    }
+    It 'sends the report with its summary (-SendMail), and tests the settings (-Mode MailTest)' {
+        $server = [ElrTest.FakeSmtp]::new()
+        try {
+            $dir = Join-Path $TestDrive 'mailreport'
+            $cfg = New-TestConfig $dir
+            $text = Set-MailBlock ([IO.File]::ReadAllText($cfg)) "SmtpServer = 'localhost'; Port = $($server.Port); Encryption = 'None'; From = 'elr@contoso.test'; To = @('team@contoso.test'); Attach = 'Zip'"
+            [IO.File]::WriteAllText($cfg, $text)
+            $entry = Join-Path $script:Root 'Invoke-ExchangeLogReport.ps1'
+            $output = & pwsh -NoProfile -File $entry -Mode MailTest -ConfigPath $cfg 2>&1 | Out-String
+            $LASTEXITCODE | Should -Be 0 -Because $output
+            $output | Should -Match 'Test message sent'
+            $output | Should -Match 'S: 250 2.6.0'
+            $output = & pwsh -NoProfile -File $entry -Range Last24Hours -ReportType Detailed -Collect -SendMail -ConfigPath $cfg 2>&1 | Out-String
+            $output | Should -Match 'Sending the report by e-mail'
+            $output | Should -Match 'Sent to team@contoso.test'
+            $output | Should -Match 'ExchangeLogs_Detailed_\S+\.zip \(.+\) attached'
+            $server.Messages.Count | Should -Be 2
+            $message = $server.Messages[1]
+            $html = [Text.Encoding]::UTF8.GetString((Get-Part $message 'text/html'))
+            $html | Should -Match 'Detailed report'
+            $html | Should -Match 'EXCH01'
+            # Detailed: the main problems of the period in the body (top 10 per kind), or the kinds without any.
+            $html | Should -Match 'Main problems'
+            $html | Should -Match 'Users with unresolved failures \(|None in this period: users with unresolved failures'
+            $html | Should -Match 'Client sessions that failed \(|client sessions that failed'
+            $zip = Get-Part $message 'application/zip'
+            $zip.Length | Should -BeGreaterThan 1000
+            $ms = [IO.MemoryStream]::new($zip); $archive = [IO.Compression.ZipArchive]::new($ms)
+            ($archive.Entries.Name -join ',') | Should -Match 'ExchangeLogs-Servers\.csv'
+            $archive.Dispose()
+            # -SendMail:$false wins over Mail.Enabled.
+            [IO.File]::WriteAllText($cfg, $text.Replace("Attach = 'Zip' }", "Attach = 'Zip'; Enabled = `$true }"))
+            $output = & pwsh -NoProfile -File $entry -Range Last24Hours -NoCollect -SendMail:$false -ConfigPath $cfg 2>&1 | Out-String
+            $output | Should -Not -Match 'Sending the report by e-mail'
+            $server.Messages.Count | Should -Be 2
+        } finally { $server.Dispose() }
     }
 }
 

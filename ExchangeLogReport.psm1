@@ -21,13 +21,13 @@
 
 .NOTES
     Author  : Nicolas Fabert
-    Version : 1.6.1
+    Version : 2.0.0
     History : see CHANGELOG.md
 #>
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
-$script:ToolVersion = '1.6.1'
+$script:ToolVersion = '2.0.0'
 $script:ToolRoot = $PSScriptRoot
 $script:LogWriter = $null
 $script:LogPath = $null
@@ -38,6 +38,9 @@ $script:ServerPathKeys = @('HttpProxyPath', 'MapiHttpPath', 'ImapLogPath', 'PopL
     'FrontEndReceivePath', 'FrontEndSendPath', 'HubReceivePath', 'HubSendPath', 'MailboxReceivePath', 'MailboxSendPath',
     'EdgeReceivePath', 'EdgeSendPath', 'MessageTrackingPath')
 $script:PathsFileName = 'ExchangeLogReport.paths.psd1'
+# Entropy of the DPAPI protection of the mail password (Mail.CredentialFile).
+$script:MailEntropy = [Text.Encoding]::UTF8.GetBytes('Exchange Log Report - mail credential')
+Add-Type -AssemblyName System.Security.Cryptography.ProtectedData -ErrorAction SilentlyContinue
 # Role of a server (Servers block, -Mode Discover or detected at collection time). An Edge Transport server has
 # no client access (no IIS, HttpProxy, MAPI, ActiveSync, POP3 or IMAP4): only its SMTP protocol logs
 # (TransportRoles\Logs\Edge\ProtocolLog) and its message tracking are read.
@@ -229,6 +232,13 @@ function Write-ExlItem {
     Write-ExlLog $level $Text
 }
 
+function Write-ExlDetail {
+    <# A dimmed detail line under an item (an SMTP conversation for instance), also written to the log. #>
+    param([Parameter(Mandatory)][AllowEmptyString()][string]$Text)
+    Write-Host ("          {0}{1}{2}" -f $script:C.Dim, $Text, $script:C.Reset)
+    Write-ExlLog 'INFO' $Text
+}
+
 function Write-ExlTableRow {
     <# One aligned row of the collection table: server, source, files, read, lines, kept, noise, duration, rate. #>
     param([switch]$Header, [ValidateSet('Ok', 'Warn', 'Fail', 'Skip')][string]$Status = 'Ok', [string]$Server, [string]$Source, [string]$Files,
@@ -386,6 +396,8 @@ function Import-ExlConfiguration {
             SessionDetailRequests  = Test-Int (Get-Value $c 'Collection' 'SessionDetailRequests' 40) 'Collection.SessionDetailRequests' 0 100000
             MaxSessionSteps        = Test-Int (Get-Value $c 'Collection' 'MaxSessionSteps' 80) 'Collection.MaxSessionSteps' 10 100000
             StaleSourceHours       = Test-Int (Get-Value $c 'Collection' 'StaleSourceHours' 24) 'Collection.StaleSourceHours' 0 8760
+            Parallelism            = Test-Int (Get-Value $c 'Collection' 'Parallelism' 0) 'Collection.Parallelism' 0 64
+            MaxFilesPerServer      = Test-Int (Get-Value $c 'Collection' 'MaxFilesPerServer' 4) 'Collection.MaxFilesPerServer' 0 64
         }
         Storage    = [ordered]@{
             DatabasePath        = Resolve-ExlPath ([string](Get-Value $st 'Storage' 'DatabasePath' '.\data\ExchangeLogReport.sqlite')) $Root
@@ -403,6 +415,7 @@ function Import-ExlConfiguration {
             IncludeSessionDetails = Test-Bool (Get-Value $r 'Report' 'IncludeSessionDetails' $true) 'Report.IncludeSessionDetails'
             CsvDelimiter          = [string](Get-Value $r 'Report' 'CsvDelimiter' ';')
             MaxHtmlRows           = Test-Int (Get-Value $r 'Report' 'MaxHtmlRows' 200000) 'Report.MaxHtmlRows' 1000 2000000
+            MaxDataAgeMinutes     = Test-Int (Get-Value $r 'Report' 'MaxDataAgeMinutes' 90) 'Report.MaxDataAgeMinutes' 0 525600
             Title                 = [string](Get-Value $r 'Report' 'Title' $script:DefaultReportTitle)
             TemplatePath          = Join-Path $Root 'templates\Report.template.html'
         }
@@ -411,6 +424,45 @@ function Import-ExlConfiguration {
             RetentionDays = Test-Int (Get-Value $l 'Logging' 'RetentionDays' 14) 'Logging.RetentionDays' 1 3650
         }
     }
+    # ---- e-mail (optional section) ------------------------------------------------------------------------
+    $ml = if ($config.ContainsKey('Mail') -and $config.Mail -is [hashtable]) { $config.Mail } else { @{} }
+    if ($config.ContainsKey('Mail') -and $config.Mail -isnot [hashtable]) { $errors.Add('Mail must be a @{ } block.') }
+    $mail = [ordered]@{
+        Enabled               = Test-Bool (Get-Value $ml 'Mail' 'Enabled' $false) 'Mail.Enabled'
+        SmtpServer            = ([string](Get-Value $ml 'Mail' 'SmtpServer' '')).Trim()
+        Port                  = Test-Int (Get-Value $ml 'Mail' 'Port' 0) 'Mail.Port' 0 65535
+        Encryption            = [string](Get-Value $ml 'Mail' 'Encryption' 'StartTls')
+        Authentication        = [string](Get-Value $ml 'Mail' 'Authentication' 'Anonymous')
+        CredentialFile        = Resolve-ExlPath ([string](Get-Value $ml 'Mail' 'CredentialFile' '.\config\ExchangeLogReport.mail.credential')) $Root
+        CredentialScope       = [string](Get-Value $ml 'Mail' 'CredentialScope' 'User')
+        TargetName            = ([string](Get-Value $ml 'Mail' 'TargetName' '')).Trim()
+        CertificateThumbprint = ([string](Get-Value $ml 'Mail' 'CertificateThumbprint' '')).Replace(' ', '').ToUpperInvariant()
+        HeloName              = ([string](Get-Value $ml 'Mail' 'HeloName' '')).Trim()
+        From                  = ([string](Get-Value $ml 'Mail' 'From' '')).Trim()
+        FromName              = [string](Get-Value $ml 'Mail' 'FromName' 'Exchange Log Report')
+        To                    = [string[]]@(Get-Value $ml 'Mail' 'To' @() | Where-Object { $_ } | ForEach-Object { ([string]$_).Trim() })
+        Cc                    = [string[]]@(Get-Value $ml 'Mail' 'Cc' @() | Where-Object { $_ } | ForEach-Object { ([string]$_).Trim() })
+        Bcc                   = [string[]]@(Get-Value $ml 'Mail' 'Bcc' @() | Where-Object { $_ } | ForEach-Object { ([string]$_).Trim() })
+        Subject               = [string](Get-Value $ml 'Mail' 'Subject' '{Title} - {Type} report - {Period}')
+        Attach                = [string](Get-Value $ml 'Mail' 'Attach' 'Html')
+        MaxAttachmentMB       = Test-Int (Get-Value $ml 'Mail' 'MaxAttachmentMB' 7) 'Mail.MaxAttachmentMB' 1 150
+        TimeoutSeconds        = Test-Int (Get-Value $ml 'Mail' 'TimeoutSeconds' 60) 'Mail.TimeoutSeconds' 5 600
+    }
+    foreach ($key in $ml.Keys) { if ($key -notin $mail.Keys) { $errors.Add("Mail.$key is not a known setting. Allowed: $($mail.Keys -join ', ').") } }
+    $enum = @{ Encryption = 'None', 'StartTls', 'Tls'; Authentication = 'Anonymous', 'Basic', 'Kerberos'; CredentialScope = 'User', 'Computer'; Attach = 'Html', 'Zip', 'None' }
+    foreach ($key in $enum.Keys) {
+        $match = @($enum[$key] | Where-Object { $_ -eq $mail[$key] }) | Select-Object -First 1
+        if ($match) { $mail[$key] = $match } else { $errors.Add("Mail.$key must be $($enum[$key] -join ', ') (current value: '$($mail[$key])').") }
+    }
+    if ($mail.Port -eq 0) { $mail.Port = if ($mail.Encryption -eq 'Tls') { 465 } else { 25 } }
+    if ($mail.Authentication -eq 'Basic' -and $mail.Encryption -eq 'None') { $errors.Add("Mail.Authentication = 'Basic' sends a password: it needs Mail.Encryption = 'StartTls' or 'Tls'.") }
+    if ($mail.CertificateThumbprint -and $mail.CertificateThumbprint -notmatch '^[0-9A-F]{40}$') { $errors.Add('Mail.CertificateThumbprint must be the 40 hexadecimal characters of the SHA-1 thumbprint of the certificate of the SMTP server.') }
+    if ($mail.SmtpServer -and $mail.SmtpServer -match '\s|/') { $errors.Add("Mail.SmtpServer must be a host name (current value: '$($mail.SmtpServer)').") }
+    foreach ($a in @(@($mail.From | Where-Object { $_ }) + $mail.To + $mail.Cc + $mail.Bcc)) {
+        try { $parsed = [Net.Mail.MailAddress]::new($a); if ($parsed.Address -ne $a) { throw 'display name' } } catch { $errors.Add("Mail: '$a' is not an e-mail address (write the address only, for example 'team@contoso.com').") }
+    }
+    if ($mail.Enabled) { foreach ($p in @(Test-ExlMailReady -Settings ([pscustomobject]@{ Mail = $mail }))) { $errors.Add("Mail.Enabled is `$true but $p") } }
+    $settings['Mail'] = $mail
     if ($settings.Storage.DetailRetentionDays -gt $settings.Storage.RetentionDays) { $errors.Add('Storage.DetailRetentionDays cannot be greater than Storage.RetentionDays.') }
     foreach ($role in $settings.Sources.TransportRoles) { if ($role -notin 'FrontEnd', 'Hub', 'Mailbox') { $errors.Add("Sources.TransportRoles accepts FrontEnd, Hub and Mailbox (current value: '$role').") } }
     if ($settings.Report.DefaultRange -notin 'Last24Hours', 'Last7Days', 'Last30Days', 'PreviousMonth') { $errors.Add('Report.DefaultRange must be Last24Hours, Last7Days, Last30Days or PreviousMonth.') }
@@ -543,10 +595,12 @@ function Initialize-ExlEngine {
     if (-not (Test-Path -LiteralPath $dll)) {
         [void][IO.Directory]::CreateDirectory($bin)
         $references = @(
-            (Join-Path $lib 'Microsoft.Data.Sqlite.dll'), 'System.IO.Compression', 'System.Text.Json', 'System.Text.Encodings.Web', 'System.Data.Common', 'System.Linq',
+            (Join-Path $lib 'Microsoft.Data.Sqlite.dll'), (Join-Path $lib 'SQLitePCLRaw.core.dll'), 'System.IO.Compression', 'System.Text.Json', 'System.Text.Encodings.Web', 'System.Data.Common', 'System.Linq',
             'System.Collections', 'System.Text.RegularExpressions', 'System.Runtime', 'System.Memory', 'System.ComponentModel.Primitives', 'System.ComponentModel',
             'System.Transactions.Local', 'System.Text.Encoding.Extensions', 'System.Runtime.Extensions', 'System.IO', 'System.Runtime.InteropServices', 'System.Console',
-            'System.Collections.NonGeneric', 'System.Diagnostics.Process', 'System.Linq.Expressions', 'netstandard')
+            'System.Collections.NonGeneric', 'System.Diagnostics.Process', 'System.Linq.Expressions', 'System.Collections.Concurrent', 'System.Threading',
+            'System.Threading.Thread', 'System.Threading.Tasks.Parallel', 'System.IO.FileSystem', 'System.Net.Primitives', 'System.Net.Security', 'System.Net.Sockets',
+            'System.Net.NetworkInformation', 'System.Security.Cryptography', 'System.Security.Cryptography.X509Certificates', 'Microsoft.Win32.Primitives', 'System.IO.Compression.ZipFile', 'netstandard')
         $staging = Join-Path $bin ("compile-{0}.dll" -f [guid]::NewGuid().ToString('N'))
         Add-Type -LiteralPath $sources.FullName -ReferencedAssemblies $references -OutputAssembly $staging -OutputType Library -IgnoreWarnings -WarningAction SilentlyContinue
         Move-Item -LiteralPath $staging -Destination $dll -Force
@@ -554,6 +608,47 @@ function Initialize-ExlEngine {
         Get-ChildItem -LiteralPath $bin -Filter 'compile-*.dll' | Remove-Item -Force -ErrorAction SilentlyContinue
     }
     if (-not ('ExchangeLogReport.Store' -as [type])) { Add-Type -LiteralPath $dll }
+}
+
+function Resolve-ExlReportCollection {
+    <#
+    .SYNOPSIS
+        Report mode: does the report read the new log lines first? The age of the data is the end of the last
+        collection recorded in the database (scheduled task or not, any account).
+          -Collect                                         yes (first collection: the last BackfillDays days)
+          no collection in the database (or no database)   no: the report stops, run -Mode Collect first
+          -NoCollect                                       no
+          the period ends before the last collection       no: the data of the period is complete
+          last collection younger than MaxDataAgeMinutes   no (an hourly scheduled collection keeps it fresh)
+          Report.MaxDataAgeMinutes = 0                     no, the age is shown
+          otherwise                                        yes: only the lines written since the last collection
+        Returns Collect, NoData, LastMs and Text (banner and log).
+    #>
+    param([Parameter(Mandatory)]$Settings, [Parameter(Mandatory)]$Period, [switch]$Collect, [switch]$NoCollect, [long]$NowMs = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds())
+    if ($Collect -and $NoCollect) { throw '-Collect and -NoCollect cannot be used together.' }
+    $last = $null
+    if (Test-Path -LiteralPath $Settings.Storage.DatabasePath) {
+        $store = Open-ExlStore -Settings $Settings -ReadOnly
+        try {
+            $v = $store.Query("SELECT MAX(ended_ms) FROM run WHERE status IN ('Completed', 'Incomplete');", $null).Rows[0][0]
+            if ($null -ne $v -and $v -isnot [DBNull]) { $last = [long]$v }
+        }
+        finally { $store.Dispose() }
+    }
+    $maxAge = [int]$Settings.Report.MaxDataAgeMinutes
+    $when = if ($null -ne $last) { 'collected until {0} ({1} ago)' -f (Format-ExlLocalTime $last $Settings.Zone), (Format-ExlDuration ([Math]::Max(0, $NowMs - $last) / 1000.0)) }
+    $r = [pscustomobject]@{ Collect = $false; NoData = $false; LastMs = $last; Text = $when }
+    if ($Collect) {
+        $r.Collect = $true
+        $r.Text = '-Collect: the new log lines are read first' + $(if ($null -ne $last) { " (last collection $(Format-ExlLocalTime $last $Settings.Zone))" } else { " (first collection: the last $($Settings.Collection.BackfillDays) days)" })
+    }
+    elseif ($null -eq $last) { $r.NoData = $true; $r.Text = 'no collection in the database yet' }
+    elseif ($NoCollect) { $r.Text = "$when $([char]0x00B7) -NoCollect" }
+    elseif ($Period.EndMs -le $last) { $r.Text = "$when $([char]0x00B7) the period is complete" }
+    elseif ($NowMs - $last -le [long]$maxAge * 60000) { }
+    elseif ($maxAge -eq 0) { $r.Text = "$when $([char]0x00B7) add -Collect to read the new log lines first" }
+    else { $r.Collect = $true; $r.Text = "$when, more than $maxAge min (Report.MaxDataAgeMinutes): the new log lines are read first" }
+    return $r
 }
 
 function Open-ExlStore {
@@ -574,21 +669,26 @@ function Get-ExlIgnoredParameter {
         a parameter is never ignored silently (the script shows these sentences as warnings).
           period      -Range -Month -Date -Start -End        -Mode Report only
           report      -ReportType -User -Include*Details      -Mode Report only
-                      -OutputPath -NoCollect
+                      -OutputPath -Collect -NoCollect
           servers     -Server                                 -Mode Report and Collect
-          discovery   -ConnectTo -Credential                  -Mode Discover only
+          discovery   -ConnectTo                              -Mode Discover only
+          credential  -Credential                             -Mode Discover and MailTest
+          mail        -SendMail                               -Mode Report only
     #>
-    param([Parameter(Mandatory)][ValidateSet('Report', 'Collect', 'Status', 'Discover')][string]$Mode, [string[]]$Name)
+    param([Parameter(Mandatory)][ValidateSet('Report', 'Collect', 'Status', 'Discover', 'MailTest')][string]$Mode, [string[]]$Name)
     $groups = @(
         @{ Names = 'Range', 'Month', 'Date', 'Start', 'End'; Modes = @('Report'); Why = @{
                 Collect  = 'a collection reads every new log line, whatever its date; the period only selects what the report shows (-Mode Report)'
                 Status   = '-Mode Status describes the whole database, whatever the period'
-                Discover = '-Mode Discover reads no log line, it only finds the log folders' } }
-        @{ Names = 'ReportType', 'User', 'IncludeRoutingDetails', 'IncludeSessionDetails', 'OutputPath', 'NoCollect'; Modes = @('Report'); Why = 'used by -Mode Report only' }
+                Discover = '-Mode Discover reads no log line, it only finds the log folders'
+                MailTest = '-Mode MailTest only sends a test message' } }
+        @{ Names = 'ReportType', 'User', 'IncludeRoutingDetails', 'IncludeSessionDetails', 'OutputPath', 'Collect', 'NoCollect', 'SendMail'; Modes = @('Report'); Why = 'used by -Mode Report only' }
         @{ Names = 'Server'; Modes = 'Report', 'Collect'; Why = @{
                 Status   = '-Mode Status describes the whole database'
-                Discover = '-Mode Discover reads the settings of every Exchange server' } }
-        @{ Names = 'ConnectTo', 'Credential'; Modes = @('Discover'); Why = 'used by -Mode Discover only' }
+                Discover = '-Mode Discover reads the settings of every Exchange server'
+                MailTest = '-Mode MailTest reads no log' } }
+        @{ Names = @('ConnectTo'); Modes = @('Discover'); Why = 'used by -Mode Discover only' }
+        @{ Names = @('Credential'); Modes = 'Discover', 'MailTest'; Why = 'used by -Mode Discover (remote PowerShell) and -Mode MailTest (account of the SMTP server) only' }
     )
     foreach ($g in $groups) {
         if ($Mode -in $g.Modes) { continue }
@@ -745,32 +845,6 @@ function Get-ExlSources {
     return $list.ToArray()
 }
 
-function Get-ExlSourceFiles {
-    <#
-    .SYNOPSIS
-        Files of one source that must be read: modified within BackfillDays and not read to their end
-        (read position different from the file size: new lines, or a session held back). Oldest first.
-        Known is keyed "kind|FileKey": a file already read through another path of the same server (its
-        administrative share before -Mode Discover, its local path after) is known.
-    #>
-    param([Parameter(Mandatory)]$Source, [Parameter(Mandatory)][hashtable]$Known, [Parameter(Mandatory)][datetime]$Since, [Parameter(Mandatory)][string]$Server)
-    $files = if ($Source.Recurse) { Get-ChildItem -LiteralPath $Source.Folder -Filter $Source.Filter -File -Recurse -ErrorAction SilentlyContinue }
-             else { Get-ChildItem -LiteralPath $Source.Folder -Filter $Source.Filter -File -ErrorAction SilentlyContinue }
-    $todo = [Collections.Generic.List[object]]::new()
-    $total = 0
-    $newest = [DateTime]::MinValue
-    foreach ($f in @($files)) {
-        $total++
-        if ($f.LastWriteTimeUtc -gt $newest) { $newest = $f.LastWriteTimeUtc }
-        $key = "$($Source.Kind)|$([ExchangeLogReport.Store]::FileKey($Server, $f.FullName))"
-        $isKnown = $Known.ContainsKey($key)
-        if (-not $isKnown -and $f.LastWriteTimeUtc -lt $Since) { continue }
-        if ($isKnown -and [long]$Known[$key] -eq $f.Length) { continue }
-        $todo.Add($f)
-    }
-    [pscustomobject]@{ Total = $total; Newest = $newest; Files = @($todo | Sort-Object LastWriteTimeUtc, Name) }
-}
-
 function Test-ExlStaleSource {
     <#
     .SYNOPSIS
@@ -884,82 +958,126 @@ function New-ExlCollector {
     $o.LongRunningPatterns = $Settings.Collection.LongRunningPatterns
     $o.SessionDetailRequests = $Settings.Collection.SessionDetailRequests
     $o.MaxSegmentSteps = $Settings.Collection.MaxSessionSteps
+    $o.Parallelism = $Settings.Collection.Parallelism
+    $o.MaxFilesPerServer = $Settings.Collection.MaxFilesPerServer
     return [ExchangeLogReport.Collector]::new($Store, $o)
 }
 
 function Invoke-ExlCollection {
     <#
     .SYNOPSIS
-        Reads the new part of the log files of every server into the database. One table row per
-        server and source; a progress bar per file. Returns the totals.
+        Reads the new part of the log files of every server into the database. The folders of every server are
+        listed in parallel, then the files are read by Collection.Parallelism threads at the same time (every
+        server and source together) and written by one thread in batched transactions. One table row per server
+        and source, printed when its last file is saved; a progress bar for the whole collection. Returns the totals.
     #>
     [CmdletBinding()]
     param([Parameter(Mandatory)]$Store, [Parameter(Mandatory)]$Settings, [Parameter(Mandatory)][long]$RunId, [object[]]$Servers)
     if (-not $Servers) { $Servers = $Settings.Servers }
     $collector = New-ExlCollector -Store $Store -Settings $Settings -RunId $RunId
     $since = [DateTime]::UtcNow.AddDays(-$Settings.Collection.BackfillDays)
-    $totals = [ordered]@{ Files = 0L; Bytes = 0L; Lines = 0L; Kept = 0L; Noise = 0L; Stored = 0L; Errors = 0L; Recovered = 0L; Seconds = 0.0; Unreachable = [Collections.Generic.List[string]]::new(); Stale = [Collections.Generic.List[string]]::new(); NoiseReasons = @{} }
+    $totals = [ordered]@{ Files = 0L; Bytes = 0L; Lines = 0L; Kept = 0L; Noise = 0L; Stored = 0L; Errors = 0L; Recovered = 0L; Seconds = 0.0; Threads = 0; Statistics = $null; Unreachable = [Collections.Generic.List[string]]::new(); Stale = [Collections.Generic.List[string]]::new(); NoiseReasons = @{} }
     $clock = [Diagnostics.Stopwatch]::StartNew()
-    Write-ExlTableRow -Header
+
+    # ---- plan: the folders of every server, listed in parallel ------------------------------------------------
+    $jobs = [Collections.Generic.List[ExchangeLogReport.SourceJob]]::new()
+    $sourceOf = @{}
     foreach ($server in $Servers) {
-        $known = @{}
-        foreach ($kv in $Store.KnownOffsets($server.Name).GetEnumerator()) { $known[$kv.Key] = $kv.Value }
         foreach ($source in Get-ExlSources $server $Settings) {
-            if (-not (Test-Path -LiteralPath $source.Folder -PathType Container -ErrorAction SilentlyContinue)) {
-                # SMTP, MAPI, POP and IMAP protocol log folders exist only where protocol logging is enabled (or has been used);
-                # IIS creates the folder of a site at its first request.
-                if ($source.Optional) {
-                    Write-ExlLog 'INFO' "$($server.Name) $($source.Label): no folder ($($source.Folder))"
-                    $disabled = ($source.Kind -eq 'Imap4' -and $server.ImapProtocolLog -eq $false) -or ($source.Kind -eq 'Pop3' -and $server.PopProtocolLog -eq $false)
-                    if (-not $disabled) { Write-ExlTableRow -Status Skip -Server $server.Name -Source $source.Label -Files '-' -Read '-' -Lines 0 -Kept 0 -Noise '-' -Duration 'no folder' -Rate '' }
-                    continue
-                }
-                Write-ExlTableRow -Status Fail -Server $server.Name -Source $source.Label -Files '-' -Read '-' -Lines 0 -Kept 0 -Noise '-' -Duration 'not found' -Rate ''
-                $totals.Unreachable.Add("$($server.Name) $($source.Label): $($source.Folder)")
-                continue
-            }
-            $plan = Get-ExlSourceFiles -Source $source -Known $known -Since $since -Server $server.Name
-            $stale = Test-ExlStaleSource -Source $source -Plan $plan -Settings $Settings
-            if ($stale) { $totals.Stale.Add("$($server.Name) $($source.Label): $stale ($($source.Folder))") }
-            if (-not $plan.Files.Count) {
-                if ($stale) { Write-ExlTableRow -Status Warn -Server $server.Name -Source $source.Label -Files "0/$($plan.Total)" -Read '-' -Lines 0 -Kept 0 -Noise '-' -Duration 'stale' -Rate '' }
-                elseif ($plan.Total) { Write-ExlTableRow -Status Skip -Server $server.Name -Source $source.Label -Files "0/$($plan.Total)" -Read '-' -Lines 0 -Kept 0 -Noise '-' -Duration 'up to date' -Rate '' }
-                else { Write-ExlTableRow -Status Skip -Server $server.Name -Source $source.Label -Files '0' -Read '-' -Lines 0 -Kept 0 -Noise '-' -Duration 'no file' -Rate '' }
-                continue
-            }
-            $row = [ordered]@{ Files = 0; Bytes = 0L; Lines = 0L; Kept = 0L; Noise = 0L; Errors = 0; Seconds = 0.0 }
-            $i = 0
-            foreach ($file in $plan.Files) {
-                $i++
-                Write-Progress -Id 1 -Activity "$($server.Name) - $($source.Label)" -Status ("{0} ({1} of {2}, {3})" -f $file.Name, $i, $plan.Files.Count, (Format-ExlBytes $file.Length)) -PercentComplete ([int](100 * ($i - 1) / $plan.Files.Count))
-                $r = $collector.ProcessFile($server.Name, $source.Kind, $source.Role, $file.FullName)
-                if ($r.Error) {
-                    $row.Errors++
-                    Write-ExlLog 'WARN' ("{0} {1}: {2}" -f $server.Name, $file.FullName, $r.Error)
-                    continue
-                }
-                if ($r.Unchanged) { continue }
-                $row.Files++; $row.Bytes += $r.BytesRead; $row.Lines += $r.Lines; $row.Kept += $r.Kept; $row.Noise += $r.Noise; $row.Seconds += $r.Seconds
-                $totals.Stored += $r.Stored
-                foreach ($kv in $r.NoiseReasons.GetEnumerator()) { $totals.NoiseReasons[$kv.Key] = [long]$totals.NoiseReasons[$kv.Key] + $kv.Value }
-                if ($r.Reset) { Write-ExlLog 'WARN' "$($file.FullName) was shorter than the position already read: read again from the beginning." }
-            }
-            Write-Progress -Id 1 -Activity "$($server.Name) - $($source.Label)" -Completed
-            if (-not $row.Files -and -not $row.Errors) {
-                # Only empty files, or files not grown since the listing (IIS writes its buffer every minute).
-                Write-ExlTableRow -Status $(if ($stale) { 'Warn' } else { 'Skip' }) -Server $server.Name -Source $source.Label -Files "0/$($plan.Total)" -Read '-' -Lines 0 -Kept 0 -Noise '-' -Duration $(if ($stale) { 'stale' } else { 'up to date' }) -Rate ''
-                continue
-            }
-            $noisePercent = if ($row.Lines) { '{0:0}%' -f (100.0 * $row.Noise / $row.Lines) } else { '-' }
-            $rate = if ($row.Seconds -gt 0) { '{0}/s' -f (Format-ExlBytes ($row.Bytes / $row.Seconds)) } else { '' }
-            $status = if ($row.Errors -or $stale) { 'Warn' } else { 'Ok' }
-            Write-ExlTableRow -Status $status -Server $server.Name -Source $source.Label -Files ("{0}/{1}" -f $row.Files, $plan.Total) -Read (Format-ExlBytes $row.Bytes) `
-                -Lines $row.Lines -Kept $row.Kept -Noise $noisePercent -Duration (Format-ExlDuration $row.Seconds) -Rate $rate
-            if ($row.Errors) { Write-ExlItem Warn ("{0} file(s) could not be read on {1} ({2}); see the log file." -f $row.Errors, $server.Name, $source.Label) }
-            $totals.Files += $row.Files; $totals.Bytes += $row.Bytes; $totals.Lines += $row.Lines; $totals.Kept += $row.Kept; $totals.Noise += $row.Noise; $totals.Errors += $row.Errors
+            $job = [ExchangeLogReport.SourceJob]::new()
+            $job.Index = $jobs.Count; $job.Server = $server.Name; $job.Kind = $source.Kind; $job.Role = $source.Role; $job.Label = $source.Label
+            $job.Folder = $source.Folder; $job.Filter = $source.Filter; $job.Recurse = [bool]$source.Recurse
+            $sourceOf[$job.Index] = [pscustomobject]@{ Server = $server; Source = $source }
+            $jobs.Add($job)
         }
     }
+    Write-Progress -Id 1 -Activity 'Reading the new log lines' -Status ("Listing {0} log folder(s) of {1} server(s)" -f $jobs.Count, @($Servers).Count)
+    $watch = [Diagnostics.Stopwatch]::StartNew()
+    $collector.Plan($jobs.ToArray(), $since)
+    Write-ExlLog 'INFO' ("Listing: {0} folder(s), {1} file(s), {2} to read, in {3:0.0} s" -f $jobs.Count, ($jobs | Measure-Object Total -Sum).Sum, ($jobs | ForEach-Object { $_.Files.Count } | Measure-Object -Sum).Sum, $watch.Elapsed.TotalSeconds)
+    Write-Progress -Id 1 -Activity 'Reading the new log lines' -Completed
+
+    Write-ExlTableRow -Header
+    $staleOf = @{}
+    $toRead = [Collections.Generic.List[ExchangeLogReport.SourceJob]]::new()
+    foreach ($job in $jobs) {
+        $server = $sourceOf[$job.Index].Server; $source = $sourceOf[$job.Index].Source
+        if (-not $job.FolderFound) {
+            # SMTP, MAPI, POP and IMAP protocol log folders exist only where protocol logging is enabled (or has been used);
+            # IIS creates the folder of a site at its first request.
+            if ($source.Optional) {
+                Write-ExlLog 'INFO' "$($server.Name) $($source.Label): no folder ($($source.Folder))"
+                $disabled = ($source.Kind -eq 'Imap4' -and $server.ImapProtocolLog -eq $false) -or ($source.Kind -eq 'Pop3' -and $server.PopProtocolLog -eq $false)
+                if (-not $disabled) { Write-ExlTableRow -Status Skip -Server $server.Name -Source $source.Label -Files '-' -Read '-' -Lines 0 -Kept 0 -Noise '-' -Duration 'no folder' -Rate '' }
+                continue
+            }
+            Write-ExlTableRow -Status Fail -Server $server.Name -Source $source.Label -Files '-' -Read '-' -Lines 0 -Kept 0 -Noise '-' -Duration 'not found' -Rate ''
+            $totals.Unreachable.Add("$($server.Name) $($source.Label): $($source.Folder)")
+            continue
+        }
+        if ($job.ListError) { Write-ExlLog 'WARN' "$($server.Name) $($source.Label): $($source.Folder) could not be listed completely: $($job.ListError)" }
+        $stale = Test-ExlStaleSource -Source $source -Plan ([pscustomobject]@{ Total = $job.Total; Newest = $job.Newest }) -Settings $Settings
+        if ($stale) { $staleOf[$job.Index] = $stale; $totals.Stale.Add("$($server.Name) $($source.Label): $stale ($($source.Folder))") }
+        if (-not $job.Files.Count) {
+            if ($stale) { Write-ExlTableRow -Status Warn -Server $server.Name -Source $source.Label -Files "0/$($job.Total)" -Read '-' -Lines 0 -Kept 0 -Noise '-' -Duration 'stale' -Rate '' }
+            elseif ($job.Total) { Write-ExlTableRow -Status Skip -Server $server.Name -Source $source.Label -Files "0/$($job.Total)" -Read '-' -Lines 0 -Kept 0 -Noise '-' -Duration 'up to date' -Rate '' }
+            else { Write-ExlTableRow -Status Skip -Server $server.Name -Source $source.Label -Files '0' -Read '-' -Lines 0 -Kept 0 -Noise '-' -Duration 'no file' -Rate '' }
+            continue
+        }
+        $toRead.Add($job)
+    }
+
+    # ---- read: one row per source as soon as its last file is saved -------------------------------------------------
+    $row = {
+        param($job)
+        $stale = $staleOf[$job.Index]
+        foreach ($kv in $job.NoiseReasons.GetEnumerator()) { $totals.NoiseReasons[$kv.Key] = [long]$totals.NoiseReasons[$kv.Key] + $kv.Value }
+        $totals.Stored += $job.Stored; $totals.Errors += $job.Errors
+        if (-not $job.FilesRead -and -not $job.Errors) {
+            # Only empty files, or files not grown since the listing (IIS writes its buffer every minute).
+            Write-ExlTableRow -Status $(if ($stale) { 'Warn' } else { 'Skip' }) -Server $job.Server -Source $job.Label -Files "0/$($job.Total)" -Read '-' -Lines 0 -Kept 0 -Noise '-' -Duration $(if ($stale) { 'stale' } else { 'up to date' }) -Rate ''
+            return
+        }
+        $noisePercent = if ($job.Lines) { '{0:0}%' -f (100.0 * $job.Noise / $job.Lines) } else { '-' }
+        $seconds = $job.Seconds
+        $rate = if ($seconds -gt 0) { '{0}/s' -f (Format-ExlBytes ($job.Bytes / $seconds)) } else { '' }
+        Write-ExlTableRow -Status $(if ($job.Errors -or $stale) { 'Warn' } else { 'Ok' }) -Server $job.Server -Source $job.Label -Files ("{0}/{1}" -f $job.FilesRead, $job.Total) `
+            -Read (Format-ExlBytes $job.Bytes) -Lines $job.Lines -Kept $job.Kept -Noise $noisePercent -Duration (Format-ExlDuration $seconds) -Rate $rate
+        if ($job.Errors) { Write-ExlItem Warn ("{0} file(s) could not be read on {1} ({2}); see the log file." -f $job.Errors, $job.Server, $job.Label) }
+        $totals.Files += $job.FilesRead; $totals.Bytes += $job.Bytes; $totals.Lines += $job.Lines; $totals.Kept += $job.Kept; $totals.Noise += $job.Noise
+    }
+    $log = { param($run) foreach ($l in $run.TakeLog()) { $level, $text = $l.Split('|', 2); Write-ExlLog $level $text } }
+    if ($toRead.Count) {
+        $run = $collector.Start($toRead.ToArray())
+        $totals.Threads = $collector.EffectiveParallelism
+        Write-ExlLog 'INFO' ("Reading {0} file(s), {1}, with {2} thread(s)" -f ($toRead | ForEach-Object { $_.Files.Count } | Measure-Object -Sum).Sum, (Format-ExlBytes (($toRead | Measure-Object PlannedBytes -Sum).Sum)), $run.Progress().Workers)
+        try {
+            while (-not $run.Wait(400)) {
+                foreach ($job in $run.TakeFinished()) { & $row $job }
+                & $log $run
+                $p = $run.Progress()
+                $percent = if ($p.BytesPlanned -gt 0) { [int][Math]::Min(100, 100.0 * $p.BytesDone / $p.BytesPlanned) } else { 0 }
+                $speed = if ($p.Seconds -gt 0) { $p.BytesDone / $p.Seconds } else { 0 }
+                $left = if ($speed -gt 0 -and $p.BytesDone -gt 0) { ' ' + [char]0x00B7 + ' ' + (Format-ExlDuration (($p.BytesPlanned - $p.BytesDone) / $speed)) + ' left' } else { '' }
+                Write-Progress -Id 1 -Activity ("Reading the new log lines ({0} threads)" -f $p.Workers) -PercentComplete $percent `
+                    -Status ("{0} of {1} files {2} {3} of {4} {2} {5}/s{6}" -f (Format-ExlNumber $p.FilesDone), (Format-ExlNumber $p.FilesPlanned), [char]0x00B7, (Format-ExlBytes $p.BytesDone), (Format-ExlBytes $p.BytesPlanned), (Format-ExlBytes $speed), $left) `
+                    -CurrentOperation (@($p.Reading | Select-Object -First 3) -join '   ')
+            }
+        }
+        finally {
+            # Ctrl+C or an error of this loop: stop the threads before the database is closed.
+            if (-not $run.Wait(0)) { $run.Stop(); [void]$run.Wait(-1) }
+            Write-Progress -Id 1 -Activity 'Reading the new log lines' -Completed
+        }
+        foreach ($job in $run.TakeFinished()) { & $row $job }
+        & $log $run
+        $totals.Statistics = $run.Statistics
+        Write-ExlLog 'INFO' ("Collection threads: {0}; WAL {1}" -f $run.Statistics, (Format-ExlBytes $Store.WalBytes))
+        if ($run.Error) { throw ("The collection stopped: {0}" -f $run.Error.Message) }
+    }
+    $watch = [Diagnostics.Stopwatch]::StartNew()
     $totals.Recovered = $collector.Complete()
+    Write-ExlLog 'INFO' ("Back-end IMAP/POP connections and recoveries ({0}) written in {1:0.0} s; WAL {2}" -f $totals.Recovered, $watch.Elapsed.TotalSeconds, (Format-ExlBytes $Store.WalBytes))
     $totals.Seconds = $clock.Elapsed.TotalSeconds
     return [pscustomobject]$totals
 }
@@ -1009,7 +1127,10 @@ function New-ExlReport {
     $q.Generated = Format-ExlLocalTime ([DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()) $zone 'yyyy-MM-dd HH:mm'
     $q.RecoveryWindowMs = [long]$Settings.Collection.RecoveryWindowMinutes * 60000
     $q.MaxHtmlRows = $Settings.Report.MaxHtmlRows
-    return [ExchangeLogReport.ReportBuilder]::Build($Store, $q)
+    $result = [ExchangeLogReport.ReportBuilder]::Build($Store, $q)
+    # The slowest steps in the execution log: what to look at when a report is slow.
+    foreach ($s in @($result.Steps | Select-Object -First 8)) { Write-ExlLog 'INFO' "Report step: $s" }
+    return $result
 }
 
 #endregion
@@ -1064,13 +1185,16 @@ function Invoke-ExlRetention {
     $detail = $now - [long]$Settings.Storage.DetailRetentionDays * 86400000
     $day = Format-ExlLocalTime $cutoff $Settings.Zone 'yyyy-MM-dd'
     $result = $Store.Purge($cutoff, $day, $detail)
+    $watch = [Diagnostics.Stopwatch]::StartNew()
+    $wal = $Store.WalBytes
     $Store.Checkpoint()
+    Write-ExlLog 'INFO' ("Retention: deletes {0:0.0} s, vacuum {1:0.0} s, statistics {2:0.0} s, WAL {3} written into the database in {4:0.0} s" -f $result.DeleteSeconds, $result.VacuumSeconds, $result.OptimizeSeconds, (Format-ExlBytes $wal), $watch.Elapsed.TotalSeconds)
     return $result
 }
 
 function Enter-ExlLock {
-    <# Prevents two executions from collecting at the same time. Release with Exit-ExlLock. #>
-    param([Parameter(Mandatory)][string]$Path, [int]$TimeoutSeconds = 30)
+    <# Prevents two executions from collecting at the same time. Release with Exit-ExlLock. -NoWait: $null when the lock is taken. #>
+    param([Parameter(Mandatory)][string]$Path, [int]$TimeoutSeconds = 30, [switch]$NoWait)
     [void][IO.Directory]::CreateDirectory((Split-Path $Path -Parent))
     $deadline = [DateTime]::UtcNow.AddSeconds($TimeoutSeconds)
     while ($true) {
@@ -1081,9 +1205,10 @@ function Enter-ExlLock {
             $stream.Write($bytes, 0, $bytes.Length); $stream.Flush()
             return $stream
         } catch [IO.IOException] {
+            if ($NoWait) { return $null }
             if ([DateTime]::UtcNow -ge $deadline) {
                 $owner = try { [IO.File]::ReadAllText($Path) } catch { 'unknown' }
-                throw "Another execution is already collecting ($owner). Wait for it to finish, or use -NoCollect to build a report from the data already collected."
+                throw "Another execution is already collecting ($owner). Wait for it to finish, or build the report without -Collect: it uses the data already collected."
             }
             Start-Sleep -Seconds 2
         }
@@ -1470,6 +1595,133 @@ function Invoke-ExlDiscovery {
         File        = $Settings.PathsFile
         Via         = "$($exchange.Method) on $($exchange.Via)"
     }
+}
+
+#endregion
+
+#region 10. E-mail -------------------------------------------------------------------------------------
+
+function Test-ExlMailReady {
+    <# Problems that prevent sending (missing server, sender, recipients); empty when the Mail section can be used. #>
+    param([Parameter(Mandatory)]$Settings)
+    $m = $Settings.Mail
+    @(
+        if (-not $m.SmtpServer) { 'Mail.SmtpServer is not set.' }
+        if (-not $m.From) { 'Mail.From is not set.' }
+        if (-not @($m.To).Count) { 'Mail.To has no recipient.' }
+    )
+}
+
+function Save-ExlMailCredential {
+    <#
+    .SYNOPSIS
+        Writes Mail.CredentialFile: the account and its password protected by DPAPI. Scope User: only this Windows
+        account on this computer can read the password (write it with the account of the scheduled task). Scope
+        Computer: any account of this computer can read it; the file is then restricted to SYSTEM, Administrators
+        and the account that writes it.
+    #>
+    param([Parameter(Mandatory)]$Settings, [Parameter(Mandatory)][pscredential]$Credential)
+    $m = $Settings.Mail
+    $scope = if ($m.CredentialScope -eq 'Computer') { [Security.Cryptography.DataProtectionScope]::LocalMachine } else { [Security.Cryptography.DataProtectionScope]::CurrentUser }
+    $plain = [Text.Encoding]::UTF8.GetBytes($Credential.GetNetworkCredential().Password)
+    try { $protected = [Security.Cryptography.ProtectedData]::Protect($plain, $script:MailEntropy, $scope) }
+    finally { [Array]::Clear($plain, 0, $plain.Length) }
+    $content = [ordered]@{
+        Tool = 'Exchange Log Report'; UserName = $Credential.UserName; Scope = [string]$m.CredentialScope; Password = [Convert]::ToBase64String($protected)
+        WrittenBy = [Security.Principal.WindowsIdentity]::GetCurrent().Name; Computer = [Environment]::MachineName; Written = (Get-Date).ToString('yyyy-MM-ddTHH:mm:sszzz')
+    } | ConvertTo-Json
+    [void][IO.Directory]::CreateDirectory((Split-Path $m.CredentialFile -Parent))
+    [IO.File]::WriteAllText($m.CredentialFile, $content, [Text.UTF8Encoding]::new($false))
+    # Only SYSTEM, the administrators and this account may read the file (the password is protected anyway).
+    try {
+        $acl = [Security.AccessControl.FileSecurity]::new()
+        $acl.SetAccessRuleProtection($true, $false)
+        foreach ($sid in 'S-1-5-18', 'S-1-5-32-544', [Security.Principal.WindowsIdentity]::GetCurrent().User.Value) {
+            $acl.AddAccessRule([Security.AccessControl.FileSystemAccessRule]::new([Security.Principal.SecurityIdentifier]::new($sid), 'FullControl', 'Allow'))
+        }
+        [IO.FileSystemAclExtensions]::SetAccessControl([IO.FileInfo]::new($m.CredentialFile), $acl)
+    } catch { Write-ExlLog 'WARN' "Could not restrict the access to $($m.CredentialFile): $($_.Exception.Message)" }
+    Write-ExlLog 'INFO' ("Mail credential written to {0} for {1} (DPAPI scope {2})" -f $m.CredentialFile, $Credential.UserName, $m.CredentialScope)
+}
+
+function Read-ExlMailCredential {
+    <# The account and password of Mail.CredentialFile ($null when the file does not exist). #>
+    param([Parameter(Mandatory)]$Settings)
+    $m = $Settings.Mail
+    if (-not (Test-Path -LiteralPath $m.CredentialFile -PathType Leaf)) { return $null }
+    $data = Get-Content -LiteralPath $m.CredentialFile -Raw -Encoding utf8 | ConvertFrom-Json
+    $scope = if ($data.Scope -eq 'Computer') { [Security.Cryptography.DataProtectionScope]::LocalMachine } else { [Security.Cryptography.DataProtectionScope]::CurrentUser }
+    try { $plain = [Security.Cryptography.ProtectedData]::Unprotect([Convert]::FromBase64String($data.Password), $script:MailEntropy, $scope) }
+    catch {
+        $who = [Security.Principal.WindowsIdentity]::GetCurrent().Name
+        throw ("The password of {0} cannot be read by {1} on {2}: it was written by {3} on {4} (DPAPI scope {5}). Write it again with -Mode MailTest -Credential, with the account that runs the tool, or set Mail.CredentialScope = 'Computer'." -f $m.CredentialFile, $who, [Environment]::MachineName, $data.WrittenBy, $data.Computer, $data.Scope)
+    }
+    try { $password = [Text.Encoding]::UTF8.GetString($plain) } finally { [Array]::Clear($plain, 0, $plain.Length) }
+    [pscustomobject]@{ UserName = [string]$data.UserName; Password = $password; Scope = [string]$data.Scope; WrittenBy = [string]$data.WrittenBy }
+}
+
+function New-ExlMailSettings {
+    <# SMTP settings of the engine from the Mail section (and the credential file for Basic, or Kerberos with another account). #>
+    param([Parameter(Mandatory)]$Settings)
+    $m = $Settings.Mail
+    $s = [ExchangeLogReport.MailSettings]::new()
+    $s.Server = $m.SmtpServer; $s.Port = $m.Port; $s.Encryption = $m.Encryption; $s.Authentication = $m.Authentication
+    $s.From = $m.From; $s.FromName = $m.FromName; $s.To = [string[]]@($m.To); $s.Cc = [string[]]@($m.Cc); $s.Bcc = [string[]]@($m.Bcc)
+    $s.TargetName = $m.TargetName; $s.CertificateThumbprint = $m.CertificateThumbprint; $s.TimeoutSeconds = $m.TimeoutSeconds; $s.HeloName = $m.HeloName
+    if ($m.Authentication -in 'Basic', 'Kerberos') {
+        $credential = Read-ExlMailCredential -Settings $Settings
+        if ($credential) { $s.UserName = $credential.UserName; $s.Password = $credential.Password }
+        elseif ($m.Authentication -eq 'Basic') { throw "Basic authentication needs Mail.CredentialFile ($($m.CredentialFile)): run once .\Invoke-ExchangeLogReport.ps1 -Mode MailTest -Credential (Get-Credential), with the account of the scheduled task." }
+    }
+    return $s
+}
+
+function Format-ExlMailSubject {
+    <# Mail.Subject with its fields: {Title} {Type} {Period} {Range} {Servers} {Computer}. #>
+    param([Parameter(Mandatory)][string]$Template, [hashtable]$Values)
+    $text = $Template
+    foreach ($k in $Values.Keys) { $text = $text.Replace('{' + $k + '}', [string]$Values[$k]) }
+    return $text
+}
+
+function Send-ExlReportMail {
+    <#
+    .SYNOPSIS
+        Sends a report by e-mail (Mail section): summary of the report in the body, the report attached
+        (Mail.Attach). Returns the engine result (Sent, Error, Tls, AuthenticationUsed, Refused, Transcript), plus Attached
+        (name and size of each attachment) and OmittedBytes (report too large for Mail.MaxAttachmentMB, not attached).
+    #>
+    param([Parameter(Mandatory)]$Settings, [Parameter(Mandatory)]$Report, [Parameter(Mandatory)][string]$Period, [Parameter(Mandatory)][string]$ReportType, [Parameter(Mandatory)][string]$Range, [string]$Title)
+    $m = $Settings.Mail
+    $smtp = New-ExlMailSettings -Settings $Settings
+    $subject = Format-ExlMailSubject -Template $m.Subject -Values @{ Title = $Title; Type = $ReportType; Period = $Period; Range = $Range; Servers = (@($Settings.Servers | ForEach-Object Name) -join ', '); Computer = [Environment]::MachineName }
+    $content = [ExchangeLogReport.ReportMail]::Build($Report, $subject, $Title, $Period, $ReportType, [Environment]::MachineName, $m.Attach, [long]$m.MaxAttachmentMB * 1MB)
+    $result = [ExchangeLogReport.SmtpSender]::Send($smtp, $content)
+    foreach ($l in $result.Transcript) { Write-ExlLog 'DEBUG' "SMTP $l" }
+    $attached = @($content.Attachments | ForEach-Object { '{0} ({1})' -f $_.Name, (Format-ExlBytes $_.Content.LongLength) })
+    $result | Add-Member -NotePropertyName Attached -NotePropertyValue $attached -Force
+    $result | Add-Member -NotePropertyName OmittedBytes -NotePropertyValue $content.OmittedBytes -Force
+    return $result
+}
+
+function Send-ExlTestMail {
+    <# -Mode MailTest: a short message with the settings used, to check the Mail section before scheduling reports. #>
+    param([Parameter(Mandatory)]$Settings)
+    $m = $Settings.Mail
+    $smtp = New-ExlMailSettings -Settings $Settings
+    $content = [ExchangeLogReport.MailContent]::new()
+    $content.Subject = Format-ExlMailSubject -Template 'Exchange Log Report - test message from {Computer}' -Values @{ Computer = [Environment]::MachineName }
+    $who = [Security.Principal.WindowsIdentity]::GetCurrent().Name
+    $lines = @(
+        "This message was sent by Exchange Log Report $script:ToolVersion from $([Environment]::MachineName) ($who) to check its Mail settings."
+        "Server: $($m.SmtpServer):$($m.Port), encryption $($m.Encryption), authentication $($m.Authentication)."
+        'The reports will be sent the same way.'
+    )
+    $content.Text = $lines -join "`r`n"
+    $content.Html = '<html><body style="font-family:Segoe UI,Arial,sans-serif;font-size:14px">' + (($lines | ForEach-Object { '<p>' + [Net.WebUtility]::HtmlEncode($_) + '</p>' }) -join '') + '</body></html>'
+    $result = [ExchangeLogReport.SmtpSender]::Send($smtp, $content)
+    foreach ($l in $result.Transcript) { Write-ExlLog 'DEBUG' "SMTP $l" }
+    return $result
 }
 
 #endregion

@@ -1,4 +1,3 @@
-# Created at run time - never commit data, reports or logs (they contain user names and e-mail addresses)
 bin/
 data/
 reports/
@@ -6,6 +5,5 @@ logs/
 *.sqlite
 *.sqlite-*
 *.lock
-*.zip
-# Written by -Mode Discover: the real log folders of your servers
 config/*.paths.psd1
+config/*.credential
