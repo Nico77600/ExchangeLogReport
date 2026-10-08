@@ -21,7 +21,7 @@
     from a real report and a real console run on a lab, with anonymised names.
 
 .PARAMETER OutputFolder
-    Default: docs\images next to the tools folder.
+    Default: package\docs\images next to the tools folder.
 
 .PARAMETER KeepWork
     Keeps the work folder (HTML pages of the graphics) and shows its path.
@@ -42,7 +42,7 @@ param(
 )
 $ErrorActionPreference = 'Stop'
 $root = Split-Path $PSScriptRoot -Parent
-if (-not $OutputFolder) { $OutputFolder = Join-Path $root 'docs\images' }
+if (-not $OutputFolder) { $OutputFolder = Join-Path $root 'package\docs\images' }
 $edge = @("${env:ProgramFiles(x86)}\Microsoft\Edge\Application\msedge.exe", "$env:ProgramFiles\Microsoft\Edge\Application\msedge.exe") | Where-Object { Test-Path $_ } | Select-Object -First 1
 if (-not $edge) { throw 'Microsoft Edge not found: it takes the screenshots (headless mode).' }
 $work = Join-Path ([IO.Path]::GetTempPath()) ('elr-doc-' + [guid]::NewGuid().ToString('N').Substring(0, 8))
@@ -59,9 +59,9 @@ function ConvertTo-ReadmeInline([string]$Text) {
 
 function Get-ReadmeAssets {
     $builder = Join-Path $root 'tools\Build-Documentation.ps1'
-    $guideHtml = Join-Path $root 'docs\ExchangeLogReport-Guide.html'
-    $guideMd = Join-Path $root 'docs\ExchangeLogReport-Guide.md'
-    if (-not (Test-Path $guideHtml)) { throw 'docs\ExchangeLogReport-Guide.html not found: run tools\Build-Documentation.ps1 first (it holds the CSS of the graphics).' }
+    $guideHtml = Join-Path $root 'package\docs\ExchangeLogReport-Guide.html'
+    $guideMd = Join-Path $root 'package\docs\ExchangeLogReport-Guide.md'
+    if (-not (Test-Path $guideHtml)) { throw 'package\docs\ExchangeLogReport-Guide.html not found: run tools\Build-Documentation.ps1 first (it holds the CSS of the graphics).' }
     # Icons: the $Icons table of the documentation builder, read without running the builder.
     $ast = [Management.Automation.Language.Parser]::ParseFile($builder, [ref]$null, [ref]$null)
     $assign = $ast.Find({ param($n) $n -is [Management.Automation.Language.AssignmentStatementAst] -and $n.Left.Extent.Text -eq '$Icons' }, $true)
@@ -72,7 +72,7 @@ function Get-ReadmeAssets {
         [pscustomobject]@{ Kind = $m.Groups[1].Value; Lines = $lines; First = $lines[0].Split('|')[1].Trim() }
     }
     # The guided path, as rendered in the user guide (the builder marks it with <!--path--> ... <!--/path-->).
-    $userHtml = Join-Path $root 'docs\ExchangeLogReport-UserGuide.html'
+    $userHtml = Join-Path $root 'package\docs\ExchangeLogReport-UserGuide.html'
     $path = if (Test-Path $userHtml) { [regex]::Match([IO.File]::ReadAllText($userHtml), '(?s)<!--path-->(.*?)<!--/path-->').Groups[1].Value } else { '' }
     [pscustomobject]@{
         Path    = $path
@@ -86,7 +86,7 @@ function Get-ReadmeAssets {
 function Get-GuideBlock([string]$Kind, [string]$FirstTitle) {
     # A cards or flow block of the guide, found by the title of its first item.
     $block = $assets.Blocks | Where-Object { $_.Kind -eq $Kind -and $_.First -eq $FirstTitle } | Select-Object -First 1
-    if (-not $block) { throw "Guide block not found: $Kind starting with '$FirstTitle' (docs\ExchangeLogReport-Guide.md)." }
+    if (-not $block) { throw "Guide block not found: $Kind starting with '$FirstTitle' (package\docs\ExchangeLogReport-Guide.md)." }
     return $block.Lines
 }
 
@@ -253,7 +253,7 @@ New-ReadmeGraphic -Name 'banner' -Body $banner
 New-ReadmeGraphic -Name 'why' -Body (ConvertTo-ReadmeCards (Get-GuideBlock 'cards' 'Usage') 'rb-cards2')
 
 # The guided path of the user guide (chapter 1): set up once, then A or B.
-if (-not $assets.Path) { throw 'Guided path not found in docs\ExchangeLogReport-UserGuide.html: run tools\Build-Documentation.ps1 first.' }
+if (-not $assets.Path) { throw 'Guided path not found in package\docs\ExchangeLogReport-UserGuide.html: run tools\Build-Documentation.ps1 first.' }
 New-ReadmeGraphic -Name 'path' -Body $assets.Path
 
 

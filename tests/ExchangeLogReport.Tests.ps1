@@ -16,7 +16,8 @@
 #>
 
 BeforeAll {
-    $script:Root = Split-Path $PSScriptRoot -Parent
+    $script:RepoRoot = Split-Path $PSScriptRoot -Parent
+    $script:Root = Join-Path $script:RepoRoot 'package'
     Import-Module (Join-Path $script:Root 'ExchangeLogReport.psd1') -Force
     Initialize-ExlEngine -Root $script:Root
     $script:Now = [DateTimeOffset]::UtcNow

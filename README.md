@@ -1,7 +1,7 @@
 <p align="center">
   <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="docs/images/readme-banner-dark.png">
-    <img alt="Exchange Log Report: a modern Log Parser for Exchange Server SE on-premises; reads the IIS, HTTP Proxy, MAPI, ActiveSync, POP/IMAP, SMTP and tracking logs of every server, removes the noise before storage and answers: is this server really used, what happened to this user or this message" src="docs/images/readme-banner-light.png">
+    <source media="(prefers-color-scheme: dark)" srcset="package/docs/images/readme-banner-dark.png">
+    <img alt="Exchange Log Report: a modern Log Parser for Exchange Server SE on-premises; reads the IIS, HTTP Proxy, MAPI, ActiveSync, POP/IMAP, SMTP and tracking logs of every server, removes the noise before storage and answers: is this server really used, what happened to this user or this message" src="package/docs/images/readme-banner-light.png">
   </picture>
 </p>
 
@@ -11,8 +11,8 @@
   <a href="#noise-removed-before-storage"><b>Noise removed</b></a> &nbsp;&middot;&nbsp;
   <a href="#sessions-and-messages"><b>Sessions and messages</b></a> &nbsp;&middot;&nbsp;
   <a href="#reports"><b>Reports</b></a> &nbsp;&middot;&nbsp;
-  <a href="docs/ExchangeLogReport-UserGuide.md"><b>User guide</b></a> &nbsp;&middot;&nbsp;
-  <a href="docs/ExchangeLogReport-Guide.md"><b>Developer guide</b></a>
+  <a href="package/docs/ExchangeLogReport-UserGuide.md"><b>User guide</b></a> &nbsp;&middot;&nbsp;
+  <a href="package/docs/ExchangeLogReport-Guide.md"><b>Developer guide</b></a>
 </p>
 
 > [!IMPORTANT]
@@ -29,26 +29,26 @@
 Exchange writes gigabytes of logs per day and per server, and almost none of it is user activity: Managed Availability probes, health mailboxes, load balancer checks, anonymous authentication challenges, SMTP connections without any message. Yet two questions come back all the time, and they used to need Log Parser queries on raw files, server by server. This tool answers both, for several servers at once.
 
 <picture>
-  <source media="(prefers-color-scheme: dark)" srcset="docs/images/readme-why-dark.png">
-  <img alt="Usage: is this server really used, by whom, with which protocols, clients and devices, can it be decommissioned. Troubleshooting: what happened to this user, this client or this message, which requests failed, did the client recover, which servers did the message go through" src="docs/images/readme-why-light.png">
+  <source media="(prefers-color-scheme: dark)" srcset="package/docs/images/readme-why-dark.png">
+  <img alt="Usage: is this server really used, by whom, with which protocols, clients and devices, can it be decommissioned. Troubleshooting: what happened to this user, this client or this message, which requests failed, did the client recover, which servers did the message go through" src="package/docs/images/readme-why-light.png">
 </picture>
 
 ## Get started
 
 <picture>
-  <source media="(prefers-color-scheme: dark)" srcset="docs/images/readme-path-dark.png">
-  <img alt="The guided path. Set up once: 1 list the servers, 2 find the log folders with -Mode Discover, 3 collect every hour with a scheduled task whose first run reads 14 days, 4 check with -Mode Status. Then branch A, recurring reporting: 5 schedule the reports, 6 open the HTML report, 7 option: receive them by e-mail. Or branch B, troubleshooting on demand: 5 run a Detailed report on the user and the period, 6 open the client session, 7 follow the timeline to the raw log lines" src="docs/images/readme-path-light.png">
+  <source media="(prefers-color-scheme: dark)" srcset="package/docs/images/readme-path-dark.png">
+  <img alt="The guided path. Set up once: 1 list the servers, 2 find the log folders with -Mode Discover, 3 collect every hour with a scheduled task whose first run reads 14 days, 4 check with -Mode Status. Then branch A, recurring reporting: 5 schedule the reports, 6 open the HTML report, 7 option: receive them by e-mail. Or branch B, troubleshooting on demand: 5 run a Detailed report on the user and the period, 6 open the client session, 7 follow the timeline to the raw log lines" src="package/docs/images/readme-path-light.png">
 </picture>
 
 One path for everyone. Set the tool up once (**1 to 4**), then take branch **A** to have reports made for you every day and every month, branch **B** to investigate a problem, or both. **A · Recurring reporting** is for the messaging manager, the architects and operations: which servers can go, which old clients and applications remain, what keeps failing — without anyone running a command; the reports are HTML files, and can be sent by e-mail too. **B · Troubleshooting** is for the Exchange administrators and support: a user, a message or an incident answered in minutes.
 
-The commands use one example — servers `EXCH01` to `EXCH04`, the tool in `E:\Tools\ExchangeLogReport` on EXCH01 run as SYSTEM, `contoso.com`, `alice`. Copy them as they are and only change these names to yours; the [user guide](docs/ExchangeLogReport-UserGuide.md) explains each step, what you should see and what to do if not.
+The commands use one example — servers `EXCH01` to `EXCH04`, the tool in `E:\Tools\ExchangeLogReport` on EXCH01 run as SYSTEM, `contoso.com`, `alice`. Copy them as they are and only change these names to yours; the [user guide](package/docs/ExchangeLogReport-UserGuide.md) explains each step, what you should see and what to do if not.
 
 ### Set up once · 1 to 4
 
 ```powershell
 # On EXCH01, in PowerShell 7 as administrator, in the folder of the tool
-# (git clone, or the zip of the latest release)
+# Use the zip of the latest release, or copy the repository package folder.
 cd E:\Tools\ExchangeLogReport
 
 # 1 · List the servers: one @{ Name = 'EXCH01' } line per server, in Servers
@@ -98,13 +98,13 @@ notepad .\config\ExchangeLogReport.config.psd1
 <details>
 <summary><b>What you get every month</b> · the usage of every server: EXCH04 used by nobody, EXCH03 by 7 users and a scanner only — the people to contact before it goes</summary>
 <br>
-<a href="docs/images/readme-report-overview.png?raw=true"><img alt="Usage report over a month: 3 of 4 servers really used; EXCH03 used by 7 users only; EXCH04 without real usage" src="docs/images/readme-report-overview.png"></a>
+<a href="package/docs/images/readme-report-overview.png?raw=true"><img alt="Usage report over a month: 3 of 4 servers really used; EXCH03 used by 7 users only; EXCH04 without real usage" src="package/docs/images/readme-report-overview.png"></a>
 </details>
 
 <details>
 <summary><b>With the e-mail option, every morning</b> · the main problems of the last 24 hours in the body, the report attached</summary>
 <br>
-<a href="docs/images/readme-mail-daily.png?raw=true"><img alt="E-mail of the daily Detailed report: figures, one line per server, then the users with unresolved failures, the client sessions that failed and the SMTP clients with refused mail" src="docs/images/readme-mail-daily.png" width="720"></a>
+<a href="package/docs/images/readme-mail-daily.png?raw=true"><img alt="E-mail of the daily Detailed report: figures, one line per server, then the users with unresolved failures, the client sessions that failed and the SMTP clients with refused mail" src="package/docs/images/readme-mail-daily.png" width="720"></a>
 </details>
 
 ### B · Troubleshooting · 5 to 7
@@ -124,18 +124,18 @@ notepad .\config\ExchangeLogReport.config.psd1
 <details>
 <summary><b>What you see</b> · the timeline of the session, front end and back end; a step shows its fields and where its raw lines are</summary>
 <br>
-<a href="docs/images/readme-report-session.png?raw=true"><img alt="Client session of a blocked ActiveSync device: each FolderSync answered HTTP 200 but UserDisabledForSync in the back end, with the request fields and the commands that find the raw lines on the front-end and back-end servers" src="docs/images/readme-report-session.png"></a>
+<a href="package/docs/images/readme-report-session.png?raw=true"><img alt="Client session of a blocked ActiveSync device: each FolderSync answered HTTP 200 but UserDisabledForSync in the back end, with the request fields and the commands that find the raw lines on the front-end and back-end servers" src="package/docs/images/readme-report-session.png"></a>
 </details>
 
-A message that did not arrive (`-User bob@contoso.com`, tab **Messages**) or an incident on some servers (`-Server EXCH01, EXCH02`, tab **Failed and slow requests**) follow the same three steps: [user guide, chapter 5](docs/ExchangeLogReport-UserGuide.md#5-b--troubleshooting).
+A message that did not arrive (`-User bob@contoso.com`, tab **Messages**) or an incident on some servers (`-Server EXCH01, EXCH02`, tab **Failed and slow requests**) follow the same three steps: [user guide, chapter 5](package/docs/ExchangeLogReport-UserGuide.md#5-b--troubleshooting).
 
 Reports read the database: they take seconds to minutes, never wait for the collection, and read the new log lines first only when the last collection is older than 90 minutes. The database keeps 60 days of usage and 14 days of detail (client sessions, failed and slow requests, SMTP transcripts).
 
 ## How it works
 
 <picture>
-  <source media="(prefers-color-scheme: dark)" srcset="docs/images/readme-how-dark.png">
-  <img alt="The Exchange servers' logs are read as new lines by the collector, which removes the noise and correlates sessions and messages, then stores the real activity only in SQLite (60 days of usage, 14 days of detail); the reports are CSV and HTML files. Two reports: Usage and Detailed, for all users or for one or more users" src="docs/images/readme-how-light.png">
+  <source media="(prefers-color-scheme: dark)" srcset="package/docs/images/readme-how-dark.png">
+  <img alt="The Exchange servers' logs are read as new lines by the collector, which removes the noise and correlates sessions and messages, then stores the real activity only in SQLite (60 days of usage, 14 days of detail); the reports are CSV and HTML files. Two reports: Usage and Detailed, for all users or for one or more users" src="package/docs/images/readme-how-light.png">
 </picture>
 
 - **Nothing to install on Exchange.** One collector — an Exchange server running the tool as SYSTEM, or an administration server — reads the log folders of every server over the administrative shares, every hour, and only the **new lines** of each file.
@@ -148,8 +148,8 @@ Reports read the database: they take seconds to minutes, never wait for the coll
 ## Noise removed before storage
 
 <picture>
-  <source media="(prefers-color-scheme: dark)" srcset="docs/images/readme-noise-dark.png">
-  <img alt="Removed before storage and counted by reason: system mailboxes, monitoring probes, load balancer checks, authentication challenges. Measured on a lab of 4 servers over 60 days: 5.5 million lines read, 4,891 kept, 99.9 % noise removed, 18 MB database" src="docs/images/readme-noise-light.png">
+  <source media="(prefers-color-scheme: dark)" srcset="package/docs/images/readme-noise-dark.png">
+  <img alt="Removed before storage and counted by reason: system mailboxes, monitoring probes, load balancer checks, authentication challenges. Measured on a lab of 4 servers over 60 days: 5.5 million lines read, 4,891 kept, 99.9 % noise removed, 18 MB database" src="package/docs/images/readme-noise-light.png">
 </picture>
 
 > [!TIP]
@@ -160,8 +160,8 @@ The 1–3 GB of logs per day and server of a production environment never reach 
 ## Sessions and messages
 
 <picture>
-  <source media="(prefers-color-scheme: dark)" srcset="docs/images/readme-sessions-dark.png">
-  <img alt="Client session: front-end requests (HttpProxy, IIS, POP/IMAP proxy) joined with the back-end logs (MAPI, ActiveSync, POP/IMAP) into one timeline, each step with its fields and its raw log location. Message: the SMTP conversation and the tracking events of every server joined on the Message-ID into one row per message" src="docs/images/readme-sessions-light.png">
+  <source media="(prefers-color-scheme: dark)" srcset="package/docs/images/readme-sessions-dark.png">
+  <img alt="Client session: front-end requests (HttpProxy, IIS, POP/IMAP proxy) joined with the back-end logs (MAPI, ActiveSync, POP/IMAP) into one timeline, each step with its fields and its raw log location. Message: the SMTP conversation and the tracking events of every server joined on the Message-ID into one row per message" src="package/docs/images/readme-sessions-light.png">
 </picture>
 
 - **One row per client session** — Outlook (MAPI), ActiveSync device, OWA, EWS, IMAP/POP client — with the result hidden behind HTTP 200 in the back end (MAPI status, `DeviceNotProvisioned`, `UserDisabledForSync`), the wrong passwords seen by IIS, slow requests, latencies, user agents and devices. Each step of the timeline shows the log files and a ready-to-copy command that finds the raw lines.
@@ -173,28 +173,28 @@ Six tabs — **Client sessions**, **Failed and slow requests**, **Users**, **Ope
 
 **Overview** · which servers are really used, by whom, with which protocols
 
-<a href="docs/images/readme-report-overview.png?raw=true"><img alt="Overview of the HTML report: servers really used, real users, client requests, messages, and one card per server with its verdict and protocols" src="docs/images/readme-report-overview.png"></a>
+<a href="package/docs/images/readme-report-overview.png?raw=true"><img alt="Overview of the HTML report: servers really used, real users, client requests, messages, and one card per server with its verdict and protocols" src="package/docs/images/readme-report-overview.png"></a>
 
 **Client session** · the timeline across the front-end and back-end logs; a step shows the fields kept and where its raw lines are
 
-<a href="docs/images/readme-report-session.png?raw=true"><img alt="Client session of a blocked ActiveSync device: each FolderSync answered HTTP 200 but UserDisabledForSync in the back end, with the request fields and the commands that find the raw lines on the front-end and back-end servers" src="docs/images/readme-report-session.png"></a>
+<a href="package/docs/images/readme-report-session.png?raw=true"><img alt="Client session of a blocked ActiveSync device: each FolderSync answered HTTP 200 but UserDisabledForSync in the back end, with the request fields and the commands that find the raw lines on the front-end and back-end servers" src="package/docs/images/readme-report-session.png"></a>
 
 <details>
 <summary><b>Message</b> · recipients, route across the servers and SMTP transcripts</summary>
 <br>
-<a href="docs/images/readme-report-message.png?raw=true"><img alt="One message: status, servers, events, recipients and the route, every tracking event and SMTP session in order" src="docs/images/readme-report-message.png"></a>
+<a href="package/docs/images/readme-report-message.png?raw=true"><img alt="One message: status, servers, events, recipients and the route, every tracking event and SMTP session in order" src="package/docs/images/readme-report-message.png"></a>
 </details>
 
 <details>
 <summary><b>SMTP client</b> · the applications and devices that send mail, each transaction with its SMTP transcript</summary>
 <br>
-<a href="docs/images/readme-report-smtp-client.png?raw=true"><img alt="One SMTP client: volume, refusals, TLS, authentication, last error and its transactions with the server response" src="docs/images/readme-report-smtp-client.png"></a>
+<a href="package/docs/images/readme-report-smtp-client.png?raw=true"><img alt="One SMTP client: volume, refusals, TLS, authentication, last error and its transactions with the server response" src="package/docs/images/readme-report-smtp-client.png"></a>
 </details>
 
 <details>
 <summary><b>Console</b> · title card, numbered steps, summary card with the report folder</summary>
 <br>
-<a href="docs/images/readme-console-report.png?raw=true"><img alt="Console of a detailed report" src="docs/images/readme-console-report.png"></a>
+<a href="package/docs/images/readme-console-report.png?raw=true"><img alt="Console of a detailed report" src="package/docs/images/readme-console-report.png"></a>
 </details>
 
 ## Requirements
@@ -203,7 +203,7 @@ Six tabs — **Client sessions**, **Failed and slow requests**, **Users**, **Ope
 |---|---|
 | Exchange | Exchange Server SE, on-premises |
 | PowerShell | 7.4 or later — a portable zip is enough. `-Mode Discover` runs the Exchange cmdlets in Windows PowerShell 5.1 (built into Windows Server), since they are not supported in PowerShell 7 |
-| Account | Local administrator of every Exchange server, to read the log folders over the administrative shares. On an Exchange server: SYSTEM (member of *Exchange Trusted Subsystem*), nothing to configure. On an administration server: a domain account, with *Log on as a batch job* on that server ([developer guide, 4.1](docs/ExchangeLogReport-Guide.md#41-where-to-run-it-and-with-which-account)) |
+| Account | Local administrator of every Exchange server, to read the log folders over the administrative shares. On an Exchange server: SYSTEM (member of *Exchange Trusted Subsystem*), nothing to configure. On an administration server: a domain account, with *Log on as a batch job* on that server ([developer guide, 4.1](package/docs/ExchangeLogReport-Guide.md#41-where-to-run-it-and-with-which-account)) |
 | Exchange role | *View-Only Organization Management*, for `-Mode Discover` only — the collection reads files and needs no Exchange role |
 | Network | SMB (445) from the collector to every server; from an administration server, also HTTP (80) to one Exchange server for `-Mode Discover` (remote PowerShell, Kerberos) |
 | Logging | SMTP protocol logging `Verbose` on the connectors to analyse; POP/IMAP protocol logs optional. HTTP Proxy, IIS, MAPI and message tracking logs are on by default |
@@ -213,14 +213,14 @@ Six tabs — **Client sessions**, **Failed and slow requests**, **Users**, **Ope
 
 ## Documentation
 
-The zip of each [release](https://github.com/Nico77600/ExchangeLogReport/releases) contains only the files needed to run, with both guides in HTML; `.\tools\New-ExchangeLogReportPackage.ps1` builds the same package from the repository.
+The `package` folder of this repository holds exactly the files needed to run Exchange Log Report, with both guides. The zip of each [release](https://github.com/Nico77600/ExchangeLogReport/releases) contains the same run-time files with the HTML guides; `.\tools\New-ExchangeLogReportPackage.ps1` builds that zip content from the repository.
 
 | Guide | Content |
 |---|---|
-| **[User guide](docs/ExchangeLogReport-UserGuide.md)** | **The guided path**, step by step: set up once (**1 to 4**), then **A · Recurring reporting** (scheduled HTML reports, e-mail as an option) or **B · Troubleshooting** (a user, a message, an incident). Each step gives the command to copy, what you should see and what to do if not; then how to keep it running and how to change the examples. |
-| **[Developer guide](docs/ExchangeLogReport-Guide.md)** | Everything else: the principles, where to run the tool and with which account, installation, configuration (servers and log folders found by `-Mode Discover`, sources, noise rules, slow-request threshold, retention), the scheduled collection and reports, the e-mail settings, how to read each tab of the report, the correlation rules, the data model, volumes and performance, troubleshooting, how to modify and validate the tool. |
+| **[User guide](package/docs/ExchangeLogReport-UserGuide.md)** | **The guided path**, step by step: set up once (**1 to 4**), then **A · Recurring reporting** (scheduled HTML reports, e-mail as an option) or **B · Troubleshooting** (a user, a message, an incident). Each step gives the command to copy, what you should see and what to do if not; then how to keep it running and how to change the examples. |
+| **[Developer guide](package/docs/ExchangeLogReport-Guide.md)** | Everything else: the principles, where to run the tool and with which account, installation, configuration (servers and log folders found by `-Mode Discover`, sources, noise rules, slow-request threshold, retention), the scheduled collection and reports, the e-mail settings, how to read each tab of the report, the correlation rules, the data model, volumes and performance, troubleshooting, how to modify and validate the tool. |
 
-Both guides also exist as a single HTML file with a light and a dark theme (`docs/ExchangeLogReport-UserGuide.html`, `docs/ExchangeLogReport-Guide.html`): download them and open them locally, or use the copies in the release zip.
+Both guides also exist as a single HTML file with a light and a dark theme (`package/docs/ExchangeLogReport-UserGuide.html`, `package/docs/ExchangeLogReport-Guide.html`): download them and open them locally, or use the copies in the release zip.
 
 ## Tests
 
@@ -228,13 +228,13 @@ Both guides also exist as a single HTML file with a light and a dark theme (`doc
 Invoke-Pester -Path .\tests      # Pester 5+, logs generated in the exact Exchange formats, no Exchange server needed
 ```
 
-`tools\New-ExlSyntheticLogs.ps1` writes logs with the volumes of a production server (or a decommissioning case), and `tools\Measure-ExlCollection.ps1` measures a collection on them: the performance figures above come from these tools, on a PC and on the lab ([developer guide, chapter 12](docs/ExchangeLogReport-Guide.md#12-volumes-and-performance)).
+`tools\New-ExlSyntheticLogs.ps1` writes logs with the volumes of a production server (or a decommissioning case), and `tools\Measure-ExlCollection.ps1` measures a collection on them: the performance figures above come from these tools, on a PC and on the lab ([developer guide, chapter 12](package/docs/ExchangeLogReport-Guide.md#12-volumes-and-performance)).
 
 The tool was also validated on a lab of four Exchange Server SE servers (two sites, one DAG) and an Edge Transport server with generated traffic: Outlook, iPhone and Android ActiveSync, OWA, EWS, Outlook for Mac, IMAP, POP, SMTP submission and relay, wrong passwords, blocked devices, internet mail through the Edge; and with a collector on an administration server, log folders moved to another drive and a second OWA/ECP web site (developer guide, chapter 14).
 
 ## License
 
-[MIT](LICENSE). The bundled SQLite components keep their own licenses: see [THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md).
+[MIT](LICENSE). The bundled SQLite components keep their own licenses: see [THIRD-PARTY-NOTICES.md](package/THIRD-PARTY-NOTICES.md).
 
 ## Disclaimer
 

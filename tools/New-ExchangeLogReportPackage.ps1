@@ -4,8 +4,8 @@
     Copies the files needed to run Exchange Log Report into a separate folder, ready to be zipped.
 
 .DESCRIPTION
-    The package contains only what Invoke-ExchangeLogReport.ps1 needs at run time, plus the HTML guides and
-    the licence notice of the SQLite binaries:
+    The package contains only what Invoke-ExchangeLogReport.ps1 needs at run time, plus the short README,
+    the HTML guides and the licence notice of the SQLite binaries:
         Invoke-ExchangeLogReport.ps1, ExchangeLogReport.psd1, ExchangeLogReport.psm1, config\, src\,
         templates\, lib\sqlite\, docs\ExchangeLogReport-UserGuide.html, docs\ExchangeLogReport-Guide.html,
         README.md, CHANGELOG.md, THIRD-PARTY-NOTICES.md
@@ -19,7 +19,7 @@
     database, report or log file is in the package.
 
 .PARAMETER Destination
-    Package folder. Default: package\ExchangeLogReport-<version>, next to the tool folder.
+    Package folder. Default: package\ExchangeLogReport-<version>, next to the repository folder.
 
 .PARAMETER Force
     Replace the destination folder if it already contains a package. A folder that contains a data\
@@ -41,12 +41,13 @@ param(
 
 $ErrorActionPreference = 'Stop'
 $root = Split-Path $PSScriptRoot -Parent
-$version = (Import-PowerShellDataFile (Join-Path $root 'ExchangeLogReport.psd1')).ModuleVersion
+$packageRoot = Join-Path $root 'package'
+$version = (Import-PowerShellDataFile (Join-Path $packageRoot 'ExchangeLogReport.psd1')).ModuleVersion
 if (-not $Destination) { $Destination = Join-Path (Split-Path $root -Parent) "package\ExchangeLogReport-$version" }
 $Destination = [IO.Path]::GetFullPath($Destination, (Get-Location).Path).TrimEnd('\')
 
-$rootPrefix = [IO.Path]::GetFullPath($root).TrimEnd('\') + '\'
-if (($Destination + '\').StartsWith($rootPrefix, [StringComparison]::OrdinalIgnoreCase) -or $rootPrefix.StartsWith($Destination + '\', [StringComparison]::OrdinalIgnoreCase)) {
+$repoPrefix = [IO.Path]::GetFullPath($root).TrimEnd('\') + '\'
+if (($Destination + '\').StartsWith($repoPrefix, [StringComparison]::OrdinalIgnoreCase) -or $repoPrefix.StartsWith($Destination + '\', [StringComparison]::OrdinalIgnoreCase)) {
     throw "The destination must be outside the tool folder: $Destination"
 }
 if (Test-Path -LiteralPath $Destination) {
@@ -64,10 +65,10 @@ $files = [Collections.Generic.List[string]]::new()
 foreach ($f in 'Invoke-ExchangeLogReport.ps1', 'ExchangeLogReport.psd1', 'ExchangeLogReport.psm1', 'README.md', 'CHANGELOG.md', 'THIRD-PARTY-NOTICES.md',
     'config\ExchangeLogReport.config.psd1', 'templates\Report.template.html', 'docs\ExchangeLogReport-Guide.html', 'docs\ExchangeLogReport-UserGuide.html') { $files.Add($f) }
 foreach ($folder in 'src', 'lib\sqlite') {
-    Get-ChildItem -LiteralPath (Join-Path $root $folder) -Recurse -File | ForEach-Object { $files.Add($_.FullName.Substring($rootPrefix.Length)) }
+    Get-ChildItem -LiteralPath (Join-Path $packageRoot $folder) -Recurse -File | ForEach-Object { $files.Add($_.FullName.Substring($packageRoot.Length + 1)) }
 }
 foreach ($f in $files) {
-    $source = Join-Path $root $f
+    $source = if ($f -eq 'CHANGELOG.md') { Join-Path $root $f } else { Join-Path $packageRoot $f }
     if (-not (Test-Path -LiteralPath $source -PathType Leaf)) { throw "Missing file in the tool folder: $f" }
     $target = Join-Path $Destination $f
     [void][IO.Directory]::CreateDirectory((Split-Path $target -Parent))

@@ -5,5 +5,5 @@ logs/
 *.sqlite
 *.sqlite-*
 *.lock
-config/*.paths.psd1
-config/*.credential
+package/config/*.paths.psd1
+package/config/*.credential

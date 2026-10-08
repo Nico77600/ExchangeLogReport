@@ -792,13 +792,13 @@ The first opening of a 1.x database by 2.0.0 builds `ix_msg_flow` and `ix_smtp_f
 | Database schema | `src\Engine.Store.cs` (`Schema`, `Migrate`). New tables: `CREATE … IF NOT EXISTS`; a new column of an existing table: `ALTER TABLE` in `Migrate` (done at the next collection) and a new `schema_version`. |
 | Console output | `ExchangeLogReport.psm1`, region 1 (same functions as Purview DLP Report). |
 | Log folders (`-Mode Discover`) | `ExchangeLogReport.psm1`, region 9 (IIS sites, paths file) and `src\Get-ExlExchangeSettings.ps1`, the Exchange part, run in **Windows PowerShell 5.1**: keep its syntax 5.1 (no `??`, `?.`, ternary operator); the tests run its functions in `powershell.exe`. |
-| This guide, the user guide | `docs\ExchangeLogReport-Guide.md` (developer guide) and `docs\ExchangeLogReport-UserGuide.md` (prerequisites and everyday commands only), then `.\tools\Build-Documentation.ps1`, which builds both (also run by the package tool). A link to the other guide (`ExchangeLogReport-Guide.md#4-prerequisites`, GitHub anchor) becomes a link to its HTML file. |
-| README graphics (GitHub) | `.\tools\New-DocumentationImages.ps1` renders `docs\images\readme-*.png` (light and dark) from the cards and flow blocks of this guide, with its CSS and icons (Microsoft Edge, headless). Run it after `Build-Documentation.ps1` when chapters 1, 2, 3 or 11 change. |
-| Version | `ExchangeLogReport.psd1` (`ModuleVersion`), `$script:ToolVersion` in the module, headers, front matter of both guides, `CHANGELOG.md`. |
+| This guide, the user guide | `package\docs\ExchangeLogReport-Guide.md` (developer guide) and `package\docs\ExchangeLogReport-UserGuide.md` (prerequisites and everyday commands only), then `.\tools\Build-Documentation.ps1`, which builds both (also run by the package tool). A link to the other guide (`ExchangeLogReport-Guide.md#4-prerequisites`, GitHub anchor) becomes a link to its HTML file. |
+| README graphics (GitHub) | `.\tools\New-DocumentationImages.ps1` renders `package\docs\images\readme-*.png` (light and dark) from the cards and flow blocks of this guide, with its CSS and icons (Microsoft Edge, headless). Run it after `Build-Documentation.ps1` when chapters 1, 2, 3 or 11 change. |
+| Version | `package\ExchangeLogReport.psd1` (`ModuleVersion`), `$script:ToolVersion` in the module, headers, front matter of both guides, `CHANGELOG.md`. |
 
 ```steps
 Test | `Invoke-Pester -Path .\tests\ExchangeLogReport.Tests.ps1 -Output Detailed` — no Exchange needed: the logs are generated with the exact Exchange formats.
-Build the guides | `.\tools\Build-Documentation.ps1` writes `docs\ExchangeLogReport-Guide.html` and `docs\ExchangeLogReport-UserGuide.html` (self-contained: images inline).
+Build the guides | `.\tools\Build-Documentation.ps1` writes `package\docs\ExchangeLogReport-Guide.html` and `package\docs\ExchangeLogReport-UserGuide.html` (self-contained: images inline).
 Build the package | `.\tools\New-ExchangeLogReportPackage.ps1` — no database, no reports, no logs; both HTML guides are included.
 ```
 

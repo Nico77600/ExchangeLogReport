@@ -51,7 +51,8 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
-$root = Split-Path $PSScriptRoot -Parent
+$repoRoot = Split-Path $PSScriptRoot -Parent
+$root = Join-Path $repoRoot 'package'
 # "A,B" given as one value (pwsh -File): a list.
 $Server = @($Server | ForEach-Object { $_ -split ',' } | Where-Object { $_ })
 $Set = @($Set | Where-Object { $_ })

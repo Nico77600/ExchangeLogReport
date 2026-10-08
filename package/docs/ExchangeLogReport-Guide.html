@@ -1469,19 +1469,19 @@ Retention: deletes 0.0 s, vacuum 0.0 s, statistics 0.2 s, WAL 1.56 GB written in
 </tr>
 <tr>
 <td>This guide, the user guide</td>
-<td><code>docs\ExchangeLogReport-Guide.md</code> (developer guide) and <code>docs\ExchangeLogReport-UserGuide.md</code> (prerequisites and everyday commands only), then <code>.\tools\Build-Documentation.ps1</code>, which builds both (also run by the package tool). A link to the other guide (<code>ExchangeLogReport-Guide.md#4-prerequisites</code>, GitHub anchor) becomes a link to its HTML file.</td>
+<td><code>package\docs\ExchangeLogReport-Guide.md</code> (developer guide) and <code>package\docs\ExchangeLogReport-UserGuide.md</code> (prerequisites and everyday commands only), then <code>.\tools\Build-Documentation.ps1</code>, which builds both (also run by the package tool). A link to the other guide (<code>ExchangeLogReport-Guide.md#4-prerequisites</code>, GitHub anchor) becomes a link to its HTML file.</td>
 </tr>
 <tr>
 <td>README graphics (GitHub)</td>
-<td><code>.\tools\New-DocumentationImages.ps1</code> renders <code>docs\images\readme-*.png</code> (light and dark) from the cards and flow blocks of this guide, with its CSS and icons (Microsoft Edge, headless). Run it after <code>Build-Documentation.ps1</code> when chapters 1, 2, 3 or 11 change.</td>
+<td><code>.\tools\New-DocumentationImages.ps1</code> renders <code>package\docs\images\readme-*.png</code> (light and dark) from the cards and flow blocks of this guide, with its CSS and icons (Microsoft Edge, headless). Run it after <code>Build-Documentation.ps1</code> when chapters 1, 2, 3 or 11 change.</td>
 </tr>
 <tr>
 <td>Version</td>
-<td><code>ExchangeLogReport.psd1</code> (<code>ModuleVersion</code>), <code>$script:ToolVersion</code> in the module, headers, front matter of both guides, <code>CHANGELOG.md</code>.</td>
+<td><code>package\ExchangeLogReport.psd1</code> (<code>ModuleVersion</code>), <code>$script:ToolVersion</code> in the module, headers, front matter of both guides, <code>CHANGELOG.md</code>.</td>
 </tr>
 </tbody>
 </table></div>
-<ol class="steps"><li><span class="step-num">1</span><div class="step-body"><div class="step-title">Test</div><div class="step-text"><code>Invoke-Pester -Path .\tests\ExchangeLogReport.Tests.ps1 -Output Detailed</code> — no Exchange needed: the logs are generated with the exact Exchange formats.</div></div></li><li><span class="step-num">2</span><div class="step-body"><div class="step-title">Build the guides</div><div class="step-text"><code>.\tools\Build-Documentation.ps1</code> writes <code>docs\ExchangeLogReport-Guide.html</code> and <code>docs\ExchangeLogReport-UserGuide.html</code> (self-contained: images inline).</div></div></li><li><span class="step-num">3</span><div class="step-body"><div class="step-title">Build the package</div><div class="step-text"><code>.\tools\New-ExchangeLogReportPackage.ps1</code> — no database, no reports, no logs; both HTML guides are included.</div></div></li></ol>
+<ol class="steps"><li><span class="step-num">1</span><div class="step-body"><div class="step-title">Test</div><div class="step-text"><code>Invoke-Pester -Path .\tests\ExchangeLogReport.Tests.ps1 -Output Detailed</code> — no Exchange needed: the logs are generated with the exact Exchange formats.</div></div></li><li><span class="step-num">2</span><div class="step-body"><div class="step-title">Build the guides</div><div class="step-text"><code>.\tools\Build-Documentation.ps1</code> writes <code>package\docs\ExchangeLogReport-Guide.html</code> and <code>package\docs\ExchangeLogReport-UserGuide.html</code> (self-contained: images inline).</div></div></li><li><span class="step-num">3</span><div class="step-body"><div class="step-title">Build the package</div><div class="step-text"><code>.\tools\New-ExchangeLogReportPackage.ps1</code> — no database, no reports, no logs; both HTML guides are included.</div></div></li></ol>
 </div></section><section class="section" id="validation-in-the-lab"><div class="section-head"><div class="section-icon"><svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M9 3h6M10 3v6L4.5 18.5A1.7 1.7 0 0 0 6 21h12a1.7 1.7 0 0 0 1.5-2.5L14 9V3"/><path d="M7 15h10"/></svg></div><div><div class="section-eyebrow">Chapter 14</div><h2>Validation in the lab</h2></div></div><div class="section-body">
 <p>Four Exchange Server SE mailbox servers EXCH01 to EXCH04 (two Active Directory sites, one DAG), collector on EXCH01 as SYSTEM, PowerShell 7.6.6 portable, 60 days of logs:</p>
 <ul>
@@ -1879,7 +1879,7 @@ Retention: deletes 0.0 s, vacuum 0.0 s, statistics 0.2 s, WAL 1.56 GB written in
 </div></section><section class="section" id="annex-c-versioning"><div class="section-head"><div class="section-icon"><svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 12V4h8l10 10-8 8z"/><circle cx="7.5" cy="8" r="1.5"/></svg></div><div><div class="section-eyebrow">Annex C</div><h2>Versioning</h2></div></div><div class="section-body">
 <p>MAJOR.MINOR.PATCH: MAJOR for a database or configuration change that needs action, MINOR for a new feature, PATCH for a fix. Every change is listed in <code>CHANGELOG.md</code>.</p>
 </div></section>
-<footer>Exchange Log Report 2.0.0 · Nicolas Fabert · generated 2026-10-07 20:01 from ExchangeLogReport-Guide.md</footer></main>
+<footer>Exchange Log Report 2.0.0 · Nicolas Fabert · generated 2026-10-08 08:57 from ExchangeLogReport-Guide.md</footer></main>
 <button type="button" id="to-top" title="Back to top"><svg class="icon-sm" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m6 14 6-6 6 6"/></svg></button>
 <dialog id="zoom"><img alt=""></dialog>
 <script>
