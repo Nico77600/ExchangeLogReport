@@ -238,4 +238,7 @@ The tool was also validated on a lab of four Exchange Server SE servers (two sit
 
 ## Disclaimer
 
-Personal project, provided as is. It is not an official Microsoft product and is not supported by Microsoft. Test it in your environment before production use.
+This Script is a Personal project.
+It's provided "AS-IS". It's not an official Microsoft product so no support can be expected from Microsoft.
+
+As any scripts you must read carefully the documentation and test it first in a Test environment before any run in Production.

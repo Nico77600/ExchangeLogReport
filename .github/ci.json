@@ -1,0 +1,10 @@
+{
+  "runtimeRoot": "package",
+  "testMode": "pester",
+  "testEntry": null,
+  "tests": [
+    "tests/ExchangeLogReport.Tests.ps1"
+  ],
+  "packageBuilder": "tools/New-ExchangeLogReportPackage.ps1",
+  "packageEntry": "Invoke-ExchangeLogReport.ps1"
+}
