@@ -6,6 +6,10 @@ param(
 
 $ErrorActionPreference = 'Stop'
 [void][IO.Directory]::CreateDirectory($Destination)
+if (-not (Get-PSRepository -ErrorAction Stop | Where-Object Name -eq 'PSGallery')) {
+    Write-Host 'Registering the default PSGallery repository on this CI runner.'
+    Register-PSRepository -Default -ErrorAction Stop
+}
 Save-Module -Name Pester -RequiredVersion 6.1.0 -Repository PSGallery -Path $Destination -Force -ErrorAction Stop
 Save-Module -Name PSScriptAnalyzer -RequiredVersion 1.25.0 -Repository PSGallery -Path $Destination -Force -ErrorAction Stop
 

@@ -1186,6 +1186,18 @@ Describe 'Command line and periods' {
 }
 
 Describe 'Entry script' {
+    It 'keeps the runtime readme and script disclaimer identical to the project readme' {
+        $pattern = '(?ms)^## Disclaimer\r?\n\s*(.+?)(?=^## |\z)'
+        $projectReadme = Get-Content -LiteralPath (Join-Path $script:RepoRoot 'README.md') -Raw
+        $expected = [regex]::Replace([regex]::Match($projectReadme, $pattern).Groups[1].Value, '\s+', ' ').Trim()
+        $expected | Should -Not -BeNullOrEmpty
+        $runtimeReadme = Get-Content -LiteralPath (Join-Path $script:Root 'README.md') -Raw
+        $actual = [regex]::Replace([regex]::Match($runtimeReadme, $pattern).Groups[1].Value, '\s+', ' ').Trim()
+        $actual | Should -BeExactly $expected
+        $help = Get-Help (Join-Path $script:Root 'Invoke-ExchangeLogReport.ps1') -Full
+        $notes = [regex]::Replace(($help.alertSet.alert.Text -join ' '), '\s+', ' ').Trim()
+        $notes.EndsWith($expected, [StringComparison]::Ordinal) | Should -BeTrue
+    }
     It 'Status on a new installation confirms the configuration and creates no database' {
         $dir = Join-Path $TestDrive 'fresh'
         $cfg = New-TestConfig $dir
