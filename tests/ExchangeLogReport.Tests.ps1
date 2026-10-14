@@ -3307,44 +3307,72 @@ public sealed class AuthMemorySampler : IDisposable {
         thread.IsBackground = true; thread.Start();
     }
     public void Dispose() { stop = true; thread.Join(); Telemetry.Finish(); }
+    public static SmtpMemoryTelemetry TrackerTelemetry;
+    public static long TrackerWorkItems, TrackerPasses;
+    public static long[][] TrackerSessions;
     public static long[] Tracker(Assembly engine, string folder, int count) {
+        if (count <= 0 || 160000 % count != 0) throw new ArgumentOutOfRangeException(nameof(count));
         var headType = engine.GetType("ExchangeLogReport.AuthFragment");
-        var head = Activator.CreateInstance(headType, true);
-        foreach (var name in new[] { "Server", "Direction", "Role", "SessionId", "SourceKey" })
-            headType.GetField(name).SetValue(head, name == "Direction" ? "Receive" : name == "Role" ? "FrontEnd" : "memory");
-        headType.GetField("FirstMs").SetValue(head, 1000L);
-        var spool = Activator.CreateInstance(engine.GetType("ExchangeLogReport.SmtpSpool"), new object[] { folder });
+        var type = engine.GetType("ExchangeLogReport.SmtpAuthTracker");
+        var line = type.GetMethod("Line"); var mail = type.GetMethod("Mail"); var finish = type.GetMethod("Finish");
+        object tracker = null, spool = null;
+        long parts = 0, live = 0;
+        var watch = Stopwatch.StartNew();
+        var sample = new AuthMemorySampler();
         try {
-            var type = engine.GetType("ExchangeLogReport.SmtpAuthTracker");
-            var tracker = Activator.CreateInstance(type, new object[] { true, head, spool, 1L });
-            var line = type.GetMethod("Line"); var mail = type.GetMethod("Mail");
-            var args = new object[] { "+", false, false, 1000L, 0L, 0L, "", "", null, null, false };
-            line.Invoke(tracker, args);
-            args[0] = "<"; args[1] = true; args[4] = 1L; args[6] = "AUTH PLAIN [redacted]";
-            line.Invoke(tracker, args);
-            args[0] = "*"; args[1] = false; args[4] = 2L; args[6] = "memory.user@contoso.test"; args[7] = "authenticated";
-            line.Invoke(tracker, args);
-            args[0] = ">"; args[2] = true; args[4] = 3L; args[6] = "235 Authentication successful"; args[7] = "";
-            line.Invoke(tracker, args);
-            var m = new object[] { 1000L, 4L, 4L, true };
-            var watch = Stopwatch.StartNew();
-            using (var sample = new AuthMemorySampler()) {
-                for (int i = 0; i < count; i++) {
-                    long seq = 4L + i * 2L;
-                    args[0] = "<"; args[1] = true; args[2] = false; args[3] = 1000L + seq; args[4] = seq; args[5] = seq;
-                    args[6] = "MAIL FROM:<sender@vendor.example>";
+            try {
+                TrackerWorkItems = 0; TrackerPasses = 0;
+                TrackerSessions = new long[160000 / count][];
+                // Equal total work, with independent N-MAIL sessions fully measured and closed before the next one.
+                for (int pass = 0; pass < TrackerSessions.Length; pass++) {
+                    var head = Activator.CreateInstance(headType, true);
+                    foreach (var name in new[] { "Server", "Direction", "Role", "SessionId", "SourceKey" })
+                        headType.GetField(name).SetValue(head, name == "Direction" ? "Receive" : name == "Role" ? "FrontEnd" : "memory");
+                    headType.GetField("FirstMs").SetValue(head, 1000L);
+                    spool = Activator.CreateInstance(engine.GetType("ExchangeLogReport.SmtpSpool"), new object[] { folder });
+                    tracker = Activator.CreateInstance(type, new object[] { true, head, spool, 1L });
+                    var args = new object[] { "+", false, false, 1000L, 0L, 0L, "", "", null, null, false };
                     line.Invoke(tracker, args);
-                    m[0] = args[3]; m[1] = seq; m[2] = seq; mail.Invoke(tracker, m);
-                    args[0] = ">"; args[1] = false; args[2] = true; args[4] = seq + 1; args[5] = seq + 1; args[6] = "250 OK";
+                    args[0] = "<"; args[1] = true; args[4] = 1L; args[6] = "AUTH PLAIN [redacted]";
                     line.Invoke(tracker, args);
+                    args[0] = "*"; args[1] = false; args[4] = 2L; args[6] = "memory.user@contoso.test"; args[7] = "authenticated";
+                    line.Invoke(tracker, args);
+                    args[0] = ">"; args[2] = true; args[4] = 3L; args[6] = "235 Authentication successful"; args[7] = "";
+                    line.Invoke(tracker, args);
+                    var m = new object[] { 1000L, 4L, 4L, true };
+                    long before = TrackerWorkItems;
+                    for (int i = 0; i < count; i++) {
+                        long seq = 4L + i * 2L;
+                        args[0] = "<"; args[1] = true; args[2] = false; args[3] = 1000L + seq; args[4] = seq; args[5] = seq;
+                        args[6] = "MAIL FROM:<sender@vendor.example>";
+                        line.Invoke(tracker, args);
+                        m[0] = args[3]; m[1] = seq; m[2] = seq; mail.Invoke(tracker, m);
+                        args[0] = ">"; args[1] = false; args[2] = true; args[4] = seq + 1; args[5] = seq + 1; args[6] = "250 OK";
+                        line.Invoke(tracker, args);
+                        TrackerWorkItems++;
+                    }
+                    parts = (long)spool.GetType().GetField("Parts").GetValue(spool);
+                    live = (int)type.GetProperty("Live").GetValue(tracker);
+                    long endSeq = 4L + count * 2L;
+                    args[0] = "-"; args[1] = false; args[2] = false; args[3] = 1000L + endSeq; args[4] = endSeq; args[5] = endSeq; args[6] = ""; args[7] = "Local";
+                    line.Invoke(tracker, args);
+                    long closed = (long)finish.Invoke(tracker, new object[] { long.MinValue });
+                    TrackerSessions[pass] = new[] { TrackerWorkItems - before, parts, live, closed,
+                        (long)(int)type.GetProperty("Live").GetValue(tracker), (long)spool.GetType().GetField("Parts").GetValue(spool) };
+                    TrackerPasses++;
+                    if (pass + 1 < TrackerSessions.Length) {
+                        ((IDisposable)spool).Dispose();
+                        spool = null; tracker = null;
+                    }
                 }
-                long end = GC.GetTotalMemory(true);
-                GC.KeepAlive(tracker); GC.KeepAlive(spool);
+            } finally {
                 sample.Dispose();
-                return new[] { sample.ManagedBase, sample.ManagedPeak, end, sample.Samples, (long)watch.ElapsedMilliseconds,
-                    (long)spool.GetType().GetField("Parts").GetValue(spool), (long)(int)type.GetProperty("Live").GetValue(tracker) };
+                TrackerTelemetry = sample.Telemetry;
             }
-        } finally { ((IDisposable)spool).Dispose(); }
+            long end = GC.GetTotalMemory(true);
+            GC.KeepAlive(tracker); GC.KeepAlive(spool); GC.KeepAlive(TrackerSessions);
+            return new[] { sample.ManagedBase, sample.ManagedPeak, end, sample.Samples, (long)watch.ElapsedMilliseconds, parts, live };
+        } finally { if (spool != null) ((IDisposable)spool).Dispose(); }
     }
 }
 "@
@@ -3419,6 +3447,8 @@ try {
         managedBase=$sample.ManagedBase; managedPeak=$sample.ManagedPeak; managedEnd=$end;
         privateBase=$sample.PrivateBase; privatePeak=$sample.PrivatePeak; samples=$sample.Samples;
         elapsedSeconds=$collectionSeconds; errors=$result.Errors; tracker=$tracker; resolver=$resolverMemory;
+        trackerTelemetry=[AuthMemorySampler]::TrackerTelemetry; trackerWorkItems=[AuthMemorySampler]::TrackerWorkItems;
+        trackerPasses=[AuthMemorySampler]::TrackerPasses; trackerSessions=[AuthMemorySampler]::TrackerSessions;
         runtime=$runtime; memoryTelemetry=$sample.Telemetry;
         scratchRemaining=@(Get-ChildItem -LiteralPath (Split-Path $s.Storage.DatabasePath) -Force -Filter '.report-*').Count
     }
@@ -3473,6 +3503,20 @@ try {
                 $m.resolver.replayed | Should -Be (2 * $m.resolver.passes)
                 $m.tracker[5] | Should -BeGreaterThan 0
                 $m.tracker[6] | Should -BeLessOrEqual 256
+                $m.tracker.Count | Should -Be 7
+                $m.trackerWorkItems | Should -Be 160000
+                $m.trackerPasses | Should -Be (160000 / $count)
+                $m.trackerSessions.Count | Should -Be $m.trackerPasses
+                foreach ($session in $m.trackerSessions) {
+                    $session[0] | Should -Be $count
+                    $session[1] | Should -Be ([math]::Floor(($count + 5) / 256))
+                    $session[2] | Should -Be (($count + 5) % 256)
+                    $session[2] | Should -BeLessOrEqual 256
+                    $session[3] | Should -Be ([math]::Ceiling(($count + 6) / 256))
+                    $session[4] | Should -Be 0
+                    $session[5] | Should -Be $session[3]
+                }
+                Assert-MemoryTelemetry $m.trackerTelemetry $m.tracker[1] $m.tracker[3]
                 Assert-MemoryTelemetry $m.resolver.telemetry $m.resolver.managedPeak $m.resolver.samples
             }
             $small = $measurements[0]; $large = $measurements[2]
