@@ -2483,6 +2483,80 @@ Describe 'SMTP authenticated identity' {
     # Review corrections: continuity of the front-end proof, barrier after the 235, long connections, mechanism of a failed attempt.
     Context 'review corrections' {
         BeforeAll {
+            $memoryTelemetrySource = @'
+public sealed class SmtpMemoryTelemetry {
+    public long AllocatedBase, AllocatedEndBeforeEndCollection, Collection0Base, Collection1Base, Collection2Base;
+    public long Collection0EndBeforeEndCollection, Collection1EndBeforeEndCollection, Collection2EndBeforeEndCollection;
+    public long StartTimestamp, EndTimestamp, PeakTimestamp, PeakObservedManagedBytes, PeakObservationCount;
+    public long Collection0AtPeak, Collection1AtPeak, Collection2AtPeak;
+    public long LastGcIndexAtPeak, LastGcGenerationAtPeak, LastGcHeapBytesAtPeak, LastGcFragmentedBytesAtPeak;
+    public long LastGcCommittedBytesAtPeak, AvailableMemoryBytesAtPeak, LastGcMemoryLoadBytesAtPeak;
+    public long LastGcGen0BeforeBytesAtPeak, LastGcGen0AfterBytesAtPeak;
+    public long LastGcGen1BeforeBytesAtPeak, LastGcGen1AfterBytesAtPeak;
+    public long LastGcGen2BeforeBytesAtPeak, LastGcGen2AfterBytesAtPeak;
+    public long ObserverAllocatedBytes, ObserverTicks;
+    public int StartLatencyMode, PeakLatencyMode;
+    public readonly string PeakInfoMeaning = "Last completed GC observed at a new sampled peak; not instantaneous live size or GC budget";
+    public void Start() {
+        AllocatedBase = GC.GetTotalAllocatedBytes(false);
+        Collection0Base = GC.CollectionCount(0); Collection1Base = GC.CollectionCount(1); Collection2Base = GC.CollectionCount(2);
+        StartLatencyMode = (int)System.Runtime.GCSettings.LatencyMode;
+        StartTimestamp = Stopwatch.GetTimestamp();
+    }
+    public void RecordPeak(long managed) {
+        long allocated = GC.GetAllocatedBytesForCurrentThread(), start = Stopwatch.GetTimestamp();
+        PeakObservedManagedBytes = managed; PeakTimestamp = start; PeakObservationCount++;
+        Collection0AtPeak = GC.CollectionCount(0); Collection1AtPeak = GC.CollectionCount(1); Collection2AtPeak = GC.CollectionCount(2);
+        PeakLatencyMode = (int)System.Runtime.GCSettings.LatencyMode;
+        // This snapshot describes the last completed GC, which can precede the sampled peak.
+        var info = GC.GetGCMemoryInfo();
+        LastGcIndexAtPeak = info.Index; LastGcGenerationAtPeak = info.Generation;
+        LastGcHeapBytesAtPeak = info.HeapSizeBytes; LastGcFragmentedBytesAtPeak = info.FragmentedBytes;
+        LastGcCommittedBytesAtPeak = info.TotalCommittedBytes; AvailableMemoryBytesAtPeak = info.TotalAvailableMemoryBytes;
+        LastGcMemoryLoadBytesAtPeak = info.MemoryLoadBytes;
+        LastGcGen0BeforeBytesAtPeak = info.GenerationInfo[0].SizeBeforeBytes; LastGcGen0AfterBytesAtPeak = info.GenerationInfo[0].SizeAfterBytes;
+        LastGcGen1BeforeBytesAtPeak = info.GenerationInfo[1].SizeBeforeBytes; LastGcGen1AfterBytesAtPeak = info.GenerationInfo[1].SizeAfterBytes;
+        LastGcGen2BeforeBytesAtPeak = info.GenerationInfo[2].SizeBeforeBytes; LastGcGen2AfterBytesAtPeak = info.GenerationInfo[2].SizeAfterBytes;
+        ObserverAllocatedBytes += GC.GetAllocatedBytesForCurrentThread() - allocated;
+        ObserverTicks += Stopwatch.GetTimestamp() - start;
+    }
+    public void Finish() {
+        EndTimestamp = Stopwatch.GetTimestamp();
+        AllocatedEndBeforeEndCollection = GC.GetTotalAllocatedBytes(false);
+        Collection0EndBeforeEndCollection = GC.CollectionCount(0); Collection1EndBeforeEndCollection = GC.CollectionCount(1); Collection2EndBeforeEndCollection = GC.CollectionCount(2);
+    }
+    public static System.Collections.Generic.Dictionary<string, object> Runtime() {
+        var env = new System.Collections.Generic.Dictionary<string, string>();
+        foreach (var prefix in new[] { "DOTNET_", "COMPlus_" })
+            foreach (var suffix in new[] { "gcServer", "gcConcurrent", "GCHeapHardLimit", "GCHeapHardLimitPercent", "GCConserveMemory", "GCRetainVM", "GCHeapCount", "GCHeapAffinitizeMask", "GCNoAffinitize" }) {
+                string name = prefix + suffix, value = Environment.GetEnvironmentVariable(name);
+                if (value != null) env[name] = value;
+            }
+        string processors = Environment.GetEnvironmentVariable("DOTNET_PROCESSOR_COUNT");
+        if (processors != null) env["DOTNET_PROCESSOR_COUNT"] = processors;
+        return new System.Collections.Generic.Dictionary<string, object> {
+            { "framework", System.Runtime.InteropServices.RuntimeInformation.FrameworkDescription },
+            { "processorCount", Environment.ProcessorCount }, { "serverGc", System.Runtime.GCSettings.IsServerGC },
+            { "latencyMode", System.Runtime.GCSettings.LatencyMode.ToString() }, { "stopwatchFrequency", Stopwatch.Frequency },
+            { "gcEnvironment", env }
+        };
+    }
+}
+'@
+            function Assert-MemoryTelemetry($telemetry, $peak, $samples) {
+                ($telemetry.AllocatedEndBeforeEndCollection - $telemetry.AllocatedBase) | Should -BeGreaterOrEqual 0
+                foreach ($generation in 0,1,2) {
+                    ($telemetry."Collection${generation}EndBeforeEndCollection" - $telemetry."Collection${generation}Base") | Should -BeGreaterOrEqual 0
+                }
+                $telemetry.PeakObservationCount | Should -BeGreaterThan 0
+                $telemetry.PeakObservationCount | Should -BeLessOrEqual $samples
+                $telemetry.PeakObservedManagedBytes | Should -Be $peak
+                $telemetry.PeakTimestamp | Should -BeGreaterOrEqual $telemetry.StartTimestamp
+                $telemetry.EndTimestamp | Should -BeGreaterOrEqual $telemetry.PeakTimestamp
+                $telemetry.AvailableMemoryBytesAtPeak | Should -BeGreaterThan 0
+                $telemetry.ObserverAllocatedBytes | Should -BeGreaterOrEqual 0
+                $telemetry.ObserverTicks | Should -BeGreaterOrEqual 0
+            }
             $u64 = B64 $script:Secrets.User; $p64 = B64 $script:Secrets.Password
             $alice = 'alice@contoso.test'
             $fe = 'EXCH01\Client Frontend EXCH01'; $feLocal = '10.0.0.1:587'; $cp = 'EXCH01\Client Proxy EXCH01'; $beLocal = '10.0.0.1:465'
@@ -2876,17 +2950,23 @@ Add-Type -TypeDefinition @"
 using System;
 using System.Diagnostics;
 using System.Threading;
+/* SMTP_MEMORY_TELEMETRY_TYPE */
 public sealed class ProxyLoadSample : IDisposable {
     readonly Thread thread; volatile bool stop;
     public long ManagedBase, ManagedPeak, ManagedEnd, PrivateBase, PrivatePeak, Samples;
+    public readonly SmtpMemoryTelemetry Telemetry = new SmtpMemoryTelemetry();
     public ProxyLoadSample() {
         ManagedBase = GC.GetTotalMemory(true); ManagedPeak = ManagedBase;
         using (var p = Process.GetCurrentProcess()) { p.Refresh(); PrivateBase = p.PrivateMemorySize64; }
         PrivatePeak = PrivateBase;
+        Telemetry.Start();
         thread = new Thread(() => {
             using (var p = Process.GetCurrentProcess()) {
                 while (!stop) {
-                    ManagedPeak = Math.Max(ManagedPeak, GC.GetTotalMemory(false));
+                    long managed = GC.GetTotalMemory(false);
+                    bool newPeak = managed > ManagedPeak;
+                    ManagedPeak = Math.Max(ManagedPeak, managed);
+                    if (newPeak) Telemetry.RecordPeak(managed);
                     p.Refresh(); PrivatePeak = Math.Max(PrivatePeak, p.PrivateMemorySize64);
                     Samples++; Thread.Sleep(20);
                 }
@@ -2894,7 +2974,7 @@ public sealed class ProxyLoadSample : IDisposable {
         });
         thread.IsBackground = true; thread.Start();
     }
-    public void Dispose() { stop = true; thread.Join(); ManagedEnd = GC.GetTotalMemory(true); }
+    public void Dispose() { stop = true; thread.Join(); Telemetry.Finish(); ManagedEnd = GC.GetTotalMemory(true); }
 }
 "@
 function Collect($s) {
@@ -2980,16 +3060,19 @@ $parts = ReadRow $s "SELECT COUNT(*),MAX(json_array_length(observations)),MAX(le
 $totals = ReadRow $s "SELECT COUNT(*),SUM(role='FrontEnd'),SUM(auth_source IN ('Overflow','Ambiguous')) FROM smtp_transaction;"
 $references = ReadRow $s "SELECT COUNT(*) FROM smtp_transaction t LEFT JOIN smtp_auth_fragment f ON f.id=t.auth_fragment_id WHERE f.id IS NULL;"
 $offsets = ReadRow $s "SELECT COUNT(*),SUM(offset=size) FROM source_file;"
+$runtime = [SmtpMemoryTelemetry]::Runtime()
+$runtime['powerShellVersion'] = $PSVersionTable.PSVersion.ToString()
 $data = @{
     mode=$Mode; count=[int]$Count; workers=1; rows=$rows; after=$after; before=$before;
     parts=$parts; totals=$totals; missingReferences=$references; offsets=$offsets;
     memory=$sample; elapsedSeconds=$initialSeconds; errors=$initial.Errors; lines=$initial.Lines;
     late=$late; resolver=$phases; scopeBudgetPerReplay=2;
+    runtime=$runtime;
     scratchRemaining=@(Get-ChildItem -LiteralPath (Split-Path $s.Storage.DatabasePath) -Force |
         Where-Object { $_.Name -like '.report-*' -or $_.Name -like '.smtp-*' }).Count
 }
 'SMTP_PROXY_LOAD_JSON=' + ($data | ConvertTo-Json -Depth 8 -Compress)
-'@ | Set-Content -LiteralPath $loadProbe -Encoding utf8
+'@.Replace('/* SMTP_MEMORY_TELEMETRY_TYPE */', $memoryTelemetrySource) | Set-Content -LiteralPath $loadProbe -Encoding utf8
                 function Run-ProxyLoadProbe($config, $warm, $count, $mode, $lateSource = '', $lateTarget = '') {
                     $out = Join-Path (Split-Path $config) 'probe.stdout.txt'
                     $err = Join-Path (Split-Path $config) 'probe.stderr.txt'
@@ -3061,6 +3144,7 @@ $data = @{
                     ($m.resolver[0].memory.ManagedPeak-$m.resolver[0].memory.ManagedBase) | Should -BeLessOrEqual 16MB
                     $m.resolver[0].updated | Should -Be 0
                     $m.resolver[0].pendingAfter | Should -Be 0
+                    Assert-MemoryTelemetry $m.resolver[0].memory.Telemetry $m.resolver[0].memory.ManagedPeak $m.resolver[0].memory.Samples
                 }
                 $small=$measurements[0]; $large=$measurements[1]
                 ($large.memory.ManagedEnd-$large.memory.ManagedBase)-($small.memory.ManagedEnd-$small.memory.ManagedBase) | Should -BeLessOrEqual 8MB
@@ -3116,18 +3200,24 @@ using System;
 using System.Diagnostics;
 using System.Reflection;
 using System.Threading;
+/* SMTP_MEMORY_TELEMETRY_TYPE */
 public sealed class AuthMemorySampler : IDisposable {
     readonly Thread thread;
     volatile bool stop;
     public long ManagedBase, PrivateBase, ManagedPeak, PrivatePeak, Samples;
+    public readonly SmtpMemoryTelemetry Telemetry = new SmtpMemoryTelemetry();
     public AuthMemorySampler() {
         ManagedBase = GC.GetTotalMemory(true);
         using (var p = Process.GetCurrentProcess()) { p.Refresh(); PrivateBase = p.PrivateMemorySize64; }
         ManagedPeak = ManagedBase; PrivatePeak = PrivateBase;
+        Telemetry.Start();
         thread = new Thread(() => {
             using (var p = Process.GetCurrentProcess()) {
                 while (!stop) {
-                    ManagedPeak = Math.Max(ManagedPeak, GC.GetTotalMemory(false));
+                    long managed = GC.GetTotalMemory(false);
+                    bool newPeak = managed > ManagedPeak;
+                    ManagedPeak = Math.Max(ManagedPeak, managed);
+                    if (newPeak) Telemetry.RecordPeak(managed);
                     p.Refresh(); PrivatePeak = Math.Max(PrivatePeak, p.PrivateMemorySize64);
                     Samples++; Thread.Sleep(20);
                 }
@@ -3135,7 +3225,7 @@ public sealed class AuthMemorySampler : IDisposable {
         });
         thread.IsBackground = true; thread.Start();
     }
-    public void Dispose() { stop = true; thread.Join(); }
+    public void Dispose() { stop = true; thread.Join(); Telemetry.Finish(); }
     public static long[] Tracker(Assembly engine, string folder, int count) {
         var headType = engine.GetType("ExchangeLogReport.AuthFragment");
         var head = Activator.CreateInstance(headType, true);
@@ -3231,6 +3321,7 @@ try {
                 passes=$resolverPasses; workItems=([int]$Count * $resolverPasses);
                 gcCollections=@(([GC]::CollectionCount(0)-$gcBefore[0]), ([GC]::CollectionCount(1)-$gcBefore[1]), ([GC]::CollectionCount(2)-$gcBefore[2]));
                 serverGc=[Runtime.GCSettings]::IsServerGC
+                telemetry=$rs.Telemetry
             }
             $tx.Commit()
         } finally { $resolver.Dispose(); $writer.Dispose(); $tx.Dispose() }
@@ -3240,16 +3331,19 @@ try {
         $row = $store.Query("SELECT COUNT(*), COUNT(DISTINCT auth_sequence), SUM(auth_user='memory.user@contoso.test' AND auth_mechanism='PLAIN' AND auth_result='Succeeded' AND auth_source='Direct') FROM smtp_transaction WHERE session_id='08DA000000003A01';", $null).Rows[0]
         $parts = $store.Query("SELECT COUNT(*), MAX(json_array_length(observations)), MAX(length(CAST(observations AS BLOB))), SUM(complete_end), SUM(conflicted) FROM smtp_auth_fragment WHERE session_id='08DA000000003A01';", $null).Rows[0]
     } finally { $store.Dispose() }
+    $runtime = [SmtpMemoryTelemetry]::Runtime()
+    $runtime['powerShellVersion'] = $PSVersionTable.PSVersion.ToString()
     $data = @{
         count=[int]$Count; workers=[int]$Workers; rows=@($row); parts=@($parts);
         managedBase=$sample.ManagedBase; managedPeak=$sample.ManagedPeak; managedEnd=$end;
         privateBase=$sample.PrivateBase; privatePeak=$sample.PrivatePeak; samples=$sample.Samples;
         elapsedSeconds=$collectionSeconds; errors=$result.Errors; tracker=$tracker; resolver=$resolverMemory;
+        runtime=$runtime; memoryTelemetry=$sample.Telemetry;
         scratchRemaining=@(Get-ChildItem -LiteralPath (Split-Path $s.Storage.DatabasePath) -Force -Filter '.report-*').Count
     }
     'SMTP_MEMORY_JSON=' + ($data | ConvertTo-Json -Depth 8 -Compress)
 } finally { [ExchangeLogReport.Store]::CacheKilobytes = $cache }
-'@ | Set-Content -LiteralPath $probe -Encoding utf8
+'@.Replace('/* SMTP_MEMORY_TELEMETRY_TYPE */', $memoryTelemetrySource) | Set-Content -LiteralPath $probe -Encoding utf8
             $measurements = @()
             foreach ($case in @(@{ Count = 20000; Workers = 1 }, @{ Count = 80000; Workers = 1 }, @{ Count = 160000; Workers = 1 }, @{ Count = 160000; Workers = 2 })) {
                 $count = $case.Count
@@ -3298,6 +3392,7 @@ try {
                 $m.resolver.replayed | Should -Be (2 * $m.resolver.passes)
                 $m.tracker[5] | Should -BeGreaterThan 0
                 $m.tracker[6] | Should -BeLessOrEqual 256
+                Assert-MemoryTelemetry $m.resolver.telemetry $m.resolver.managedPeak $m.resolver.samples
             }
             $small = $measurements[0]; $large = $measurements[2]
             ($large.managedEnd - $large.managedBase) - ($small.managedEnd - $small.managedBase) | Should -BeLessOrEqual 8MB
