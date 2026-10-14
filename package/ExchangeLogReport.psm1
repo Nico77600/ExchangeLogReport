@@ -21,7 +21,7 @@
 
 .NOTES
     Author  : Nicolas Fabert
-    Version : 2.1.0
+    Version : 2.1.1
     History : see CHANGELOG.md
 
     This Script is a Personal project.
@@ -32,7 +32,7 @@
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
-$script:ToolVersion = '2.1.0'
+$script:ToolVersion = '2.1.1'
 $script:ToolRoot = $PSScriptRoot
 function Assert-ExlPackageIntegrity {
     $verifier = Join-Path $script:ToolRoot 'src\Test-PackageIntegrity.ps1'
@@ -433,7 +433,7 @@ function Import-ExlConfiguration {
         Report     = [ordered]@{
             DefaultRange          = [string](Get-Value $r 'Report' 'DefaultRange' 'Last7Days')
             DefaultType           = [string](Get-Value $r 'Report' 'DefaultType' 'Usage')
-            TimeZone              = [string](Get-Value $r 'Report' 'TimeZone' 'Europe/Paris')
+            TimeZone              = [string](Get-Value $r 'Report' 'TimeZone' 'Romance Standard Time')
             OutputPath            = Resolve-ExlPath ([string](Get-Value $r 'Report' 'OutputPath' '.\reports')) $Root
             FilePrefix            = [string](Get-Value $r 'Report' 'FilePrefix' 'ExchangeLogs')
             Formats               = [string[]]@(Get-Value $r 'Report' 'Formats' @('Csv', 'Html'))
@@ -2066,11 +2066,12 @@ function Send-ExlTestMail {
 
 #endregion
 
+
 # SIG # Begin signature block
-# MIIghQYJKoZIhvcNAQcCoIIgdjCCIHICAQExDzANBglghkgBZQMEAgEFADB5Bgor
+# MIIghgYJKoZIhvcNAQcCoIIgdzCCIHMCAQExDzANBglghkgBZQMEAgEFADB5Bgor
 # BgEEAYI3AgEEoGswaTA0BgorBgEEAYI3AgEeMCYCAwEAAAQQH8w7YFlLCE63JNLG
-# KX7zUQIBAAIBAAIBAAIBAAIBADAxMA0GCWCGSAFlAwQCAQUABCAzJdPTLIZ7zbtF
-# PCW41yEaT1P4n/Q4+7CI0Zu4DWzOMaCCDW8wggZyMIIEWqADAgECAghkM1HTxzif
+# KX7zUQIBAAIBAAIBAAIBAAIBADAxMA0GCWCGSAFlAwQCAQUABCBIlaQ/peqhk5/a
+# 2WlTEl9m/Mq+Xtk8nhb/7EZGYrfpsKCCDW8wggZyMIIEWqADAgECAghkM1HTxzif
 # CDANBgkqhkiG9w0BAQsFADB8MQswCQYDVQQGEwJVUzEOMAwGA1UECAwFVGV4YXMx
 # EDAOBgNVBAcMB0hvdXN0b24xGDAWBgNVBAoMD1NTTCBDb3Jwb3JhdGlvbjExMC8G
 # A1UEAwwoU1NMLmNvbSBSb290IENlcnRpZmljYXRpb24gQXV0aG9yaXR5IFJTQTAe
@@ -2142,28 +2143,28 @@ function Send-ExlTestMail {
 # ULeH38N0Vr83psiJVuBSxQyt5nRVrpYz7FACq5gtXELkyViq/rGOlJKaRrgQ6WWq
 # eoIXqKhVFAdP/jAEm2M8ezoVYsUgPyKY2OcuecV9coulAcxUIUydx6qYiOfsGj5u
 # Dy7l4aYjvB771wkUMzUQwxzcDYXJtMMTaWRe6n9EemR67jc73u5CJyFg3PfA5WR1
-# wZislcdCZuS6MYISbDCCEmgCAQEwgYwweDELMAkGA1UEBhMCVVMxDjAMBgNVBAgM
+# wZislcdCZuS6MYISbTCCEmkCAQEwgYwweDELMAkGA1UEBhMCVVMxDjAMBgNVBAgM
 # BVRleGFzMRAwDgYDVQQHDAdIb3VzdG9uMREwDwYDVQQKDAhTU0wgQ29ycDE0MDIG
 # A1UEAwwrU1NMLmNvbSBDb2RlIFNpZ25pbmcgSW50ZXJtZWRpYXRlIENBIFJTQSBS
 # MQIQBof4ljXihJpmCqqt2mhAWzANBglghkgBZQMEAgEFAKCBhDAYBgorBgEEAYI3
 # AgEMMQowCKACgAChAoAAMBkGCSqGSIb3DQEJAzEMBgorBgEEAYI3AgEEMBwGCisG
-# AQQBgjcCAQsxDjAMBgorBgEEAYI3AgEVMC8GCSqGSIb3DQEJBDEiBCDzF1dJYvGY
-# 6fTPRXGd/9GfXDrh6xYVASr1gYnqznsuUTANBgkqhkiG9w0BAQEFAASCAgAi051i
-# Q/eTHsSI26Oxw2FGvtAMk6ka/wqbN+fvQWT8Wmfocr5F5JLxBWdJNdjz6nr0PJym
-# rz3YxSdN/Vm2OUsZqxlPsyfgHws4zzqmkFEYIL88dbS9es78R36SF85laaEZFiXr
-# zZiefEfnLdgMxMRNjJlY79mcOQIfBkzoHNHrLUeO457iEYT1/fSiIanabtpiZHA+
-# 8bDHgp22ebAIVRI55tc5MKd/v5Ri8PwZiSJmsLUq30AmEsA20K+MTxTvzHs+UUtd
-# icC18J3FkzchrRpBhCdQNymrlfKLOKqLLMtC/tVLZ1eZR5CUbPm4PJCmUyFiJqGZ
-# 0zX6jGk9zwq+Ezseys9J2zoLEzalnR5YCYDkdx7FwdjlsXfF9ImNGsIjBefXihzw
-# V282hu6e5cVRlRdjUagD1JRongygGH/OPF3BhZpI3E9U/0wTgjXWL0DvtI1nAJdO
-# Kxvh9e9aDdQb4oL3PH8+nBR7QHnaWLTrWyKJTJmFYDCPbN65nphRQ/sjxgdIWvRe
-# rV+KmnXLc6/C7NRPFj4mNf8i4tfc7fxRor6ev/ybj46qfNl8iNNTkxW18P4zRs07
-# j3KVSZdwWVBv+p1+lZf8vcstbIKZdqF+5FlxAQ3iiU9q40j3VFaFBRcJMBgNy85P
-# iJvqEtF/hSqvsYmGoUSq9q7McvCJY/fNhF1fzKGCDykwgg8lBgorBgEEAYI3AwMB
-# MYIPFTCCDxEGCSqGSIb3DQEHAqCCDwIwgg7+AgEDMQ0wCwYJYIZIAWUDBAIBMIGJ
+# AQQBgjcCAQsxDjAMBgorBgEEAYI3AgEVMC8GCSqGSIb3DQEJBDEiBCCdcWPtiNVs
+# i8SS08U0kIG6q+G4MWe3QUxj5VlnaC7W9zANBgkqhkiG9w0BAQEFAASCAgBtlRkX
+# W2X5w+UHVIRi1ALJUG6VhIwvtKJ24yVl1LKurIFhMGz37Ck9lwugvAY1eELA9gOw
+# WR45YMUaiOhE0EF/g8FB79ViDXVJbrTm+f9EGR/NTEd3Ge78X/S4TmlHaafDGl5N
+# MkUP97PZ5iQZ9PGECK8W1euZd6g3FrgykjFClXeqtMMc3l+BogmeFClFlgHO0mWD
+# 2anRjr2/uHg2+LE0DVAZDRc9vDeiAga1NnMZhAegfF72s0pc45NrDQLY3RXTVXah
+# 9eROwqghzfjK2k95uvm88rSHWsXeTUOLk9zZ1Sj+aYqqZwj1+9pziOEYcKP/xiYA
+# zLjWe6muQ9ONj8iK0gQynz8KVF4Y7nC0l7o+k0Iv2NpBX9zmI8/E4B4wIQ/KltGU
+# EVftzBulZgYEqnrkfVX67u8lcjH9S7QcGaw3VE+zGbky6StPyd/MsreMM+jVD/Uy
+# sYR3stHfa0md5uozcFlok40P6WC7ano6Xc3Y+1m0RdJz2Lx5tjuDIQZWqmFEV6pW
+# o3h7lqeiSIuhgVGaqacnfQuT0MwB2JlnbhBBQzNlPRbv0vuPgkruk3RMnOg0eeTN
+# NxRHrdwlgReCmKGsgShSYlG6OnV+DXlT80SZtOrOgD48/w3wTZTRTb0/T3oxZoi6
+# vfMwEicztcIJfwhxJ+I0LszT7ih4JiT6RgxByqGCDyowgg8mBgorBgEEAYI3AwMB
+# MYIPFjCCDxIGCSqGSIb3DQEHAqCCDwMwgg7/AgEDMQ0wCwYJYIZIAWUDBAIBMIGJ
 # BgsqhkiG9w0BCRABBKB6BHgwdgIBAQYMKwYBBAGCqTABAwYBMDEwDQYJYIZIAWUD
-# BAIBBQAEIKcqiKG6L7eGCAV4aONENOXJiUsgkUoX6wsK/qnrjmuvAghyBTR9Law/
-# vRgPMjAyNjEwMTQwMjQxMjBaMAMCAQECEGly4rF2knz1IOnzQMU1y/KgggwAMIIE
+# BAIBBQAEIOMDVW0q0Tl1rqpjPyGO61OT9QEARctrfuJ2uNONIYx4Aghg1D7q8W69
+# oRgPMjAyNjEwMTQxNTE2MjRaMAMCAQECEEWm24/0XlDjbzLuwrLJkQ2gggwAMIIE
 # /DCCAuSgAwIBAgIQH2sWYtIuG2xd8cDBoGAOODANBgkqhkiG9w0BAQsFADBzMQsw
 # CQYDVQQGEwJVUzEOMAwGA1UECAwFVGV4YXMxEDAOBgNVBAcMB0hvdXN0b24xETAP
 # BgNVBAoMCFNTTCBDb3JwMS8wLQYDVQQDDCZTU0wuY29tIFRpbWVzdGFtcGluZyBJ
@@ -2228,17 +2229,17 @@ function Send-ExlTestMail {
 # daAvJgTfe9MiL2nSBioYe/g5mHUSWAay/Ip1RQmQCvmF9sNfqlhJwkjy/1U1ibUk
 # TIUBX3HgymyQvqQTZLLys6pL2tCdWcjI9YuLw30rgZm8+K387L7ycUvqrmQ3ZJlu
 # jHl3r1hgV76s3WwMPgKk1bAEFMj+rRXimSC+Ev30hXZdqyMdl/il5Ksd0vhGMYIC
-# WDCCAlQCAQEwgYcwczELMAkGA1UEBhMCVVMxDjAMBgNVBAgMBVRleGFzMRAwDgYD
+# WTCCAlUCAQEwgYcwczELMAkGA1UEBhMCVVMxDjAMBgNVBAgMBVRleGFzMRAwDgYD
 # VQQHDAdIb3VzdG9uMREwDwYDVQQKDAhTU0wgQ29ycDEvMC0GA1UEAwwmU1NMLmNv
 # bSBUaW1lc3RhbXBpbmcgSXNzdWluZyBSU0EgQ0EgUjECEB9rFmLSLhtsXfHAwaBg
 # DjgwCwYJYIZIAWUDBAIBoIIBYTAaBgkqhkiG9w0BCQMxDQYLKoZIhvcNAQkQAQQw
-# HAYJKoZIhvcNAQkFMQ8XDTI2MTAxNDAyNDEyMFowKAYJKoZIhvcNAQk0MRswGTAL
-# BglghkgBZQMEAgGhCgYIKoZIzj0EAwIwLwYJKoZIhvcNAQkEMSIEIENOL0dbBL/p
-# 9R53lw7CgrmDzd/rz5NUUfh/Ywz/V/QxMIHJBgsqhkiG9w0BCRACLzGBuTCBtjCB
+# HAYJKoZIhvcNAQkFMQ8XDTI2MTAxNDE1MTYyNFowKAYJKoZIhvcNAQk0MRswGTAL
+# BglghkgBZQMEAgGhCgYIKoZIzj0EAwIwLwYJKoZIhvcNAQkEMSIEIPVFG0KM1DX9
+# yisfoDyN+D7kiHJwIK7s+w1n0jSJNSWxMIHJBgsqhkiG9w0BCRACLzGBuTCBtjCB
 # szCBsAQgVCr5oWqNci5mEUl4iumUwYqaruWmXLNEolSa+Wx5x4swgYswd6R1MHMx
 # CzAJBgNVBAYTAlVTMQ4wDAYDVQQIDAVUZXhhczEQMA4GA1UEBwwHSG91c3RvbjER
 # MA8GA1UECgwIU1NMIENvcnAxLzAtBgNVBAMMJlNTTC5jb20gVGltZXN0YW1waW5n
 # IElzc3VpbmcgUlNBIENBIFIxAhAfaxZi0i4bbF3xwMGgYA44MAoGCCqGSM49BAMC
-# BEcwRQIhAM70swFCOA4DHjZa95TRmcEXcARcvE9ghp0bGg/zg5T3AiARLJe0eQZ7
-# nDzU1+ACPdZmTMe8tWdOoDCSVQ6vZTCybA==
+# BEgwRgIhAPyVDAXoDjXPBdKxl8oIDOTYFyiwCsM85IeVMnHukooHAiEA1miqUZ0J
+# bT4M58e5d3VlCNwVrxG3zfj7P8A6mG/hWDc=
 # SIG # End signature block

@@ -29,11 +29,11 @@
 
 .EXAMPLE
     .\tools\New-ExchangeLogReportPackage.ps1
-    Creates ..\package\ExchangeLogReport-2.1.0.
+    Creates ..\package\ExchangeLogReport-2.1.1.
 
 .NOTES
     Author  : Nicolas Fabert
-    Version : 2.1.0
+    Version : 2.1.1
 #>
 [CmdletBinding()]
 param(

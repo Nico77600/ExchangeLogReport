@@ -1,9 +1,9 @@
 ---
 title: Exchange Log Report
 subtitle: Developer guide
-version: 2.1.0
+version: 2.1.1
 author: Nicolas Fabert
-updated: 2026-10-12
+updated: 2026-10-14
 ---
 
 # Exchange Log Report — Developer guide
@@ -352,7 +352,7 @@ Built-in rules that need no configuration:
 | `Report.IncludeSessionDetails` | `$true` | Timeline of each client session **in the CSV files** (always available behind a click in HTML). |
 | `Report.MaxHtmlRows` | 200,000 | Per table in the HTML file; the CSV files are always complete. |
 | `Report.MemoryBudgetMB` | 512 | Estimated report buffers and SQLite caches, 64 to 16,384 MB. Retained datasets spill to disk as the shared budget fills; this is not a hard process RAM limit. |
-| `Report.TimeZone` | Europe/Paris | IANA or native Windows ID. On Windows without ICU/IANA lookup, the default falls back to `Romance Standard Time`, preserving Paris winter/summer rules. With an older package, set that Windows ID explicitly if `Europe/Paris` is refused. |
+| `Report.TimeZone` | Romance Standard Time | Native Windows Paris zone, with winter/summer rules; also used when this setting is absent. Explicit IANA IDs remain supported. On Windows without ICU/IANA lookup, `Europe/Paris` falls back to `Romance Standard Time`. |
 | `Report.Parallelism` | 0 | Independent report CPU workers, 0 to 16. 0 uses up to four workers, leaving one processor when possible; 1 is sequential. Does not change collection parallelism or multiply database connections. |
 | `Logging.RetentionDays` | **14** | Daily execution log files. |
 

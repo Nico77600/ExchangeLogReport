@@ -3,7 +3,7 @@
 <#
     Exchange Log Report - automated tests (Pester 5 or later).
     Author  : Nicolas Fabert
-    Version : 2.1.0
+    Version : 2.1.1
 
     Run:  Invoke-Pester -Path .\tests\ExchangeLogReport.Tests.ps1 -Output Detailed
 
@@ -293,6 +293,7 @@ Describe 'Configuration' {
         $s.Logging.RetentionDays | Should -Be 14
         $s.Report.MemoryBudgetMB | Should -Be 512
         $s.Report.Parallelism | Should -Be 0
+        $s.Report.TimeZone | Should -Be 'Romance Standard Time'
         $s.Servers[0].HttpProxyPath | Should -Be '\\EXCH01\c$\Program Files\Microsoft\Exchange Server\V15\Logging\HttpProxy'
     }
     It 'reports every invalid value at once' {
@@ -319,6 +320,26 @@ Describe 'Configuration' {
 }
 
 Describe 'Time zone compatibility' {
+    It 'uses the native Windows Paris zone when the configuration omits TimeZone' {
+        $path = Join-Path $TestDrive 'missing-timezone.psd1'
+        $text = Get-Content -LiteralPath $script:ConfigPath -Raw
+        $text = [regex]::Replace($text, '(?m)^\s*TimeZone\s*=.*\r?\n', '')
+        [IO.File]::WriteAllText($path, $text)
+        $s = Import-ExlConfiguration -Path $path -Root $script:Root
+        $s.Report.TimeZone | Should -Be 'Romance Standard Time'
+        $s.Zone.GetUtcOffset([DateTimeOffset]'2026-01-15T12:00:00Z').TotalHours | Should -Be 1
+        $s.Zone.GetUtcOffset([DateTimeOffset]'2026-07-15T12:00:00Z').TotalHours | Should -Be 2
+    }
+    It 'preserves an explicitly configured IANA Paris zone' {
+        $path = Join-Path $TestDrive 'explicit-iana-timezone.psd1'
+        $text = (Get-Content -LiteralPath $script:ConfigPath -Raw).Replace(
+            "TimeZone              = 'Romance Standard Time'", "TimeZone              = 'Europe/Paris'")
+        [IO.File]::WriteAllText($path, $text)
+        $s = Import-ExlConfiguration -Path $path -Root $script:Root
+        $s.Report.TimeZone | Should -Be 'Europe/Paris'
+        $s.Zone.GetUtcOffset([DateTimeOffset]'2026-01-15T12:00:00Z').TotalHours | Should -Be 1
+        $s.Zone.GetUtcOffset([DateTimeOffset]'2026-07-15T12:00:00Z').TotalHours | Should -Be 2
+    }
     It 'preserves the Paris winter/summer offsets and refuses an unknown zone' {
         $zone = Get-ExlTimeZone 'Europe/Paris'
         $zone.GetUtcOffset([DateTimeOffset]'2026-01-15T12:00:00Z').TotalHours | Should -Be 1
@@ -338,6 +359,7 @@ try { [void][TimeZoneInfo]::FindSystemTimeZoneById('Europe/Paris'); throw 'NLS r
 catch [TimeZoneNotFoundException] { }
 Import-Module '$module'
 `$s=Import-ExlConfiguration -Path '$config' -Root '$script:Root'
+if (`$s.Report.TimeZone -ne 'Romance Standard Time') { throw 'The delivered timezone is not the native Windows default.' }
 if (`$s.Zone.Id -ne 'Romance Standard Time') { throw 'Native Paris timezone was not resolved.' }
 if (`$s.Zone.GetUtcOffset([DateTimeOffset]'2026-01-15T12:00:00Z').TotalHours -ne 1) { throw 'Wrong winter offset.' }
 if (`$s.Zone.GetUtcOffset([DateTimeOffset]'2026-07-15T12:00:00Z').TotalHours -ne 2) { throw 'Wrong summer offset.' }
