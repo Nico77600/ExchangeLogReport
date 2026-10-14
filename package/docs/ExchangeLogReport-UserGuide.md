@@ -1,9 +1,9 @@
 ---
 title: Exchange Log Report
 subtitle: User guide
-version: 2.0.0
+version: 2.1.0
 author: Nicolas Fabert
-updated: 2026-10-07
+updated: 2026-10-12
 ---
 
 # Exchange Log Report — User guide
@@ -18,6 +18,12 @@ updated: 2026-10-07
 > ```
 >
 > Replace the example path with the folder where you downloaded or extracted this project.
+
+> [!WARNING]
+> Noise removal is not anonymisation. Reports can contain account names, e-mail and IP addresses, device identifiers, message subjects and SMTP transcripts. Restrict access to the database and report folders. Database retention does not delete exported reports or copies sent by e-mail: protect and delete those separately.
+
+> [!NOTE]
+> Report e-mail is disabled in the delivered configuration. `-SendMail` or `Mail.Enabled` enables it; `-SendMail:$false` suppresses it for one report. `-Mode MailTest` sends a test message independently of `Mail.Enabled`. Review the recipients before using either feature.
 
 <!-- icon: flow -->
 ## 1. Start here
@@ -75,7 +81,7 @@ That is all for a tool that runs on an Exchange server: there, it runs as **SYST
 | Account | **Local administrator of every Exchange server** (the logs are read through `\\<server>\C$`). On an Exchange server: **SYSTEM**, nothing to configure. On an administration server: a **domain account** (not a local account), with *Log on as a batch job* on that server. |
 | Exchange role | *View-Only Organization Management*, for step 2 only. The collection and the reports need no Exchange role. |
 | Network | SMB (445) from the collector to every Exchange server. From an administration server, also HTTP (80) to one Exchange server for step 2. |
-| Logging | SMTP: `ProtocolLoggingLevel Verbose` on the connectors to analyse. POP/IMAP: protocol log on (optional). HttpProxy, IIS, MAPI and message tracking are on by default. |
+| Logging | SMTP: `ProtocolLoggingLevel Verbose` on the connectors to analyse (also what shows the authenticated user of SMTP clients). POP/IMAP: protocol log on (optional). HttpProxy, IIS, MAPI and message tracking are on by default. |
 | Edge Transport | Its own copy of the tool **on the Edge itself** (chapter 6). |
 | E-mail (option of step 7) | SMTP (25, 587 or 465) from the collector to a receive connector that accepts it. |
 
@@ -202,6 +208,10 @@ Get-ChildItem .\reports -Recurse -Filter ExchangeLogs.html |
 
 Each report is a new folder in `E:\Tools\ExchangeLogReport\reports`: the HTML file, and the same data in CSV files for Excel. Delete the old folders when you no longer need them.
 
+Large Detailed reports keep rows in a shared memory allowance and temporarily spool them to disk when it fills. `Report.MemoryBudgetMB` defaults to 512 MB for report buffers and SQLite caches; it is not a hard limit on the PowerShell process. `Report.Parallelism` controls report CPU workers (0 = automatic, up to four; 1 = sequential). On an Exchange server, start with one or two workers and leave memory available for Exchange. These settings do not change collection.
+
+Allow extra free space in the report folder; slower disks may take longer when rows spill. HTML transcripts are loaded only for the rows shown, while the complete SMTP CSV is streamed separately. The temporary file is removed when the report finishes or reports an error. CSV files remain complete, even when the HTML row limit is reached. A `.partial` file indicates an interrupted export, not a ready report. `-NoCollect` skips collection, but still builds these details from one consistent database snapshot.
+
 **The monthly report** answers *is this server really used?* with one card per server:
 
 ![Monthly report: EXCH04 has no real usage; EXCH03 is used by 7 users only](images/usage-decommission.png)
@@ -209,8 +219,7 @@ Each report is a new folder in `E:\Tools\ExchangeLogReport\reports`: the HTML fi
 In this example:
 
 - **EXCH04** says *No real usage*: in a whole month, only monitoring probes and load balancer checks reached it.
-- **EXCH03** says *In use*, but by 7 users only. Click the **Users** tab and choose EXCH03 in *Servers*: these 7 users, and their old clients — Outlook 2013, RPC over HTTP, an old Android, an EWS application, Internet Explorer. Click the **SMTP clients** tab and choose EXCH03: a scanner still sends mail through it, without TLS.
-
+- **EXCH03** says *In use*, but by 7 users only. Click the **Users** tab and choose EXCH03 in *Servers*: these 7 users, and their old clients — Outlook 2013, RPC over HTTP, an old Android, an EWS application, Internet Explorer. Click the **SMTP clients** tab and choose EXCH03: a scanner still sends mail through it, without TLS. The **Authenticated user** column shows the account that Exchange logged for a successful SMTP login. It is never guessed from the sender address: when no account is proven, it shows *Not available*, and so do the rows collected before this version.
 These are the people to contact before EXCH03 goes. To look at it any day, for the last 30 days:
 
 ```powershell
@@ -372,6 +381,10 @@ A report reads the database. The **Data** line under its banner says how fresh t
 
 Add `-Collect` to read the new lines first whatever the age of the data, `-NoCollect` to never read them.
 
+### Time zone error
+
+If the configuration stops with **Unknown time zone 'Europe/Paris'**, set `Report.TimeZone = 'Romance Standard Time'` in the configuration file, then repeat the command. This is the native Windows Paris zone, with daylight-saving rules, not a fixed UTC offset. Some Windows/.NET installations cannot resolve IANA names; the local corrected version performs this fallback automatically.
+
 ### After a CU, a new server or a moved log folder
 
 Add a new server to the `Servers` block (step 1), then run step 2 again with your administrator account and read its warnings:
@@ -379,6 +392,8 @@ Add a new server to the `Servers` block (step 1), then run step 2 again with you
 ```powershell
 .\Invoke-ExchangeLogReport.ps1 -Mode Discover
 ```
+
+**If the protocol logs were moved in `web.config`:** the tool detects customized MAPI HTTP and HttpProxy folders too, including separate MAPI mailbox and address-book folders. It checks them again at every collection. A warning says which setting could not be read; a path you forced in the tool configuration remains the priority. A report with `-NoCollect` never reads these files.
 
 ### Edge Transport server
 
@@ -423,12 +438,14 @@ Each report is written to a new folder under `reports\`, one per run, named afte
 | Exit code | Meaning |
 |---|---|
 | `0` | Success. |
-| `2` | Finished with warnings: a server, a folder or a file could not be read, a source is stale, the IIS log folders changed since `-Mode Discover`, or the report could not be sent by e-mail (or a recipient was refused). The run went to the end: a report run still writes its report. |
+| `2` | Finished with warnings: a server, a folder or a file could not be read, a source is stale, the IIS or application log folders changed since `-Mode Discover`, or the report could not be sent by e-mail (or a recipient was refused). The run went to the end: a report run still writes its report. |
 | `1` | Failure: read the error in red, and the log file of the day in `logs\`. |
 
 | Warning | What to do |
 |---|---|
 | *folder not found or not readable* | The account is not local administrator of that server, or the logs were moved: run `-Mode Discover`. |
+| *Application logs of '…' moved to …* | The collection already follows the new protocol log folder. Run `-Mode Discover` to record it. |
+| *log settings could not be read* | Check the `web.config` or external XML file named in the warning and its permissions. Previously known paths are kept, but data may be incomplete until this is resolved. |
 | *SMTP protocol logging is off on …* (`-Mode Discover`) | That SMTP traffic is not in the reports: set `ProtocolLoggingLevel Verbose` on the connector if it matters. |
 | *No log line newer than 24 h for …* / *Logging stopped, or the logs were moved* | The collection or the logging stopped, or the old folder is read: check the scheduled task, then run `-Mode Discover`. |
 | *The paths file was written on …* | The tool folder was copied from another computer: run `-Mode Discover` on this one. |

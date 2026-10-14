@@ -6,12 +6,14 @@
 .DESCRIPTION
     The package contains only what Invoke-ExchangeLogReport.ps1 needs at run time, plus the short README,
     the HTML guides and the licence notice of the SQLite binaries:
-        Invoke-ExchangeLogReport.ps1, ExchangeLogReport.psd1, ExchangeLogReport.psm1, config\, src\,
+        Invoke-ExchangeLogReport.ps1, ExchangeLogReport.psd1, ExchangeLogReport.psm1,
+        PackageIntegrity.psd1, config\, src\ (including Test-PackageIntegrity.ps1),
         templates\, lib\sqlite\, docs\ExchangeLogReport-UserGuide.html, docs\ExchangeLogReport-Guide.html,
         README.md, CHANGELOG.md, THIRD-PARTY-NOTICES.md
-    The HTML guides (user guide, developer guide) are rebuilt first from their Markdown source
-    (tools\Build-Documentation.ps1): they are self-contained (images inline), so the Markdown sources and
-    the images are not copied.
+    The package source and the finished package must pass the owner-signed integrity check
+    (src\Test-PackageIntegrity.ps1 and PackageIntegrity.psd1: exact SHA256 of every hashed file). The HTML guides are
+    self-contained (images inline) and are copied as hashed: the builder never regenerates them. Rebuild them with
+    tools\Build-Documentation.ps1 before the manifest is generated and signed; after that, any change fails the check.
     It never copies data\, reports\, logs\, bin\ or tests\: there is no database in the package, the
     tool creates an empty one at the first collection.
 
@@ -27,11 +29,11 @@
 
 .EXAMPLE
     .\tools\New-ExchangeLogReportPackage.ps1
-    Creates ..\package\ExchangeLogReport-2.0.0.
+    Creates ..\package\ExchangeLogReport-2.1.0.
 
 .NOTES
     Author  : Nicolas Fabert
-    Version : 2.0.0
+    Version : 2.1.0
 #>
 [CmdletBinding()]
 param(
@@ -42,6 +44,23 @@ param(
 $ErrorActionPreference = 'Stop'
 $root = Split-Path $PSScriptRoot -Parent
 $packageRoot = Join-Path $root 'package'
+function Assert-AuthenticatedPackage([string]$Path, [switch]$Distribution) {
+    $verifier = Join-Path $Path 'src\Test-PackageIntegrity.ps1'
+    $cursor = [IO.Path]::GetFullPath($verifier)
+    while ($cursor) {
+        $item = Get-Item -LiteralPath $cursor -Force -ErrorAction Stop
+        if ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) { throw "Package integrity: reparse point: $cursor" }
+        $cursor = [IO.Path]::GetDirectoryName($cursor)
+    }
+    $signature = Microsoft.PowerShell.Security\Get-AuthenticodeSignature -LiteralPath $verifier -ErrorAction Stop
+    if ([string]$signature.Status -cne 'Valid' -or $null -eq $signature.SignerCertificate -or
+        $signature.SignerCertificate.Thumbprint -cne '0F28E442889F17B5F4D251E8F96E7CC6E2C9C6D6' -or
+        $null -eq $signature.TimeStamperCertificate) {
+        throw 'Package integrity: verifier must have the trusted, timestamped owner signature.'
+    }
+    if ($Distribution) { & $verifier -Root $Path -Distribution } else { & $verifier -Root $Path }
+}
+Assert-AuthenticatedPackage $packageRoot
 $version = (Import-PowerShellDataFile (Join-Path $packageRoot 'ExchangeLogReport.psd1')).ModuleVersion
 if (-not $Destination) { $Destination = Join-Path (Split-Path $root -Parent) "package\ExchangeLogReport-$version" }
 $Destination = [IO.Path]::GetFullPath($Destination, (Get-Location).Path).TrimEnd('\')
@@ -57,12 +76,9 @@ if (Test-Path -LiteralPath $Destination) {
     Remove-Item -LiteralPath $Destination -Recurse -Force
 }
 
-# ---- HTML guides, rebuilt from the Markdown sources ------------------------------------------------
-& (Join-Path $PSScriptRoot 'Build-Documentation.ps1') | Out-Null
-
 # ---- Files needed at run time -------------------------------------------------------------------
 $files = [Collections.Generic.List[string]]::new()
-foreach ($f in 'Invoke-ExchangeLogReport.ps1', 'ExchangeLogReport.psd1', 'ExchangeLogReport.psm1', 'README.md', 'CHANGELOG.md', 'THIRD-PARTY-NOTICES.md',
+foreach ($f in 'Invoke-ExchangeLogReport.ps1', 'ExchangeLogReport.psd1', 'ExchangeLogReport.psm1', 'PackageIntegrity.psd1', 'README.md', 'CHANGELOG.md', 'THIRD-PARTY-NOTICES.md',
     'config\ExchangeLogReport.config.psd1', 'templates\Report.template.html', 'docs\ExchangeLogReport-Guide.html', 'docs\ExchangeLogReport-UserGuide.html') { $files.Add($f) }
 foreach ($folder in 'src', 'lib\sqlite') {
     Get-ChildItem -LiteralPath (Join-Path $packageRoot $folder) -Recurse -File | ForEach-Object { $files.Add($_.FullName.Substring($packageRoot.Length + 1)) }
@@ -82,10 +98,12 @@ foreach ($name in 'data', 'reports', 'logs', 'bin', 'tests') {
 }
 Get-ChildItem -LiteralPath $Destination -Recurse -File -Include '*.sqlite', '*.sqlite-*', '*.db', '*.lock', '*.log', '*.csv', '*.paths.psd1' |
     ForEach-Object { $problems.Add("Runtime file in the package: $($_.Name)") }
-foreach ($f in 'src\Engine.Text.cs', 'src\Engine.Store.cs', 'src\Engine.Collector.cs', 'src\Engine.Sessions.cs', 'src\Engine.Report.cs', 'src\Engine.ReportSessions.cs', 'src\Get-ExlExchangeSettings.ps1', 'lib\sqlite\runtimes\win-x64\e_sqlite3.dll', 'docs\ExchangeLogReport-Guide.html', 'docs\ExchangeLogReport-UserGuide.html') {
+if (@($files | Select-Object -Unique).Count -ne $files.Count) { throw 'Package integrity: duplicate distribution file path.' }
+foreach ($f in 'src\Engine.Text.cs', 'src\Engine.Store.cs', 'src\Engine.Collector.cs', 'src\Engine.Sessions.cs', 'src\Engine.Report.cs', 'src\Engine.ReportSessions.cs', 'src\Get-ExlExchangeSettings.ps1', 'src\Test-PackageIntegrity.ps1', 'PackageIntegrity.psd1', 'lib\sqlite\runtimes\win-x64\e_sqlite3.dll', 'docs\ExchangeLogReport-Guide.html', 'docs\ExchangeLogReport-UserGuide.html') {
     if (-not (Test-Path -LiteralPath (Join-Path $Destination $f))) { $problems.Add("Missing in the package: $f") }
 }
 if ($problems.Count) { throw ("Package not valid ($Destination):`n - " + ($problems -join "`n - ")) }
+Assert-AuthenticatedPackage $Destination -Distribution
 
 $all = Get-ChildItem -LiteralPath $Destination -Recurse -File
 Write-Host ''

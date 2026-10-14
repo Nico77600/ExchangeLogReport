@@ -334,7 +334,7 @@ footer ul { margin:4px 0 8px; padding-left:18px; }
     { name: "users", title: "Users", caption: "Real users (accounts that authenticated), with the protocols, clients and servers they used. Click a user to see each client and device (versions, addresses, servers) and its client sessions.", filters: ["Servers", "Protocols", "Clients"], sort: [5, -1] },
     { name: "operations", title: "Operations", caption: "One row per protocol and operation (MAPI request type, ActiveSync command, OWA action, IMAP/POP command, or method and page), all users: volume, failures and latency. Slow = successful requests above the slow threshold.", filters: ["Protocol", "Servers"], sort: [2, -1] },
     { name: "messages", title: "Messages", caption: meta.edge ? "One row per message (Message-ID) that went through the Edge, inbound and outbound, plus the mail refused during the SMTP conversation (relay denied, blocked sender or recipient: no Message-ID). Click a message to see its route: every tracking event and SMTP session, in order." : "One row per message (Message-ID), consolidated over all servers, plus the mail refused during the SMTP conversation (relay denied, unknown recipient: no Message-ID). Click a message to see its route: every tracking event and SMTP session, in order.", filters: ["Status", "Direction"], sort: [0, -1] },
-    { name: "smtpclients", title: "SMTP clients", caption: meta.edge ? "One row per SMTP client of the Edge (address and HELO name): internet servers and partners (inbound), and the mailbox servers of the organization (outbound mail handed over to the Edge), with their volume and refusals. Click a client to see its transactions and their SMTP transcript." : "One row per SMTP client (address and HELO name): the applications, devices, servers and users that send mail to the collected servers, with their volume and refusals. Hops between the collected Exchange servers are not listed. Click a client to see its transactions and their SMTP transcript.", filters: ["Servers", "Connectors", "TLS", "Authentication"], sort: [4, -1] },
+    { name: "smtpclients", title: "SMTP clients", caption: meta.edge ? "One row per SMTP client of the Edge (address and HELO name): internet servers and partners (inbound), and the mailbox servers of the organization (outbound mail handed over to the Edge), with their volume and refusals. Click a client to see its transactions and their SMTP transcript." : "One row per SMTP client (address and HELO name): the applications, devices, servers and users that send mail to the collected servers, with their volume and refusals. Hops between the collected Exchange servers are not listed. Click a client to see its transactions and their SMTP transcript.", filters: ["Servers", "Connectors", "TLS", "Authentication", "Authentication mechanism", "Authentication result"], sort: [4, -1] },
     { name: "smtpdestinations", title: "SMTP destinations", caption: "One row per destination of the Edge (remote address and send connector): Exchange Online, the MX of the internet domains, the mailbox servers of the organization (inbound mail handed over by the Edge). Remote host: name of its 220 banner. Click a destination to see its transactions, deferrals and failures with their SMTP transcript.", filters: ["Connector", "Servers", "TLS"], sort: [4, -1] }
   ].filter(t => meta.datasets[t.name]);
   let tab = tabs[0], view = new Int32Array(0), sortState = null;
@@ -571,22 +571,27 @@ footer ul { margin:4px 0 8px; padding-left:18px; }
         body.append(make("h3", null, `Clients and devices (${v.length})`));
         miniTable(body, ["Protocol", "Client", "Device type", "Device ID", "Client IPs", "Servers", "Requests", "Failures", "Last seen"], v, { 6: "num", 7: "num", 8: "time" });
       } else if (c.kind === "steps" && c.name === "Transactions detail") {
-        // [time, server, connector, status, mail from, recipients, response, message id, transcript]
+        // [time, server, connector, status, mail from, recipients, response, message id, transcript, mechanism, result, last attempt, authenticated user, identity evidence]
         const total = r[col(set, "Transactions")];
+        const authentication = set === "smtpclients";
         body.append(make("h3", null, `Transactions (${v.length}${total > v.length ? ` of ${number(total)}: ${set === "smtpdestinations" ? "deferrals and failures" : "refusals"} first, then the latest; the SmtpSessions CSV has them all` : ""})`));
         const table = make("table", "mini"), head = make("tr");
-        for (const h of ["Time", "Server", "Connector", "Status", "Mail from", "Recipients", "Response", "Message ID"]) head.append(make("th", h === "Recipients" ? "num" : null, h));
+        const headers = ["Time", "Server", "Connector", "Status", "Mail from", "Recipients", "Response", "Message ID"];
+        if (authentication) headers.push("Authentication mechanism", "Authentication result", "Last AUTH attempt", "Authenticated user", "Identity evidence");
+        for (const h of headers) head.append(make("th", h === "Recipients" ? "num" : null, h));
         table.append(head);
         for (const s of v) {
           const row = make("tr");
-          [stamp(s[0]), s[1], s[2], null, s[4], number(s[5]), s[6], s[7]].forEach((x, j) => {
+          const cells = [stamp(s[0]), s[1], s[2], null, s[4], number(s[5]), s[6], s[7]];
+          if (authentication) cells.push(s[9], s[10], s[11], s[12], s[13]);
+          cells.forEach((x, j) => {
             const td = make("td", j === 5 ? "num nowrap" : j === 0 || j === 1 || j === 3 ? "nowrap" : null);
             if (j === 3) td.append(make("span", `pill ${tone(s[3])}`, s[3])); else td.textContent = x == null ? "" : x;
             row.append(td);
           });
           table.append(row);
           if (s[8]) {
-            const tr2 = make("tr"), td2 = make("td"); td2.colSpan = 8;
+            const tr2 = make("tr"), td2 = make("td"); td2.colSpan = headers.length;
             const d = make("details"); d.append(make("summary", null, "SMTP transcript"), make("pre", null, s[8])); td2.append(d); tr2.append(td2); table.append(tr2);
           }
         }

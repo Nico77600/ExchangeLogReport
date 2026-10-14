@@ -2,7 +2,7 @@
 #  Exchange Log Report - configuration file
 #  --------------------------------------------------------------------------
 #  Author  : Nicolas Fabert
-#  Version : 2.0.0
+#  Version : 2.1.0
 #
 #  This file is read by Invoke-ExchangeLogReport.ps1. It is a PowerShell data
 #  file: text between quotes, $true / $false, numbers, and @( ) for lists.
@@ -22,6 +22,9 @@
     #   FrontEndReceivePath, FrontEndSendPath, HubReceivePath, HubSendPath, MailboxReceivePath,
     #   MailboxSendPath, EdgeReceivePath, EdgeSendPath, MessageTrackingPath; or a root: ExchangePath,
     #   IisLogPath, LoggingPath, TransportLogPath.
+    # HttpProxy and MAPI HTTP log folders customized in application web.config are detected at Discover
+    # and checked at every collection. Forced HttpProxyPath / MapiHttpPath / LoggingPath still win;
+    # ExchangePath locates the installation and does not override an application's logging setting.
     # Edge Transport servers are detected (registry on the server itself, Edge folders through C$, or
     # -Mode Discover run on the Edge): only their SMTP protocol logs and message tracking are read, no
     # IIS, HttpProxy, MAPI, ActiveSync, POP3 or IMAP4. Role = 'Edge' (or 'Mailbox') forces the role.
@@ -44,7 +47,7 @@
         SmtpSend        = $true    # TransportRoles\Logs\<role>\ProtocolLog\SmtpSend
         MessageTracking = $true    # TransportRoles\Logs\MessageTracking\MSGTRK*.log
         TransportRoles  = @('FrontEnd', 'Hub', 'Mailbox') # mailbox servers; an Edge Transport server is read from its Edge folder
-        MapiBackEnd     = $true    # Logging\MapiHttp\Mailbox: Outlook version and mode, MAPI status codes (an HTTP 200 can hide a MAPI failure)
+        MapiBackEnd     = $true    # Logging\MapiHttp\Mailbox or web.config override: Outlook version/mode and MAPI status behind HTTP 200
         EasBackEnd      = $true    # inetpub\logs\LogFiles\<IisBackEndSite>: ActiveSync results hidden behind HTTP 200 (only ActiveSync lines are kept)
         IisBackEndSite  = 'W3SVC2' # Exchange Back End web site when -Mode Discover has not been run
         PopImap         = $false   # Logging\Imap4 and Logging\Pop3 (optional). Needs Set-ImapSettings / Set-PopSettings -ProtocolLogEnabled $true
@@ -120,7 +123,7 @@
     }
 
     # ---------------------------------------------------------------------
-    # Report files (CSV and HTML), written locally only.
+    # Report files (CSV and HTML), written to local disk. Mail can also send them.
     # ---------------------------------------------------------------------
     Report = @{
         DefaultRange          = 'Last7Days'      # Last24Hours | Last7Days | Last30Days | PreviousMonth
@@ -133,6 +136,8 @@
         IncludeSessionDetails = $true            # timeline of each client session in the CSV files (always behind a click in HTML)
         CsvDelimiter          = ';'              # ';' opens directly in Excel with French regional settings
         MaxHtmlRows           = 200000           # per table in the HTML file; the CSV files are always complete
+        MemoryBudgetMB        = 512              # SQLite caches + estimated row/worker buffers; not a process RAM ceiling
+        Parallelism           = 0                # report CPU workers: 0 = up to 4, leaving one processor; 1 = sequential
         # A report reads the database. It reads the new log lines first only when the last collection is older
         # than this and the period ends after it (-Collect / -NoCollect decide for one run). With the hourly
         # scheduled collection, a report never waits for a collection. 0 = never on its own.

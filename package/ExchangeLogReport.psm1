@@ -21,14 +21,38 @@
 
 .NOTES
     Author  : Nicolas Fabert
-    Version : 2.0.0
+    Version : 2.1.0
     History : see CHANGELOG.md
+
+    This Script is a Personal project.
+    It's provided "AS-IS". It's not an official Microsoft product so no support can be expected from Microsoft.
+
+    As any scripts you must read carefully the documentation and test it first in a Test environment before any run in Production.
 #>
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
-$script:ToolVersion = '2.0.0'
+$script:ToolVersion = '2.1.0'
 $script:ToolRoot = $PSScriptRoot
+function Assert-ExlPackageIntegrity {
+    $verifier = Join-Path $script:ToolRoot 'src\Test-PackageIntegrity.ps1'
+    $cursor = [IO.Path]::GetFullPath($verifier)
+    while ($cursor) {
+        $item = Microsoft.PowerShell.Management\Get-Item -LiteralPath $cursor -Force -ErrorAction Stop
+        if ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) {
+            throw "Package integrity: reparse point: $cursor"
+        }
+        $cursor = [IO.Path]::GetDirectoryName($cursor)
+    }
+    $signature = Microsoft.PowerShell.Security\Get-AuthenticodeSignature -LiteralPath $verifier -ErrorAction Stop
+    if ([string]$signature.Status -cne 'Valid' -or $null -eq $signature.SignerCertificate -or
+        $signature.SignerCertificate.Thumbprint -cne '0F28E442889F17B5F4D251E8F96E7CC6E2C9C6D6' -or
+        $null -eq $signature.TimeStamperCertificate) {
+        throw 'Package integrity: verifier must have the trusted, timestamped owner signature.'
+    }
+    & $verifier -Root $script:ToolRoot
+}
+Assert-ExlPackageIntegrity
 $script:LogWriter = $null
 $script:LogPath = $null
 # Per-server settings of the configuration. Root keys only serve to derive the path keys that are
@@ -291,10 +315,12 @@ function Resolve-ExlPath {
 function Get-ExlTimeZone {
     <# Accepts an IANA name (Europe/Paris) or a Windows name (Romance Standard Time). #>
     param([Parameter(Mandatory)][string]$Id)
-    try { return [TimeZoneInfo]::FindSystemTimeZoneById($Id) } catch { }
+    try { return [TimeZoneInfo]::FindSystemTimeZoneById($Id) } catch [TimeZoneNotFoundException] { }
+    # Windows without ICU uses native registry IDs; the delivered default must not depend on IANA conversion.
+    if ($IsWindows -and $Id -ieq 'Europe/Paris') { return [TimeZoneInfo]::FindSystemTimeZoneById('Romance Standard Time') }
     $windowsId = $null
-    if ([TimeZoneInfo]::TryConvertIanaIdToWindowsId($Id, [ref]$windowsId)) { try { return [TimeZoneInfo]::FindSystemTimeZoneById($windowsId) } catch { } }
-    throw "Unknown time zone '$Id' (Report.TimeZone). Use a name such as 'Europe/Paris' or 'Romance Standard Time'."
+    if ([TimeZoneInfo]::TryConvertIanaIdToWindowsId($Id, [ref]$windowsId)) { return [TimeZoneInfo]::FindSystemTimeZoneById($windowsId) }
+    throw "Unknown time zone '$Id' (Report.TimeZone). On Windows without IANA support, use a Windows ID such as 'Romance Standard Time' (Paris); otherwise an IANA ID such as 'Europe/Paris'."
 }
 
 function Import-ExlConfiguration {
@@ -415,6 +441,8 @@ function Import-ExlConfiguration {
             IncludeSessionDetails = Test-Bool (Get-Value $r 'Report' 'IncludeSessionDetails' $true) 'Report.IncludeSessionDetails'
             CsvDelimiter          = [string](Get-Value $r 'Report' 'CsvDelimiter' ';')
             MaxHtmlRows           = Test-Int (Get-Value $r 'Report' 'MaxHtmlRows' 200000) 'Report.MaxHtmlRows' 1000 2000000
+            MemoryBudgetMB        = Test-Int (Get-Value $r 'Report' 'MemoryBudgetMB' 512) 'Report.MemoryBudgetMB' 64 16384
+            Parallelism           = Test-Int (Get-Value $r 'Report' 'Parallelism' 0) 'Report.Parallelism' 0 16
             MaxDataAgeMinutes     = Test-Int (Get-Value $r 'Report' 'MaxDataAgeMinutes' 90) 'Report.MaxDataAgeMinutes' 0 525600
             Title                 = [string](Get-Value $r 'Report' 'Title' $script:DefaultReportTitle)
             TemplatePath          = Join-Path $Root 'templates\Report.template.html'
@@ -556,6 +584,19 @@ function Resolve-ExlServerPaths {
                 if ($c -and $c.Name -and $c.Folder) { [pscustomobject]@{ Name = [string]$c.Name; Id = [string]$c.Id; Role = [string]$c.Role; Vdirs = [string]$c.Vdirs; Folder = ([string]$c.Folder).TrimEnd('\') } }
             }
         })
+    $server['ApplicationLogSources'] = @(if ($Discovered -and $Discovered['ApplicationLogSources']) {
+            foreach ($a in $Discovered['ApplicationLogSources']) {
+                if ($a.Kind -notin 'HttpProxy', 'MapiBackEnd' -or -not $a.Folder -or -not $a.Application -or -not $a.Site) {
+                    throw "Invalid ApplicationLogSources entry for $Name in the paths file. Run -Mode Discover again."
+                }
+                [pscustomobject]@{ Kind = [string]$a.Kind; Protocol = [string]$a.Protocol; Site = [string]$a.Site; Application = [string]$a.Application
+                    Folder = [string]$a.Folder; DefaultFolder = [string]$a.DefaultFolder; ConfigFile = [string]$a.ConfigFile; Setting = [string]$a.Setting; Customized = [bool]$a.Customized }
+            }
+        })
+    $server['ApplicationLogForcedKinds'] = @(
+        if ($Configured['HttpProxyPath'] -or $Configured['LoggingPath']) { 'HttpProxy' }
+        if ($Configured['MapiHttpPath'] -or $Configured['LoggingPath']) { 'MapiBackEnd' }
+    )
     $server['Origin'] = $origin
     return [pscustomobject]$server
 }
@@ -567,11 +608,17 @@ function Resolve-ExlServerPaths {
 function Initialize-ExlEngine {
     <#
     .SYNOPSIS
-        Loads SQLite (lib\sqlite) and the C# engine. The engine is compiled from src\Engine.*.cs
-        into bin\ the first time, and again only when a source file changes (hash in the file name).
+        Verifies the package, then loads SQLite (lib\sqlite) and compiles the authenticated C# sources
+        (src\Engine.*.cs) in memory, once per process. A compiled copy in bin\ is never loaded: it cannot be
+        authenticated, so a bin\ left by an earlier version is ignored.
     #>
     [CmdletBinding()]
     param([string]$Root = $script:ToolRoot)
+    if (-not [string]::Equals([IO.Path]::GetFullPath($Root).TrimEnd('\'),
+        [IO.Path]::GetFullPath($script:ToolRoot).TrimEnd('\'), [StringComparison]::OrdinalIgnoreCase)) {
+        throw 'Package integrity: engine root must be the imported package root.'
+    }
+    Assert-ExlPackageIntegrity
     if ('ExchangeLogReport.Store' -as [type]) { return }
     $lib = Join-Path $Root 'lib\sqlite'
     $arch = if ([Runtime.InteropServices.RuntimeInformation]::ProcessArchitecture -eq 'Arm64') { 'win-arm64' } else { 'win-x64' }
@@ -585,29 +632,14 @@ function Initialize-ExlEngine {
 
     $sources = @(Get-ChildItem -LiteralPath (Join-Path $Root 'src') -Filter 'Engine.*.cs' -File | Sort-Object Name)
     if (-not $sources.Count) { throw "Engine source files not found in $(Join-Path $Root 'src')." }
-    $hasher = [Security.Cryptography.SHA256]::Create()
-    $all = [Text.StringBuilder]::new()
-    foreach ($f in $sources) { [void]$all.Append($f.Name).Append((Get-FileHash -LiteralPath $f.FullName -Algorithm SHA256).Hash) }
-    $hash = [BitConverter]::ToString($hasher.ComputeHash([Text.Encoding]::UTF8.GetBytes($all.ToString()))).Replace('-', '').Substring(0, 16)
-    $hasher.Dispose()
-    $bin = Join-Path $Root 'bin'
-    $dll = Join-Path $bin "ExchangeLogReport.Engine.$hash.dll"
-    if (-not (Test-Path -LiteralPath $dll)) {
-        [void][IO.Directory]::CreateDirectory($bin)
-        $references = @(
-            (Join-Path $lib 'Microsoft.Data.Sqlite.dll'), (Join-Path $lib 'SQLitePCLRaw.core.dll'), 'System.IO.Compression', 'System.Text.Json', 'System.Text.Encodings.Web', 'System.Data.Common', 'System.Linq',
-            'System.Collections', 'System.Text.RegularExpressions', 'System.Runtime', 'System.Memory', 'System.ComponentModel.Primitives', 'System.ComponentModel',
-            'System.Transactions.Local', 'System.Text.Encoding.Extensions', 'System.Runtime.Extensions', 'System.IO', 'System.Runtime.InteropServices', 'System.Console',
-            'System.Collections.NonGeneric', 'System.Diagnostics.Process', 'System.Linq.Expressions', 'System.Collections.Concurrent', 'System.Threading',
-            'System.Threading.Thread', 'System.Threading.Tasks.Parallel', 'System.IO.FileSystem', 'System.Net.Primitives', 'System.Net.Security', 'System.Net.Sockets',
-            'System.Net.NetworkInformation', 'System.Security.Cryptography', 'System.Security.Cryptography.X509Certificates', 'Microsoft.Win32.Primitives', 'System.IO.Compression.ZipFile', 'netstandard')
-        $staging = Join-Path $bin ("compile-{0}.dll" -f [guid]::NewGuid().ToString('N'))
-        Add-Type -LiteralPath $sources.FullName -ReferencedAssemblies $references -OutputAssembly $staging -OutputType Library -IgnoreWarnings -WarningAction SilentlyContinue
-        Move-Item -LiteralPath $staging -Destination $dll -Force
-        Get-ChildItem -LiteralPath $bin -Filter 'ExchangeLogReport.Engine.*.dll' | Where-Object FullName -ne $dll | Remove-Item -Force -ErrorAction SilentlyContinue
-        Get-ChildItem -LiteralPath $bin -Filter 'compile-*.dll' | Remove-Item -Force -ErrorAction SilentlyContinue
-    }
-    if (-not ('ExchangeLogReport.Store' -as [type])) { Add-Type -LiteralPath $dll }
+    $references = @(
+        (Join-Path $lib 'Microsoft.Data.Sqlite.dll'), (Join-Path $lib 'SQLitePCLRaw.core.dll'), 'System.IO.Compression', 'System.Text.Json', 'System.Text.Encodings.Web', 'System.Data.Common', 'System.Linq',
+        'System.Collections', 'System.Text.RegularExpressions', 'System.Runtime', 'System.Memory', 'System.ComponentModel.Primitives', 'System.ComponentModel',
+        'System.Transactions.Local', 'System.Text.Encoding.Extensions', 'System.Runtime.Extensions', 'System.IO', 'System.Runtime.InteropServices', 'System.Console',
+        'System.Collections.NonGeneric', 'System.Diagnostics.Process', 'System.Linq.Expressions', 'System.Collections.Concurrent', 'System.Threading',
+        'System.Threading.Thread', 'System.Threading.Tasks.Parallel', 'System.IO.FileSystem', 'System.Net.Primitives', 'System.Net.Security', 'System.Net.Sockets',
+        'System.Net.NetworkInformation', 'System.Security.Cryptography', 'System.Security.Cryptography.X509Certificates', 'Microsoft.Win32.Primitives', 'System.IO.Compression.ZipFile', 'netstandard')
+    Add-Type -LiteralPath $sources.FullName -ReferencedAssemblies $references -IgnoreWarnings -WarningAction SilentlyContinue
 }
 
 function Resolve-ExlReportCollection {
@@ -823,12 +855,44 @@ function Get-ExlSources {
             $list.Add([pscustomobject]@{ Kind = $Kind; Role = $null; Label = $label; Folder = $c.Folder; Filter = '*.log'; Recurse = $false; PathKey = 'IisCustomSites'; Optional = $true; Site = $c.Name })
         }
     }
-    if ($src.HttpProxy) { & $add 'HttpProxy' $null 'HttpProxy' 'HttpProxyPath' '*.log' $true }
+    $appSources = @($Server.ApplicationLogSources)
+    $folderKey = { param([string]$Folder) (ConvertTo-ExlRemotePath -Server $Server.Name -Path $Folder).TrimEnd('\') }
+    if ($src.HttpProxy) {
+        & $add 'HttpProxy' $null 'HttpProxy' 'HttpProxyPath' '*.log' $true
+        if ('HttpProxy' -notin $Server.ApplicationLogForcedKinds) {
+            $apps = @($appSources | Where-Object Kind -eq 'HttpProxy')
+            if ($apps.Count -and -not @($apps | Where-Object { -not $_.Customized }).Count) { $list[$list.Count - 1].Optional = $true }
+            foreach ($a in $apps | Sort-Object { $_.Folder.Length }) {
+                $key = & $folderKey $a.Folder
+                $covered = @($list | Where-Object {
+                    $_.Kind -eq 'HttpProxy' -and ($key -eq (& $folderKey $_.Folder) -or
+                        ($_.Recurse -and $key.StartsWith((& $folderKey $_.Folder) + '\', [StringComparison]::OrdinalIgnoreCase)))
+                })
+                if ($covered.Count) { continue }
+                # A customized parent folder covers a previously added child folder too.
+                for ($i = $list.Count - 1; $i -ge 0; $i--) {
+                    if ($list[$i].Kind -eq 'HttpProxy' -and (& $folderKey $list[$i].Folder).StartsWith($key + '\', [StringComparison]::OrdinalIgnoreCase)) { $list.RemoveAt($i) }
+                }
+                $list.Add([pscustomobject]@{ Kind = 'HttpProxy'; Role = $null; Label = "HttpProxy $($a.Protocol)"; Folder = $a.Folder
+                        Filter = '*.log'; Recurse = $true; PathKey = 'ApplicationLogSources'; Optional = -not $a.Customized })
+            }
+        }
+    }
     if ($src.IisFrontEnd) {
         & $add 'Iis' $null 'IIS front end' 'IisFrontEndPath' '*.log' $false
         & $custom 'Iis' 'FrontEnd' { $_.Folder -ne $Server.IisFrontEndPath }
     }
-    if ($src.MapiBackEnd) { & $add 'MapiBackEnd' $null 'MAPI back end' 'MapiHttpPath' '*.log' $false }
+    if ($src.MapiBackEnd) {
+        & $add 'MapiBackEnd' $null 'MAPI back end' 'MapiHttpPath' '*.log' $false
+        if ('MapiBackEnd' -notin $Server.ApplicationLogForcedKinds) {
+            foreach ($a in $appSources | Where-Object Kind -eq 'MapiBackEnd') {
+                $existing = @($list | Where-Object { $_.Kind -eq 'MapiBackEnd' -and (& $folderKey $_.Folder) -eq (& $folderKey $a.Folder) })
+                if ($existing.Count) { if ($a.Customized) { $existing[0].Optional = $false }; continue }
+                $list.Add([pscustomobject]@{ Kind = 'MapiBackEnd'; Role = $null; Label = 'MAPI ' + $a.Application.TrimEnd('/').Split('/')[-1]; Folder = $a.Folder
+                        Filter = '*.log'; Recurse = $false; PathKey = 'ApplicationLogSources'; Optional = -not $a.Customized })
+            }
+        }
+    }
     if ($src.EasBackEnd) {
         & $add 'EasBackEnd' $null 'EAS back end (IIS)' 'IisBackEndPath' '*.log' $false
         & $custom 'EasBackEnd' 'BackEnd' { $_.Folder -ne $Server.IisBackEndPath -and $_.Vdirs -match '(^|, )Microsoft-Server-ActiveSync(,|$)' }
@@ -1096,13 +1160,18 @@ function New-ExlReport {
     [CmdletBinding()]
     param([Parameter(Mandatory)]$Store, [Parameter(Mandatory)]$Settings, [Parameter(Mandatory)]$Period,
         [ValidateSet('Usage', 'Detailed')][string]$ReportType = 'Usage', [string[]]$User, [string[]]$Server, [bool]$IncludeRoutingDetails = $true, [bool]$IncludeSessionDetails = $true)
+    Assert-ExlPackageIntegrity
+    if (-not [string]::Equals([IO.Path]::GetFullPath($Settings.Report.TemplatePath),
+        [IO.Path]::Combine($script:ToolRoot, 'templates\Report.template.html'), [StringComparison]::OrdinalIgnoreCase)) {
+        throw 'Package integrity: report template must belong to the authenticated package.'
+    }
     $zone = $Settings.Zone
     $scope = @($Settings.Servers | Where-Object { -not $Server -or $_.Name -in $Server })
     $edge = $scope.Count -gt 0 -and @($scope | Where-Object { -not (Test-ExlEdgeServer $_) }).Count -eq 0
     $stamp = (Format-ExlLocalTime $Period.StartMs $zone 'yyyyMMdd-HHmm') + '_' + (Format-ExlLocalTime $Period.EndMs $zone 'yyyyMMdd-HHmm')
     $folderName = '{0}_{1}{2}_{3}' -f $Settings.Report.FilePrefix, $(if ($edge) { 'Edge' } else { '' }), $ReportType, $stamp
     if ($User) { $folderName += '_' + (($User | ForEach-Object { ($_ -replace '[^\w@.-]', '_') }) -join '+') }
-    $folderName += '_' + (Get-Date -Format 'HHmmss')
+    $folderName += '_' + (Get-Date -Format 'HHmmss') + '_' + [guid]::NewGuid().ToString('N').Substring(0, 8)
     $q = [ExchangeLogReport.ReportRequest]::new()
     $q.StartMs = $Period.StartMs; $q.EndMs = $Period.EndMs
     $q.DetailCutoffMs = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds() - [long]$Settings.Storage.DetailRetentionDays * 86400000
@@ -1127,9 +1196,16 @@ function New-ExlReport {
     $q.Generated = Format-ExlLocalTime ([DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()) $zone 'yyyy-MM-dd HH:mm'
     $q.RecoveryWindowMs = [long]$Settings.Collection.RecoveryWindowMinutes * 60000
     $q.MaxHtmlRows = $Settings.Report.MaxHtmlRows
+    $q.MemoryBudgetMB = $Settings.Report.MemoryBudgetMB
+    $q.Parallelism = $Settings.Report.Parallelism
+    $q.Progress = [Action[string]]{ param($stage) Write-ExlLog 'INFO' "Report stage: $stage" }
     $result = [ExchangeLogReport.ReportBuilder]::Build($Store, $q)
     # The slowest steps in the execution log: what to look at when a report is slow.
     foreach ($s in @($result.Steps | Select-Object -First 8)) { Write-ExlLog 'INFO' "Report step: $s" }
+    Write-ExlLog 'INFO' ("Report buffers: budget {0} MB including SQLite caches (source {4} MB, temporary 8 MB), estimated row/worker peak {1:0.0} MB, {2} CPU worker(s), {3} rows spooled to disk (process RAM includes other allocations)." -f
+        $result.MemoryBudgetMB, ($result.PeakBufferBytes / 1MB), $result.Parallelism, $result.SpilledRows, $result.DatabaseCacheMB)
+    Write-ExlLog 'INFO' ("Report I/O: {0} transcript value(s) decoded ({1}); scratch peak {2}." -f
+        $result.TranscriptReads, (Format-ExlBytes $result.TranscriptBytes), (Format-ExlBytes $result.ScratchPeakBytes))
     return $result
 }
 
@@ -1261,7 +1337,7 @@ function Get-ExlIisLogFolders {
     $stream = [IO.FileStream]::new($File, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::ReadWrite)
     try { $xml.Load($stream) } finally { $stream.Dispose() }
     $attribute = { param($Node, [string]$Name, [string]$Default) if ($null -ne $Node -and $Node.GetAttribute($Name)) { $Node.GetAttribute($Name) } else { $Default } }
-    $expand = { param([string]$Directory) ($Directory -replace '(?i)%SystemDrive%', $drive) -replace '(?i)%SystemRoot%', "$drive\Windows" }
+    $expand = { param([string]$Directory) ($Directory -replace '(?i)%SystemDrive%', $drive) -replace '(?i)%(SystemRoot|windir)%', "$drive\Windows" }
     $defaults = $xml.SelectSingleNode('/configuration/system.applicationHost/sites/siteDefaults/logFile')
     $directory = & $attribute $defaults 'directory' '%SystemDrive%\inetpub\logs\LogFiles'
     $format = & $attribute $defaults 'logFormat' 'W3C'
@@ -1272,10 +1348,12 @@ function Get-ExlIisLogFolders {
         $id = $site.GetAttribute('id')
         $roles = [Collections.Generic.List[string]]::new()
         $vdirs = [Collections.Generic.List[string]]::new()
+        $applications = [Collections.Generic.List[object]]::new()
         foreach ($app in @($site.SelectNodes('application'))) {
             $path = $app.GetAttribute('path')
             $physical = & $attribute $app.SelectSingleNode("virtualDirectory[@path='/']") 'physicalPath' ''
             $role = if ($physical -match '(?i)\\FrontEnd\\HttpProxy(\\|$)') { 'FrontEnd' } elseif ($physical -match '(?i)\\ClientAccess(\\|$)') { 'BackEnd' } elseif ($app.GetAttribute('applicationPool') -like 'MSExchange*') { 'Exchange' }
+            $applications.Add([pscustomobject]@{ Site = $site.GetAttribute('name'); Path = $path; PhysicalPath = & $expand $physical; Role = $role })
             if (-not $role) { continue }
             $roles.Add($role)
             $top = $path.Trim('/').Split('/')[0]
@@ -1283,6 +1361,7 @@ function Get-ExlIisLogFolders {
         }
         $siteName = $site.GetAttribute('name')
         $exchangeRole = if ($roles -contains 'FrontEnd') { 'FrontEnd' } elseif ($roles -contains 'BackEnd') { 'BackEnd' } elseif ($vdirs.Count) { if ($siteName -eq $script:ExchangeSites.IisBackEndPath) { 'BackEnd' } else { 'FrontEnd' } }
+        foreach ($a in $applications) { if ($a.Role -eq 'Exchange') { $a.Role = $exchangeRole } }
         [pscustomobject]@{
             Name    = $siteName
             Id      = $id
@@ -1292,9 +1371,11 @@ function Get-ExlIisLogFolders {
             Enabled = (& $attribute $node 'enabled' $(if ($enabled) { 'true' } else { 'false' })) -ne 'false'
             Role    = $exchangeRole
             Vdirs   = $vdirs -join ', '
+            Applications = $applications.ToArray()
         }
     }
-    [pscustomobject]@{ Central = & $attribute $xml.SelectSingleNode('/configuration/system.applicationHost/log') 'centralLogFileMode' 'Site'; Sites = @($sites) }
+    [pscustomobject]@{ Central = & $attribute $xml.SelectSingleNode('/configuration/system.applicationHost/log') 'centralLogFileMode' 'Site'; Sites = @($sites)
+        SystemDrive = $drive; File = $File; Xml = $xml }
 }
 
 function Get-ExlIisSiteMap {
@@ -1308,7 +1389,8 @@ function Get-ExlIisSiteMap {
     param([Parameter(Mandatory)][string]$Server, [switch]$Local, [string]$File)
     $iis = Get-ExlIisLogFolders -Server $Server -Local:$Local -File $File
     if (-not $iis) { return $null }
-    $map = [ordered]@{ Central = $iis.Central; IisFrontEndPath = $null; IisBackEndPath = $null; Custom = [Collections.Generic.List[object]]::new(); Problems = [Collections.Generic.List[string]]::new() }
+    $map = [ordered]@{ Central = $iis.Central; IisFrontEndPath = $null; IisBackEndPath = $null; Custom = [Collections.Generic.List[object]]::new(); Problems = [Collections.Generic.List[string]]::new()
+        Applications = @($iis.Sites | Where-Object Role | ForEach-Object { $_.Applications }); SystemDrive = $iis.SystemDrive; File = $iis.File; Xml = $iis.Xml }
     foreach ($site in @($iis.Sites | Where-Object Role)) {
         $folder = ConvertTo-ExlRemotePath -Server $Server -Path $site.Folder -Local:$Local
         $key = @($script:ExchangeSites.Keys | Where-Object { $script:ExchangeSites[$_] -eq $site.Name }) | Select-Object -First 1
@@ -1334,7 +1416,7 @@ function Test-ExlIisSites {
         Returns the findings as (Status, Text, Drift) entries. -File: an applicationHost.config to check
         instead of the server's own (tests).
     #>
-    param([Parameter(Mandatory)]$Server, [switch]$Local, [string]$File)
+    param([Parameter(Mandatory)]$Server, [switch]$Local, [string]$File, $Sources)
     $notes = [Collections.Generic.List[object]]::new()
     $note = { param($Status, $Text, [bool]$Drift) $notes.Add([pscustomobject]@{ Status = $Status; Text = $Text; Drift = $Drift }) }
     $map = $null
@@ -1370,6 +1452,242 @@ function Test-ExlIisSites {
     }
     $Server.IisCustomSites = @($map.Custom)
     foreach ($p in $map.Problems) { & $note 'Warn' $p $false }
+    foreach ($n in Update-ExlApplicationLogPaths -Server $Server -Map (Get-ExlApplicationLogMap -Server $Server -IisMap $map -Local:$Local -Sources $Sources)) {
+        $notes.Add($n)
+    }
+    return $notes.ToArray()
+}
+
+function Read-ExlConfigurationXml {
+    param([Parameter(Mandatory)][string]$Path)
+    $settings = [Xml.XmlReaderSettings]::new()
+    $settings.DtdProcessing = [Xml.DtdProcessing]::Prohibit
+    $settings.XmlResolver = $null
+    $stream = [IO.FileStream]::new($Path, [IO.FileMode]::Open, [IO.FileAccess]::Read, ([IO.FileShare]::ReadWrite -bor [IO.FileShare]::Delete))
+    $reader = $null
+    try {
+        $reader = [Xml.XmlReader]::Create($stream, $settings)
+        $xml = [xml]::new()
+        $xml.XmlResolver = $null
+        $xml.Load($reader)
+        return , $xml
+    }
+    finally { if ($reader) { $reader.Dispose() }; $stream.Dispose() }
+}
+
+function Get-ExlApplicationLogMap {
+    <# Only settings of the formats parsed by this tool: not MAPI LogPath / LogFilePath, nor native EWS logs. #>
+    param([Parameter(Mandatory)]$Server, [Parameter(Mandatory)]$IisMap, [switch]$Local, $Sources)
+    $entries = [Collections.Generic.List[object]]::new()
+    $failed = [Collections.Generic.List[object]]::new()
+    $problems = [Collections.Generic.List[string]]::new()
+    $cache = @{}
+    $protocols = @{ autodiscover = 'Autodiscover'; ews = 'Ews'; mapi = 'Mapi'; oab = 'Oab'; owa = 'Owa'; ecp = 'Ecp'
+        rpc = 'RpcHttp'; powershell = 'PowerShell'; 'microsoft-server-activesync' = 'Eas'; 'owa/calendar' = 'OwaCalendar' }
+    $apps = @(if ($IisMap.PSObject.Properties['Applications']) { $IisMap.Applications })
+    $expand = {
+        param([string]$Path, [string]$Installation = $Server.ExchangePath)
+        $variables = @{ ExchangeInstallPath = $Installation.TrimEnd('\') + '\'; SystemDrive = $IisMap.SystemDrive
+            SystemRoot = "$($IisMap.SystemDrive)\Windows"; windir = "$($IisMap.SystemDrive)\Windows" }
+        foreach ($m in [regex]::Matches($Path, '%([^%]+)%')) {
+            if (-not $variables.ContainsKey($m.Groups[1].Value)) { throw [FormatException]::new("Unresolved path variable $($m.Value).") }
+        }
+        $text = [regex]::Replace($Path.Trim(), '%([^%]+)%', {
+                param($m)
+                return $variables[$m.Groups[1].Value]
+            })
+        if (-not [IO.Path]::IsPathFullyQualified($text)) { throw [FormatException]::new('The configured log path must be absolute.') }
+        ConvertTo-ExlRemotePath -Server $Server.Name -Path ([IO.Path]::GetFullPath($text)) -Local:$Local
+    }
+    $read = {
+        param([string]$Path, [bool]$Required)
+        if ($cache.ContainsKey($Path)) {
+            if ($Required -and $null -eq $cache[$Path]) { throw [IO.FileNotFoundException]::new('Application configuration file not found.', $Path) }
+            return , $cache[$Path]
+        }
+        try { $xml = Read-ExlConfigurationXml -Path $Path }
+        catch [IO.FileNotFoundException] { if ($Required) { throw }; $xml = $null }
+        catch [IO.DirectoryNotFoundException] { if ($Required) { throw }; $xml = $null }
+        $cache[$Path] = $xml
+        return , $xml
+    }
+    $applyElements = {
+        param($Node, $Values)
+        foreach ($child in $Node.ChildNodes) {
+            switch ($child.Name) {
+                'clear' { $Values.Clear() }
+                'remove' { [void]$Values.Remove($child.GetAttribute('key')) }
+                'add' { $Values[$child.GetAttribute('key')] = $child.GetAttribute('value') }
+            }
+        }
+    }
+    $apply = {
+        param($Node, [string]$File, $Values)
+        if (-not $Node) { return }
+        if ($Node.GetAttribute('configProtectionProvider')) { throw [IO.InvalidDataException]::new('Encrypted appSettings cannot be read by the collector.') }
+        $external = $Node.GetAttribute('configSource')
+        if ($external) {
+            if ([IO.Path]::IsPathRooted($external)) { throw [IO.InvalidDataException]::new('configSource must be relative to its configuration file.') }
+            $otherFile = [IO.Path]::GetFullPath((Join-ExlPath (Split-Path $File -Parent) $external))
+            $other = & $read $otherFile $true
+            if ($other.DocumentElement.Name -ne 'appSettings') { throw [IO.InvalidDataException]::new('configSource must contain an appSettings element.') }
+            $Node = $other.DocumentElement
+            $File = $otherFile
+        }
+        & $applyElements $Node $Values
+        $external = $Node.GetAttribute('file')
+        if ($external) {
+            if ([IO.Path]::IsPathRooted($external)) { throw [IO.InvalidDataException]::new('The appSettings file must be relative to its configuration file.') }
+            $otherFile = [IO.Path]::GetFullPath((Join-ExlPath (Split-Path $File -Parent) $external))
+            $other = & $read $otherFile $false
+            if ($other) {
+                if ($other.DocumentElement.Name -ne 'appSettings') { throw [IO.InvalidDataException]::new('The external settings file must contain an appSettings element.') }
+                & $applyElements $other.DocumentElement $Values
+            }
+        }
+    }
+    foreach ($app in $apps) {
+        $kind = $null; $protocol = $null; $setting = $null
+        $path = $app.Path.Trim('/').ToLowerInvariant()
+        if ($app.Role -eq 'FrontEnd' -and $path) {
+            $kind = 'HttpProxy'
+            $protocol = if ($protocols.ContainsKey($path)) { $protocols[$path] }
+                        elseif ($protocols.ContainsKey($path.Split('/')[0])) { $protocols[$path.Split('/')[0]] }
+                        else { [IO.Path]::GetFileName($app.PhysicalPath.TrimEnd('\')) }
+            $setting = 'RequestDetailsLogger.HttpProxyProtocolLogFolder'
+        }
+        elseif ($app.Role -eq 'BackEnd' -and $path -in 'mapi/emsmdb', 'mapi/nspi') {
+            $kind = 'MapiBackEnd'; $protocol = 'Mapi'; $setting = 'RequestDetailsLogger.MapiHttpMailboxLogFolder'
+        }
+        if (-not $kind) { continue }
+        if ($Sources -and (($kind -eq 'HttpProxy' -and -not $Sources.HttpProxy) -or ($kind -eq 'MapiBackEnd' -and -not $Sources.MapiBackEnd))) { continue }
+        $configFile = $null
+        $default = $null
+        try {
+            $physical = & $expand $app.PhysicalPath
+            $configFile = Join-ExlPath $physical 'web.config'
+            $install = $Server.ExchangePath
+            if ($physical -match '^(.*)\\(?:FrontEnd\\HttpProxy|ClientAccess)(?:\\|$)') { $install = $Matches[1] }
+            $default = Join-ExlPath $install $(if ($kind -eq 'HttpProxy') { "Logging\HttpProxy\$protocol" } else { 'Logging\MapiHttp\Mailbox' })
+            $values = [Collections.Generic.Dictionary[string, string]]::new([StringComparer]::Ordinal)
+            if ($IisMap.PSObject.Properties['Xml'] -and $IisMap.Xml) {
+                & $apply $IisMap.Xml.SelectSingleNode('/configuration/appSettings') $IisMap.File $values
+                foreach ($location in $IisMap.Xml.SelectNodes('/configuration/location')) {
+                    $target = $app.Site + '/' + $app.Path.Trim('/')
+                    $scope = $location.GetAttribute('path').TrimEnd('/')
+                    if ($scope -eq $target.TrimEnd('/') -or ($location.GetAttribute('inheritInChildApplications') -ne 'false' -and
+                            ($scope -eq '' -or $scope -eq '.' -or $target.StartsWith($scope + '/', [StringComparison]::OrdinalIgnoreCase)))) {
+                        & $apply $location.SelectSingleNode('appSettings') $IisMap.File $values
+                    }
+                }
+            }
+            # ASP.NET inheritance follows virtual paths, not the physical parent of a relocated application.
+            $seen = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+            $prefixes = @('/') + @(for ($n = 1; $n -le $path.Split('/').Count; $n++) { '/' + ($path.Split('/')[0..($n - 1)] -join '/') })
+            foreach ($prefix in $prefixes) {
+                $parent = @($apps | Where-Object { $_.Site -eq $app.Site -and ($_.Path -eq '/' -or
+                            $prefix -eq $_.Path -or $prefix.StartsWith($_.Path.TrimEnd('/') + '/', [StringComparison]::OrdinalIgnoreCase)) } |
+                    Sort-Object { $_.Path.Length } -Descending | Select-Object -First 1)
+                if (-not $parent.Count) { continue }
+                $suffix = $prefix.Substring($parent[0].Path.TrimEnd('/').Length).Trim('/').Replace('/', '\')
+                $file = Join-ExlPath (Join-ExlPath (& $expand $parent[0].PhysicalPath) $suffix) 'web.config'
+                if (-not $seen.Add($file)) { continue }
+                $xml = & $read $file ($file -eq $configFile)
+                if ($xml) {
+                    & $apply $xml.SelectSingleNode('/configuration/appSettings') $file $values
+                    $target = $app.Path.Substring($prefix.TrimEnd('/').Length).Trim('/')
+                    foreach ($location in $xml.SelectNodes('/configuration/location')) {
+                        $scope = $location.GetAttribute('path').Trim('/')
+                        $exact = $scope -eq $target -or (($scope -eq '' -or $scope -eq '.') -and $target -eq '')
+                        if ($exact -or ($location.GetAttribute('inheritInChildApplications') -ne 'false' -and
+                                ($scope -eq '' -or $scope -eq '.' -or $target.StartsWith($scope + '/', [StringComparison]::OrdinalIgnoreCase)))) {
+                            & $apply $location.SelectSingleNode('appSettings') $file $values
+                        }
+                    }
+                }
+            }
+            if (-not $seen.Contains($configFile)) { $xml = & $read $configFile $true; & $apply $xml.SelectSingleNode('/configuration/appSettings') $configFile $values }
+            $customized = $values.ContainsKey($setting) -and -not [string]::IsNullOrWhiteSpace($values[$setting])
+            $folder = if ($customized) { & $expand $values[$setting] $install } else { ConvertTo-ExlRemotePath -Server $Server.Name -Path $default -Local:$Local }
+            $entries.Add([pscustomobject]@{ Kind = $kind; Protocol = $protocol; Site = $app.Site; Application = $app.Path
+                    Folder = $folder.TrimEnd('\'); DefaultFolder = $default.TrimEnd('\'); ConfigFile = $configFile; Setting = $setting; Customized = $customized })
+        }
+        catch [IO.IOException], [IO.InvalidDataException], [UnauthorizedAccessException], [Xml.XmlException], [FormatException], [ArgumentException] {
+            $failed.Add([pscustomobject]@{ Kind = $kind; Protocol = $protocol; Site = $app.Site; Application = $app.Path; ConfigFile = $configFile; DefaultFolder = $default })
+            $problems.Add("Application '$($app.Site)$($app.Path)': log settings could not be read ($configFile): $($_.Exception.Message)")
+        }
+    }
+    [pscustomobject]@{ Entries = $entries.ToArray(); Failed = $failed.ToArray(); Problems = $problems.ToArray()
+        CheckedKinds = @(
+            if ($IisMap.PSObject.Properties['Applications']) {
+                if (-not $Sources -or $Sources.HttpProxy) { 'HttpProxy' }
+                if (-not $Sources -or $Sources.MapiBackEnd) { 'MapiBackEnd' }
+            }
+        ) }
+}
+
+function Update-ExlApplicationLogPaths {
+    param([Parameter(Mandatory)]$Server, [Parameter(Mandatory)]$Map)
+    $notes = [Collections.Generic.List[object]]::new()
+    $before = @($Server.ApplicationLogSources)
+    $next = [Collections.Generic.List[object]]::new()
+    $key = { param([string]$Folder) (ConvertTo-ExlRemotePath -Server $Server.Name -Path $Folder).TrimEnd('\') }
+    foreach ($p in $Map.Problems) { $notes.Add([pscustomobject]@{ Status = 'Warn'; Text = $p; Drift = $false }) }
+    foreach ($a in $Map.Entries) {
+        $next.Add($a)
+        $pathKey = if ($a.Kind -eq 'HttpProxy') { 'HttpProxyPath' } else { 'MapiHttpPath' }
+        $forced = $a.Kind -in $Server.ApplicationLogForcedKinds
+        $old = @($before | Where-Object { $_.Kind -eq $a.Kind -and $_.Site -eq $a.Site -and $_.Application -eq $a.Application } | Select-Object -First 1)
+        $was = if ($old.Count) { $old[0].Folder } elseif ($a.Kind -eq 'MapiBackEnd') { $Server.MapiHttpPath } else { $a.DefaultFolder }
+        if ($forced) {
+            if ($a.Customized) { $notes.Add([pscustomobject]@{ Status = 'Info'; Text = "Application '$($a.Site)$($a.Application)' logs to $($a.Folder); $pathKey is forced in the configuration (kept)."; Drift = $false }) }
+        }
+        elseif ((& $key $was) -ne (& $key $a.Folder)) {
+            $drift = $Server.Discovered -or $old.Count -gt 0
+            $notes.Add([pscustomobject]@{ Status = $(if ($drift) { 'Warn' } else { 'Info' })
+                    Text = "Application logs of '$($a.Site)$($a.Application)' moved to $($a.Folder) (was $was): read from the new folder. Run -Mode Discover to record it."
+                    Drift = [bool]$drift })
+        }
+    }
+    foreach ($f in $Map.Failed) {
+        $known = @($before | Where-Object { $_.Kind -eq $f.Kind -and $_.Site -eq $f.Site -and $_.Application -eq $f.Application })
+        foreach ($a in $known) { $next.Add($a) }
+        if (-not $known.Count) {
+            $default = if ($f.DefaultFolder) { $f.DefaultFolder } elseif ($f.Kind -eq 'MapiBackEnd') { Join-ExlPath $Server.ExchangePath 'Logging\MapiHttp\Mailbox' } else { Join-ExlPath $Server.HttpProxyPath $f.Protocol }
+            $folder = if ($f.Kind -eq 'MapiBackEnd' -and $Server.Origin.MapiHttpPath -in 'Discover', 'WebConfig', 'Configuration') { $Server.MapiHttpPath } else { $default }
+            $next.Add([pscustomobject]@{ Kind = $f.Kind; Protocol = $f.Protocol; Site = $f.Site; Application = $f.Application
+                    Folder = $folder; DefaultFolder = $default; ConfigFile = $f.ConfigFile; Setting = ''; Customized = ((& $key $folder) -ne (& $key $default)) })
+        }
+    }
+    $checked = @(if ($Map.PSObject.Properties['CheckedKinds']) { $Map.CheckedKinds } else {
+            foreach ($a in $Map.Entries) { $a.Kind }
+            foreach ($a in $Map.Failed) { $a.Kind }
+        }) | Select-Object -Unique
+    foreach ($a in $before) {
+        if ($a.Kind -notin $checked) { $next.Add($a); continue }
+        if (-not @($next | Where-Object { $_.Kind -eq $a.Kind -and $_.Site -eq $a.Site -and $_.Application -eq $a.Application }).Count) {
+            $forced = $a.Kind -in $Server.ApplicationLogForcedKinds
+            $notes.Add([pscustomobject]@{ Status = $(if ($forced) { 'Info' } else { 'Warn' })
+                    Text = "Application '$($a.Site)$($a.Application)' no longer supplies its log folder $($a.Folder). Run -Mode Discover to record it."
+                    Drift = -not $forced })
+        }
+    }
+    if ($Map.Entries.Count -or $Map.Failed.Count -or $before.Count) {
+        $Server.ApplicationLogSources = $next.ToArray()
+        if ('MapiBackEnd' -notin $Server.ApplicationLogForcedKinds) {
+            $mapi = @($next | Where-Object Kind -eq 'MapiBackEnd' | Sort-Object { $_.Application -notmatch '/emsmdb$' } | Select-Object -First 1)
+            if ($mapi.Count) { $Server.MapiHttpPath = $mapi[0].Folder; $Server.Origin.MapiHttpPath = 'WebConfig' }
+            elseif ('MapiBackEnd' -in $checked -and @($before | Where-Object Kind -eq 'MapiBackEnd').Count) {
+                $Server.MapiHttpPath = Join-ExlPath $Server.ExchangePath 'Logging\MapiHttp\Mailbox'
+                $Server.Origin.MapiHttpPath = 'Default'
+            }
+        }
+        if ('HttpProxy' -notin $Server.ApplicationLogForcedKinds) {
+            $roots = @($Map.Entries | Where-Object Kind -eq 'HttpProxy' |
+                ForEach-Object { [IO.Path]::GetDirectoryName($_.DefaultFolder) } | Sort-Object -Unique)
+            if ($roots.Count -eq 1) { $Server.HttpProxyPath = $roots[0]; $Server.Origin.HttpProxyPath = 'WebConfig' }
+        }
+    }
     return $notes.ToArray()
 }
 
@@ -1383,6 +1701,7 @@ function Get-ExlExchangeSettings {
     param([string[]]$ConnectTo, [pscredential]$Credential)
     $windowsPowerShell = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
     if (-not (Test-Path -LiteralPath $windowsPowerShell -PathType Leaf)) { throw "Windows PowerShell 5.1 is needed for -Mode Discover (the Exchange cmdlets run in Windows PowerShell only): $windowsPowerShell not found." }
+    Assert-ExlPackageIntegrity
     $helper = Join-Path $script:ToolRoot 'src\Get-ExlExchangeSettings.ps1'
     $out = Join-Path ([IO.Path]::GetTempPath()) ("elr-discover-{0}.json" -f [guid]::NewGuid().ToString('N'))
     $credentialFile = $null
@@ -1461,6 +1780,7 @@ function Invoke-ExlDiscovery {
         foreach ($w in @($x.Warnings)) { if ($w) { & $warn "${name}: $w" } }
         $raw = [ordered]@{}
         $map = $null
+        $appServer = $null
         if ($edge) {
             # Edge Transport: no client access, no IIS; SMTP protocol logs of the Edge folder and message tracking.
             if (& $prop $x 'InstallPath') { $raw.ExchangePath = ([string]$x.InstallPath).TrimEnd('\') }
@@ -1484,6 +1804,17 @@ function Invoke-ExlDiscovery {
                     if ($map.$key) { $raw[$key] = $map.$key } else { & $warn "${name}: IIS site '$($script:ExchangeSites[$key])' not found: default folder kept." }
                 }
                 foreach ($p in $map.Problems) { & $warn "${name}: $p" }
+                $appServer = Resolve-ExlServerPaths -Name $name -Discovered $raw -Sources $Settings.Sources
+                $appMap = Get-ExlApplicationLogMap -Server $appServer -IisMap $map -Local:$local -Sources $Settings.Sources
+                foreach ($p in $appMap.Problems) { & $warn "${name}: $p" }
+                [void]@(Update-ExlApplicationLogPaths -Server $appServer -Map $appMap)
+                if ($appServer.ApplicationLogSources.Count) {
+                    $raw.HttpProxyPath = $appServer.HttpProxyPath
+                    $raw.MapiHttpPath = $appServer.MapiHttpPath
+                    foreach ($a in $appServer.ApplicationLogSources | Where-Object Customized) {
+                        Write-ExlItem Info "${name}: $($a.Site)$($a.Application), $($a.Setting) = $($a.Folder)" -Icon Folder
+                    }
+                }
             }
         }
         $e = [ordered]@{ Version = [string]$x.Version; Site = [string]$x.Site; Role = $(if ($edge) { 'Edge' } else { 'Mailbox' }) }
@@ -1493,6 +1824,7 @@ function Invoke-ExlDiscovery {
             $e.PopProtocolLog = [bool]$x.PopProtocolLog
         }
         if ($map -and $map.Custom.Count) { $e.IisCustomSites = @($map.Custom) }
+        if (-not $edge -and $appServer -and $appServer.ApplicationLogSources.Count) { $e.ApplicationLogSources = @($appServer.ApplicationLogSources) }
 
         # Folders that are not where a default installation puts them (the reason for this mode).
         $default = Resolve-ExlServerPaths -Name $name -Configured @{ ExchangePath = 'C:\Program Files\Microsoft\Exchange Server\V15'; IisLogPath = 'C:\inetpub\logs\LogFiles' } -Sources $Settings.Sources
@@ -1573,6 +1905,14 @@ function Invoke-ExlDiscovery {
             if ($key -eq 'IisCustomSites') {
                 $lines.Add(('            {0,-19} = @(' -f $key))
                 foreach ($c in @($value)) { $lines.Add(('                @{{ Name = {0}; Id = {1}; Role = {2}; Vdirs = {3}; Folder = {4} }}' -f (& $q $c.Name), (& $q $c.Id), (& $q $c.Role), (& $q $c.Vdirs), (& $q $c.Folder))) }
+                $lines.Add('            )')
+            }
+            elseif ($key -eq 'ApplicationLogSources') {
+                $lines.Add(('            {0,-19} = @(' -f $key))
+                foreach ($a in $value) {
+                    $parts = foreach ($field in 'Kind', 'Protocol', 'Site', 'Application', 'Folder', 'DefaultFolder', 'ConfigFile', 'Setting', 'Customized') { '{0} = {1}' -f $field, (& $q $a.$field) }
+                    $lines.Add('                @{ ' + ($parts -join '; ') + ' }')
+                }
                 $lines.Add('            )')
             }
             else { $lines.Add(('            {0,-19} = {1}' -f $key, (& $q $value))) }
@@ -1725,3 +2065,180 @@ function Send-ExlTestMail {
 }
 
 #endregion
+
+# SIG # Begin signature block
+# MIIghQYJKoZIhvcNAQcCoIIgdjCCIHICAQExDzANBglghkgBZQMEAgEFADB5Bgor
+# BgEEAYI3AgEEoGswaTA0BgorBgEEAYI3AgEeMCYCAwEAAAQQH8w7YFlLCE63JNLG
+# KX7zUQIBAAIBAAIBAAIBAAIBADAxMA0GCWCGSAFlAwQCAQUABCAzJdPTLIZ7zbtF
+# PCW41yEaT1P4n/Q4+7CI0Zu4DWzOMaCCDW8wggZyMIIEWqADAgECAghkM1HTxzif
+# CDANBgkqhkiG9w0BAQsFADB8MQswCQYDVQQGEwJVUzEOMAwGA1UECAwFVGV4YXMx
+# EDAOBgNVBAcMB0hvdXN0b24xGDAWBgNVBAoMD1NTTCBDb3Jwb3JhdGlvbjExMC8G
+# A1UEAwwoU1NMLmNvbSBSb290IENlcnRpZmljYXRpb24gQXV0aG9yaXR5IFJTQTAe
+# Fw0xNjA2MjQyMDQ0MzBaFw0zMTA2MjQyMDQ0MzBaMHgxCzAJBgNVBAYTAlVTMQ4w
+# DAYDVQQIDAVUZXhhczEQMA4GA1UEBwwHSG91c3RvbjERMA8GA1UECgwIU1NMIENv
+# cnAxNDAyBgNVBAMMK1NTTC5jb20gQ29kZSBTaWduaW5nIEludGVybWVkaWF0ZSBD
+# QSBSU0EgUjEwggIiMA0GCSqGSIb3DQEBAQUAA4ICDwAwggIKAoICAQCfgxNzqrDG
+# bSHL24t6h3TQcdyOl3Ka5LuINLTdgAPGL0WkdJq/Hg9Q6p5tePOf+lEmqT2d0bKU
+# Vz77OYkbkStW72fL5gvjDjmMxjX0jD3dJekBrBdCfVgWQNz51ShEHZVkMGE6ZPKX
+# 13NMfXsjAm3zdetVPW+qLcSvvnSsXf5qtvzqXHnpD0OctVIFD+8+sbGP0EmtpuNC
+# GVQ/8y8Ooct8/hP5IznaJRy4PgBKOm8yMDdkHseudQfYVdIYyQ6KvKNc8HwKp4WB
+# wg6vj5lc02AlvINaaRwlE81y9eucgJvcLGfE3ckJmNVz68Qho+Uyjj4vUpjGYDdk
+# jLJvSlRyGMwnh/rNdaJjIUy1PWT9K6abVa8mTGC0uVz+q0O9rdATZlAfC9KJpv/X
+# gAbxwxECMzNhF/dWH44vO2jnFfF3VkopngPawismYTJboFblSSmNNqf1x1KiVgMg
+# Lzh4gL32Bq5BNMuURb2bx4kYHwu6/6muakCZE93vUN8BuvIE1tAx3zQ4XldbyDge
+# VtSsSKbt//m4wTvtwiS+RGCnd83VPZhZtEPqqmB9zcLlL/Hr9dQg1Zc0bl0EawUR
+# 0tOSjAknRO1PNTFGfnQZBWLsiePqI3CY5NEv1IoTGEaTZeVYc9NMPSd6Ij/D+KNV
+# t/nmh4LsRR7Fbjp8sU65q2j3m2PVkUG8qQIDAQABo4H7MIH4MA8GA1UdEwEB/wQF
+# MAMBAf8wHwYDVR0jBBgwFoAU3QQJB6L1en1SUxKSle44gCUNplkwMAYIKwYBBQUH
+# AQEEJDAiMCAGCCsGAQUFBzABhhRodHRwOi8vb2NzcHMuc3NsLmNvbTARBgNVHSAE
+# CjAIMAYGBFUdIAAwEwYDVR0lBAwwCgYIKwYBBQUHAwMwOwYDVR0fBDQwMjAwoC6g
+# LIYqaHR0cDovL2NybHMuc3NsLmNvbS9zc2wuY29tLXJzYS1Sb290Q0EuY3JsMB0G
+# A1UdDgQWBBRUwv4QlQCTzWr158DX2bJLuI8M4zAOBgNVHQ8BAf8EBAMCAYYwDQYJ
+# KoZIhvcNAQELBQADggIBAPUPJodwr5miyvXWyfCNZj05gtOII9iCv49UhCe204MH
+# 154niU2EjlTRIO5gQ9tXQjzHsJX2vszqoz2OTwbGK1mGf+tzG8rlQCbgPW/M9r1x
+# xs19DiBAOdYF0q+UCL9/wlG3K7V7gyHwY9rlnOFpLnUdTsthHvWlM98CnRXZ7WmT
+# V7pGRS6AvGW+5xI+3kf/kJwQrfZWsqTU+tb8LryXIbN2g9KR+gZQ0bGAKID+260P
+# Z+34fdzZcFt6umi1s0pmF4/n8OdX3Wn+vF7h1YyfE7uVmhX7eSuF1W0+Z0duGwdc
+# +1RFDxYRLhHDsLy1bhwzV5Qe/kI0Ro4xUE7bM1eV+jjk5hLbq1guRbfZIsr0WkdJ
+# LCjoT4xCPGRo6eZDrBmRqccTgl/8cQo3t51Qezxd96JSgjXktefTCm9r/o35pNfV
+# HUvnfWII+NnXrJlJ27WEQRQu9i5gl1NLmv7xiHp0up516eDap8nMLDt7TAp4z5T3
+# NmC2gzyKVMtODWgqlBF1JhTqIDfM63kXdlV4cW3iSTgzN9vkbFnHI2LmvM4uVEv9
+# XgMqyN0eS3FE0HU+MWJliymm7STheh2ENH+kF3y0rH0/NVjLw78a3Z9UVm1F5VPz
+# iIorMaPKPlDRADTsJwjDZ8Zc6Gi/zy4WZbg8Zv87spWrmo2dzJTw7XhQf+xkR6Od
+# MIIG9TCCBN2gAwIBAgIQBof4ljXihJpmCqqt2mhAWzANBgkqhkiG9w0BAQsFADB4
+# MQswCQYDVQQGEwJVUzEOMAwGA1UECAwFVGV4YXMxEDAOBgNVBAcMB0hvdXN0b24x
+# ETAPBgNVBAoMCFNTTCBDb3JwMTQwMgYDVQQDDCtTU0wuY29tIENvZGUgU2lnbmlu
+# ZyBJbnRlcm1lZGlhdGUgQ0EgUlNBIFIxMB4XDTI2MTAxMzAyNDgwMloXDTI3MTAx
+# MzAyNDgwMlowXDELMAkGA1UEBhMCRlIxGzAZBgNVBAcMEkNoYW50ZWxvdXAtRW4t
+# QnJpZTEXMBUGA1UECgwOTmljb2xhcyBGYWJlcnQxFzAVBgNVBAMMDk5pY29sYXMg
+# RmFiZXJ0MIICIjANBgkqhkiG9w0BAQEFAAOCAg8AMIICCgKCAgEAsg6CT0mFQ4jB
+# V2plIS4uWFSoVqRHd82Y7XYZ4CUTe/7nPBRUlXXdKTZMMHzGgiG8dEXNE8K1Xe90
+# Dgl/FnorzAFlrNWSwf6t27UAUw9xkqtRDVVpVgpixpWkAwjcQeLG+YMqBkGbFi35
+# TGvS23lPFWvLp4DxARrv15MtZ/NjNTCAAGUlMP2hFVBknEmrnYjEGyeJ93sl20RS
+# WXQQLNqlenBdkGCrQW4XjHtRjJAEqAC68hN6nWevopSQ8CLUV7A1RFfHFarDrzrL
+# zr0/NjIdSyIfM9hShln31NDrktB6Ups2XIyrtPDNB7fjkW4jpLlOqQGfYKsU9ErE
+# 4SnFsh0yOOjitegyh1RvZ9wH++3DF4CmJfTli5l/gEIm8xCCryxI+K5EogW3wu1y
+# u8NT2hcvHjdh7OpRyPyFAuLZ8MfX7kPAJpnuCeOuktzY/20eVD8bDglj+4zgqzsn
+# cR/t6T/7w1/HxpRyrVoKvEyRx+mphYh5jMdEa0BjxOL0vAJpdGZSfXGmPm/yPqRn
+# 5STTkMtzkVQXPbcvgKM0luzFcQKPHk3qdHLEXa8gf93ktYDbLE5Wd2UHrXz3SZxN
+# URHPdIXCr1qgrqQve7041kMpzrkDI5DnG2lvRG4108gp02bHG0muKyZlDdCOra7h
+# Zonu2nO79sFallruzzNi0o994PoWksUCAwEAAaOCAZUwggGRMAwGA1UdEwEB/wQC
+# MAAwHwYDVR0jBBgwFoAUVML+EJUAk81q9efA19myS7iPDOMwegYIKwYBBQUHAQEE
+# bjBsMEgGCCsGAQUFBzAChjxodHRwOi8vY2VydC5zc2wuY29tL1NTTGNvbS1TdWJD
+# QS1Db2RlU2lnbmluZy1SU0EtNDA5Ni1SMS5jZXIwIAYIKwYBBQUHMAGGFGh0dHA6
+# Ly9vY3Nwcy5zc2wuY29tMFEGA1UdIARKMEgwCAYGZ4EMAQQBMDwGDCsGAQQBgqkw
+# AQMDATAsMCoGCCsGAQUFBwIBFh5odHRwczovL3d3dy5zc2wuY29tL3JlcG9zaXRv
+# cnkwEwYDVR0lBAwwCgYIKwYBBQUHAwMwTQYDVR0fBEYwRDBCoECgPoY8aHR0cDov
+# L2NybHMuc3NsLmNvbS9TU0xjb20tU3ViQ0EtQ29kZVNpZ25pbmctUlNBLTQwOTYt
+# UjEuY3JsMB0GA1UdDgQWBBRoUx3630l9wA1fUpkKkw2GUIxl/jAOBgNVHQ8BAf8E
+# BAMCB4AwDQYJKoZIhvcNAQELBQADggIBAE3oj6cNuwlDToi1BwjgsA5djfRN4DIi
+# BYDFZIRYaIRe/rEdnItz3aqQQdFuwXnJA/MQEmi2WAGek8GeZF+R41s8FbcDxBUE
+# BoSt98TuBE+0xgxQWDiPhhXaX1Aw9V0GF4ZnlfCSw1eu2KiASaKn7Bo0PLbEAXff
+# vftRXof/kyqtw8iID6I4Rhrf5DI3WVZQodakUUmWnbnziWvEZOWbNOfzwP+7BwEt
+# 7jQANfbmEfb4p75rfy5dQVwniTDSvdo6xkrbe1Cr93GS7cJta18IG5CoIVUmdK+s
+# W38B1sLuy8Mi0MstMXV3004yaRuzLdNaAM0f9WAFerxemiQC0kdmA44/lWV3lVkM
+# WJSwkHBkkSg8Eh0hxcGzTH2xmtDhLJHNNLRwkI9u2Ur+HbLCt50oBgSV8BcCs/1i
+# qi884iC/yuX+HIv9YgTUNZ8c4lLaq4VuliJpXLu2buHIsTkO0v0+5oCM91zjTVZm
+# ULeH38N0Vr83psiJVuBSxQyt5nRVrpYz7FACq5gtXELkyViq/rGOlJKaRrgQ6WWq
+# eoIXqKhVFAdP/jAEm2M8ezoVYsUgPyKY2OcuecV9coulAcxUIUydx6qYiOfsGj5u
+# Dy7l4aYjvB771wkUMzUQwxzcDYXJtMMTaWRe6n9EemR67jc73u5CJyFg3PfA5WR1
+# wZislcdCZuS6MYISbDCCEmgCAQEwgYwweDELMAkGA1UEBhMCVVMxDjAMBgNVBAgM
+# BVRleGFzMRAwDgYDVQQHDAdIb3VzdG9uMREwDwYDVQQKDAhTU0wgQ29ycDE0MDIG
+# A1UEAwwrU1NMLmNvbSBDb2RlIFNpZ25pbmcgSW50ZXJtZWRpYXRlIENBIFJTQSBS
+# MQIQBof4ljXihJpmCqqt2mhAWzANBglghkgBZQMEAgEFAKCBhDAYBgorBgEEAYI3
+# AgEMMQowCKACgAChAoAAMBkGCSqGSIb3DQEJAzEMBgorBgEEAYI3AgEEMBwGCisG
+# AQQBgjcCAQsxDjAMBgorBgEEAYI3AgEVMC8GCSqGSIb3DQEJBDEiBCDzF1dJYvGY
+# 6fTPRXGd/9GfXDrh6xYVASr1gYnqznsuUTANBgkqhkiG9w0BAQEFAASCAgAi051i
+# Q/eTHsSI26Oxw2FGvtAMk6ka/wqbN+fvQWT8Wmfocr5F5JLxBWdJNdjz6nr0PJym
+# rz3YxSdN/Vm2OUsZqxlPsyfgHws4zzqmkFEYIL88dbS9es78R36SF85laaEZFiXr
+# zZiefEfnLdgMxMRNjJlY79mcOQIfBkzoHNHrLUeO457iEYT1/fSiIanabtpiZHA+
+# 8bDHgp22ebAIVRI55tc5MKd/v5Ri8PwZiSJmsLUq30AmEsA20K+MTxTvzHs+UUtd
+# icC18J3FkzchrRpBhCdQNymrlfKLOKqLLMtC/tVLZ1eZR5CUbPm4PJCmUyFiJqGZ
+# 0zX6jGk9zwq+Ezseys9J2zoLEzalnR5YCYDkdx7FwdjlsXfF9ImNGsIjBefXihzw
+# V282hu6e5cVRlRdjUagD1JRongygGH/OPF3BhZpI3E9U/0wTgjXWL0DvtI1nAJdO
+# Kxvh9e9aDdQb4oL3PH8+nBR7QHnaWLTrWyKJTJmFYDCPbN65nphRQ/sjxgdIWvRe
+# rV+KmnXLc6/C7NRPFj4mNf8i4tfc7fxRor6ev/ybj46qfNl8iNNTkxW18P4zRs07
+# j3KVSZdwWVBv+p1+lZf8vcstbIKZdqF+5FlxAQ3iiU9q40j3VFaFBRcJMBgNy85P
+# iJvqEtF/hSqvsYmGoUSq9q7McvCJY/fNhF1fzKGCDykwgg8lBgorBgEEAYI3AwMB
+# MYIPFTCCDxEGCSqGSIb3DQEHAqCCDwIwgg7+AgEDMQ0wCwYJYIZIAWUDBAIBMIGJ
+# BgsqhkiG9w0BCRABBKB6BHgwdgIBAQYMKwYBBAGCqTABAwYBMDEwDQYJYIZIAWUD
+# BAIBBQAEIKcqiKG6L7eGCAV4aONENOXJiUsgkUoX6wsK/qnrjmuvAghyBTR9Law/
+# vRgPMjAyNjEwMTQwMjQxMjBaMAMCAQECEGly4rF2knz1IOnzQMU1y/KgggwAMIIE
+# /DCCAuSgAwIBAgIQH2sWYtIuG2xd8cDBoGAOODANBgkqhkiG9w0BAQsFADBzMQsw
+# CQYDVQQGEwJVUzEOMAwGA1UECAwFVGV4YXMxEDAOBgNVBAcMB0hvdXN0b24xETAP
+# BgNVBAoMCFNTTCBDb3JwMS8wLQYDVQQDDCZTU0wuY29tIFRpbWVzdGFtcGluZyBJ
+# c3N1aW5nIFJTQSBDQSBSMTAeFw0yNTAyMTgxNjMyMDJaFw0zNDExMTIxODUwMDVa
+# MG4xCzAJBgNVBAYTAlVTMQ4wDAYDVQQIDAVUZXhhczEQMA4GA1UEBwwHSG91c3Rv
+# bjERMA8GA1UECgwIU1NMIENvcnAxKjAoBgNVBAMMIVNTTC5jb20gVGltZXN0YW1w
+# aW5nIFVuaXQgMjAyNSBFMTBZMBMGByqGSM49AgEGCCqGSM49AwEHA0IABBv7UVHH
+# b+ZVluxPXlfE3M6tg0Xnq8dic+O3vPOCRpalUM1vO9A+GRzSVVjyygHhYrBw62XL
+# Fh1kv7e+yRd/aTajggFaMIIBVjAfBgNVHSMEGDAWgBQMnRAljpqnG5mHQ88IfuG9
+# gZD0zzBRBggrBgEFBQcBAQRFMEMwQQYIKwYBBQUHMAKGNWh0dHA6Ly9jZXJ0LnNz
+# bC5jb20vU1NMLmNvbS10aW1lU3RhbXBpbmctSS1SU0EtUjEuY2VyMFEGA1UdIARK
+# MEgwPAYMKwYBBAGCqTABAwYBMCwwKgYIKwYBBQUHAgEWHmh0dHBzOi8vd3d3LnNz
+# bC5jb20vcmVwb3NpdG9yeTAIBgZngQwBBAIwFgYDVR0lAQH/BAwwCgYIKwYBBQUH
+# AwgwRgYDVR0fBD8wPTA7oDmgN4Y1aHR0cDovL2NybHMuc3NsLmNvbS9TU0wuY29t
+# LXRpbWVTdGFtcGluZy1JLVJTQS1SMS5jcmwwHQYDVR0OBBYEFM582cAEgMUkEGoJ
+# 6hyrJT0R/ajSMA4GA1UdDwEB/wQEAwIHgDANBgkqhkiG9w0BAQsFAAOCAgEAgHN1
+# JIW9ZlNip07FfY9r1LJwLKTl1h/y9r1BjDgHMEz7U7J7mAy32JxA1KLyjCCJqNku
+# RfhDHGFEfZtjTOru7AQMDSDiUDvCCc3jaz5py9jGvwIe5npkLbXqXhA+SqCzG719
+# USigwhHkYr7v8NiXoaY0Xu03p0BiZZreZlpngmGB9+86N94FqIFx2I5Z5iuu7d4j
+# 7aAOZBNxfU9jFDIIGDtWfWeCpF0Q8rLE/3DHDlzJKs5Il3i/VoOl7rTU938oSrxM
+# www6GDBlKX8rGHxvkjgIb9MXkVglJSDHsNAZDeCS/inaxKHA+ChuB8K4OxIxa6k1
+# e+eHBypakAY3wuN7w7PlPmhN6k5IdqZn3HZHs2VjoR841Z9wmVPFdGDdkBZ7XOmb
+# 5OZUaKufsvtER0VbY2DkzaqAaItt1kc+I+FUz7PiVz2PUzpegkftRRxvrPyIL08b
+# lJTnbMQ0XrqDN0rEfuTLv4XhhnKyJaXhxCUdjO/cRumMzZ35QTUMItBWy1xGp0iy
+# oFVnAya2pPsVMuAI+sy1zxlOS9l5iSxvKJ8gpnpOgjqYTa7u1eyZo+4JlcGoiiR1
+# 7LthMTrF1q62tO5xOpI8txUZ6gtKGtkJV6wdj+vZLcwKZ2M93GqVpOo6UBlGjx1s
+# KsVZ7AIUzJZli4NJ0M2KYcrfNnlebkYKpDnSqWwwggb8MIIE5KADAgECAhBtUhhw
+# h+gjTYVgANCAj5NWMA0GCSqGSIb3DQEBCwUAMHwxCzAJBgNVBAYTAlVTMQ4wDAYD
+# VQQIDAVUZXhhczEQMA4GA1UEBwwHSG91c3RvbjEYMBYGA1UECgwPU1NMIENvcnBv
+# cmF0aW9uMTEwLwYDVQQDDChTU0wuY29tIFJvb3QgQ2VydGlmaWNhdGlvbiBBdXRo
+# b3JpdHkgUlNBMB4XDTE5MTExMzE4NTAwNVoXDTM0MTExMjE4NTAwNVowczELMAkG
+# A1UEBhMCVVMxDjAMBgNVBAgMBVRleGFzMRAwDgYDVQQHDAdIb3VzdG9uMREwDwYD
+# VQQKDAhTU0wgQ29ycDEvMC0GA1UEAwwmU1NMLmNvbSBUaW1lc3RhbXBpbmcgSXNz
+# dWluZyBSU0EgQ0EgUjEwggIiMA0GCSqGSIb3DQEBAQUAA4ICDwAwggIKAoICAQCu
+# URAT0vk8IKAghd7JUBxkyeH9xek0/wp/MUjoclrFXqhh/fGH91Fc+7fm0MHCE7A+
+# wmOiqBj9ODrJAYGq3rm33jCnHSsCBNWAQYyoauLq8IjqsS1JlXL29qDNMMdwZ8UN
+# zQS7vWZMDJ40JSGNphMGTIA2qn2bohGtgRc4p1395ESypUOaGvJ3t0FNL3BuKmb6
+# YctMcQUF2sqooMzd89h0E6ujdvBDo6ZwNnWoxj7YmfWjSXg33A5GuY9ym4QZM5OE
+# Vgo8ebz/B+gyhyCLNNhh4Mb/4xvCTCMVmNYrBviGgdPZYrym8Zb84TQCmSuX0JlL
+# La6WK1aO6qlwISbb9bVGh866ekKblC/XRP20gAu1CjvcYciUgNTrGFg8f8AJgQPO
+# Cc1/CCdaJSYwhJpSdheKOnQgESgNmYZPhFOC6IKaMAUXk5U1tjTcFCgFvvArXtK4
+# azAWUOO1Y3fdldIBL6LjkzLUCYJNkFXqhsBVcPMuB0nUDWvLJfPimstjJ8lF4S6E
+# CxWnlWi7OElVwTnt1GtRqeY9ydvvGLntU+FecK7DbqHDUd366UreMkSBtzevAc9a
+# qoZPnjVMjvFqV1pYOjzmTiVHZtAc80bAfFe5LLfJzPI6DntNyqobpwTevQpHqPDN
+# 9qqNO83r3kaw8A9j+HZiSw2AX5cGdQP0kG0vhzfgBwIDAQABo4IBgTCCAX0wEgYD
+# VR0TAQH/BAgwBgEB/wIBADAfBgNVHSMEGDAWgBTdBAkHovV6fVJTEpKV7jiAJQ2m
+# WTCBgwYIKwYBBQUHAQEEdzB1MFEGCCsGAQUFBzAChkVodHRwOi8vd3d3LnNzbC5j
+# b20vcmVwb3NpdG9yeS9TU0xjb21Sb290Q2VydGlmaWNhdGlvbkF1dGhvcml0eVJT
+# QS5jcnQwIAYIKwYBBQUHMAGGFGh0dHA6Ly9vY3Nwcy5zc2wuY29tMD8GA1UdIAQ4
+# MDYwNAYEVR0gADAsMCoGCCsGAQUFBwIBFh5odHRwczovL3d3dy5zc2wuY29tL3Jl
+# cG9zaXRvcnkwEwYDVR0lBAwwCgYIKwYBBQUHAwgwOwYDVR0fBDQwMjAwoC6gLIYq
+# aHR0cDovL2NybHMuc3NsLmNvbS9zc2wuY29tLXJzYS1Sb290Q0EuY3JsMB0GA1Ud
+# DgQWBBQMnRAljpqnG5mHQ88IfuG9gZD0zzAOBgNVHQ8BAf8EBAMCAYYwDQYJKoZI
+# hvcNAQELBQADggIBAJIZdQ2mWkLPGQfZ8vyU+sCb8BXpRJZaL3Ez3VDlE3uZk3cP
+# xPtybVfLuqaci0W6SB22JTMttCiQMnIVOsXWnIuAbD/aFTcUkTLBI3xys+wEajzX
+# aXJYWACDS47BRjDtYlDW14gLJxf8W6DQoH3jHDGGy8kGJFOlDKG7/YrK7UGfHtBA
+# EDVe6lyZ+FtCsrk7dD/IiL/+Q3Q6SFASJLQ2XI89ihFugdYL77CiDNXrI2MFspQG
+# swXEAGpHuaQDTHUp/LdR3TyrIsLlnzoLskUGswF/KF8+kpWUiKJNC4rPWtNrxlbX
+# YRGgdEdx8SMjUTDClldcrknlFxbqHsVmr9xkT2QtFmG+dEq1v5fsIK0vHaHrWjMM
+# maJ9i+4qGJSD0stYfQ6v0PddT7EpGxGd867Ada6FZyHwbuQSadMb0K0P0OC2r7rw
+# qBUe0BaMqTa6LWzWItgBjGcObXeMxmbQqlEz2YtAcErkZvh0WABDDE4U8GyV/32F
+# daAvJgTfe9MiL2nSBioYe/g5mHUSWAay/Ip1RQmQCvmF9sNfqlhJwkjy/1U1ibUk
+# TIUBX3HgymyQvqQTZLLys6pL2tCdWcjI9YuLw30rgZm8+K387L7ycUvqrmQ3ZJlu
+# jHl3r1hgV76s3WwMPgKk1bAEFMj+rRXimSC+Ev30hXZdqyMdl/il5Ksd0vhGMYIC
+# WDCCAlQCAQEwgYcwczELMAkGA1UEBhMCVVMxDjAMBgNVBAgMBVRleGFzMRAwDgYD
+# VQQHDAdIb3VzdG9uMREwDwYDVQQKDAhTU0wgQ29ycDEvMC0GA1UEAwwmU1NMLmNv
+# bSBUaW1lc3RhbXBpbmcgSXNzdWluZyBSU0EgQ0EgUjECEB9rFmLSLhtsXfHAwaBg
+# DjgwCwYJYIZIAWUDBAIBoIIBYTAaBgkqhkiG9w0BCQMxDQYLKoZIhvcNAQkQAQQw
+# HAYJKoZIhvcNAQkFMQ8XDTI2MTAxNDAyNDEyMFowKAYJKoZIhvcNAQk0MRswGTAL
+# BglghkgBZQMEAgGhCgYIKoZIzj0EAwIwLwYJKoZIhvcNAQkEMSIEIENOL0dbBL/p
+# 9R53lw7CgrmDzd/rz5NUUfh/Ywz/V/QxMIHJBgsqhkiG9w0BCRACLzGBuTCBtjCB
+# szCBsAQgVCr5oWqNci5mEUl4iumUwYqaruWmXLNEolSa+Wx5x4swgYswd6R1MHMx
+# CzAJBgNVBAYTAlVTMQ4wDAYDVQQIDAVUZXhhczEQMA4GA1UEBwwHSG91c3RvbjER
+# MA8GA1UECgwIU1NMIENvcnAxLzAtBgNVBAMMJlNTTC5jb20gVGltZXN0YW1waW5n
+# IElzc3VpbmcgUlNBIENBIFIxAhAfaxZi0i4bbF3xwMGgYA44MAoGCCqGSM49BAMC
+# BEcwRQIhAM70swFCOA4DHjZa95TRmcEXcARcvE9ghp0bGg/zg5T3AiARLJe0eQZ7
+# nDzU1+ACPdZmTMe8tWdOoDCSVQ6vZTCybA==
+# SIG # End signature block

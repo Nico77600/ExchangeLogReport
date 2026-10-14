@@ -1,9 +1,9 @@
 ---
 title: Exchange Log Report
 subtitle: Developer guide
-version: 2.0.0
+version: 2.1.0
 author: Nicolas Fabert
-updated: 2026-10-07
+updated: 2026-10-12
 ---
 
 # Exchange Log Report — Developer guide
@@ -52,6 +52,12 @@ Every step with its exact command, on one example (EXCH01 to EXCH04, contoso.com
 > [!IMPORTANT]
 > The tool is **read-only** for Exchange: it reads log files and, with `-Mode Discover`, settings (`Get-*` cmdlets and IIS `applicationHost.config`). It never changes a setting. Reports stay on the local disk, unless the `Mail` section sends them by e-mail (chapter 8.1).
 
+> [!WARNING]
+> Noise removal is not anonymisation. The database and reports can contain account names, e-mail and IP addresses, device identifiers, message subjects and SMTP transcripts. Restrict access to the output folders and review the recipients before enabling e-mail. Database retention does not delete exported HTML/CSV reports or e-mail copies; the operator must protect and delete them separately.
+
+> [!NOTE]
+> Report e-mail is disabled in the delivered configuration. `-SendMail` or `Mail.Enabled` enables it, while `-SendMail:$false` suppresses it for one report. `-Mode MailTest` sends a test message independently of `Mail.Enabled`.
+
 # Part I · Understand
 
 <!-- icon: target -->
@@ -91,10 +97,10 @@ chart | CSV + HTML | usage or detailed troubleshooting report
 | **MAPI back end** (`Logging\MapiHttp\Mailbox`) | Outlook version and mode, MAPI status of each request (an HTTP 200 can carry a MAPI failure), Connect / Disconnect / address book Bind. Same `RequestId` as HttpProxy: the back-end detail is attached to the front-end request. |
 | **ActiveSync back end** (`W3SVC2`, Exchange Back End) | Only the ActiveSync lines: the ActiveSync result hidden behind HTTP 200 (`DeviceNotProvisioned`, `UserDisabledForSync`...), device access state, protocol version. |
 | **POP3 / IMAP4** (`Logging\Pop3`, `Logging\Imap4`, optional) | Front end: client address, logon, back-end server. Back end: every command with its result (`NO`, `BAD`, `-ERR`) and duration. |
-| **SMTP protocol logs** (`<role>\ProtocolLog\SmtpReceive|SmtpSend`) | One row per mail transaction (`MAIL FROM` … end of data): remote host, HELO, TLS, authentication, recipients, final response, Message-ID, session transcript. |
+| **SMTP protocol logs** (`<role>\ProtocolLog\SmtpReceive|SmtpSend`) | One row per mail transaction (`MAIL FROM` … end of data): remote host, HELO, TLS, authentication (mechanism, result and the authenticated user, see 9.3), recipients, final response, Message-ID, session transcript. |
 | **Message tracking** (`MSGTRK*.log`) | Every event of every real message on every server; consolidated into **one row per Message-ID** with its route. |
 
-Performance-critical work (reading, parsing, SQLite, report files, e-mail) is done by a C# engine (`src\Engine.*.cs`) compiled automatically on first use, like in Purview DLP Report.
+Performance-critical work (reading, parsing, SQLite, report files, e-mail) is done by a C# engine (`src\Engine.*.cs`) compiled in memory at each start from the authenticated sources, like in Purview DLP Report (no compiled copy is kept or loaded).
 
 A collection reads **every server and every source at the same time** (2.0.0):
 
@@ -132,7 +138,7 @@ key | Authentication challenges | The anonymous `401` that precedes every NTLM /
 > **Raw log lines are never stored.** The report shows the normalised fields and, for every step of a client session, the log files and a ready-to-copy command that finds the raw lines in the Exchange logs, as long as Exchange keeps them.
 
 > [!WARNING]
-> **Detail is kept 14 days, usage 60 days.** Client sessions, failed and slow requests and SMTP transcripts follow `DetailRetentionDays`; daily usage, operations, clients, SMTP transactions and message tracking follow `RetentionDays`. A report on an older period shows the aggregates only.
+> **Detail is kept 14 days, usage 60 days.** Client sessions, failed and slow requests and SMTP transcripts follow `DetailRetentionDays`; daily usage, operations, clients, SMTP transactions and message tracking follow `RetentionDays`. A report on an older period shows the aggregates only. The authenticated user of an SMTP transaction is kept with the transaction after its transcript expires.
 
 # Part II · Set up
 
@@ -144,7 +150,7 @@ key | Authentication challenges | The anonymous `401` that precedes every NTLM /
 | PowerShell | **7.4 or later** (`pwsh`) for the tool. A portable zip is enough: no installation on the Exchange servers. **Windows PowerShell 5.1** (`powershell.exe`, part of Windows Server) for `-Mode Discover` only: the Exchange cmdlets are not supported in PowerShell 7, so the tool runs them in a Windows PowerShell 5.1 process. |
 | Account | SYSTEM on an Exchange server, or a domain account that is local administrator of every Exchange server (4.1). Edge Transport server: on the Edge itself, SYSTEM or a local administrator (4.2). |
 | Network | SMB (445) from the collector to every Exchange server. On a collector that is not an Exchange server, also HTTP (80) to one Exchange server for `-Mode Discover` (remote PowerShell `http://<server>/PowerShell/`, Kerberos). |
-| Protocol logging | SMTP: `ProtocolLoggingLevel Verbose` on the receive and send connectors whose traffic must be analysed (`Get-ReceiveConnector | ft Name,ProtocolLoggingLevel`). POP/IMAP (optional): `Set-PopSettings` / `Set-ImapSettings -ProtocolLogEnabled $true`, then restart the POP3/IMAP4 services. HttpProxy, IIS (front and back end), MAPI over HTTP and message tracking are on by default. `-Mode Discover` lists the connectors and services whose logging is off. |
+| Protocol logging | SMTP: `ProtocolLoggingLevel Verbose` on the receive and send connectors whose traffic must be analysed (`Get-ReceiveConnector | ft Name,ProtocolLoggingLevel`). Verbose is also what the authenticated user of SMTP clients is read from. POP/IMAP (optional): `Set-PopSettings` / `Set-ImapSettings -ProtocolLogEnabled $true`, then restart the POP3/IMAP4 services. HttpProxy, IIS (front and back end), MAPI over HTTP and message tracking are on by default. `-Mode Discover` lists the connectors and services whose logging is off. |
 | Disk | The database is small (see chapter 12). Plan 1 GB per server and per month in large environments. |
 
 ### 4.1 Where to run it, and with which account
@@ -207,6 +213,15 @@ Run the first collection | `pwsh -File .\Invoke-ExchangeLogReport.ps1 -Mode Coll
 Schedule it | Hourly scheduled task (chapter 7), then build the first report (chapter 8).
 ```
 
+### 5.1 Package integrity
+
+Every release is protected end to end. The owner signs (Authenticode with a timestamp) the five PowerShell files of the package and a manifest, `PackageIntegrity.psd1`, which stays at the package root and lists the raw SHA256 of all 29 protected files (28 required, plus `CHANGELOG.md` in a distribution). Before anything runs, `Invoke-ExchangeLogReport.ps1`, the module (at import and at every engine initialization) and the package builder call `src\Test-PackageIntegrity.ps1`. The verifier authenticates the whole parent package, not only `src`, and is included once through the package builder's recursive `src` copy. It requires a valid, timestamped signature of the owner on itself, on the manifest and on every PowerShell file, then checks all 12 C# sources (`src\*.cs`), all six SQLite DLLs (`lib\sqlite`, including both native architectures), `templates\Report.template.html`, both HTML guides, `README.md`, `THIRD-PARTY-NOTICES.md` and, in a distribution, `CHANGELOG.md`. C# and DLLs are protected by their hashes in the separately owner-signed manifest, not individually Authenticode-signed. A missing, changed, duplicate or unknown file in the package, or a link (reparse point) in the package tree, stops the tool before the module, the SQLite libraries or the engine are loaded. Generate the final manifest hashes only after the five approved script signatures and their real timestamps have been finalized; sign and timestamp the manifest separately last.
+
+- **Not protected, on purpose:** `config\ExchangeLogReport.config.psd1`, `config\ExchangeLogReport.paths.psd1` and `config\ExchangeLogReport.mail.credential` (you edit or generate them: they are data, never executed), and the folders `bin\`, `data\`, `logs\` and `reports\` at the package root. Any other file in `config\` is refused. Repository-only files (`LICENSE`, the Markdown guides, `docs\images\`) are allowed by exact name and are not part of a distribution. The integrity check does not claim that every byte of the folder is immutable.
+- **No compiled cache.** The engine is compiled in memory from the verified sources at every start (a few seconds more than before). A DLL in `bin\` is never loaded: no unsigned checksum next to it could prove where it came from. An existing `bin\` is ignored and can be deleted.
+- **Residual limits.** The check protects the files, not the account: an attacker who can change the package files can also replace the verifier. The files are verified, then read; an administrator who can write to the package folder during that interval is outside this protection. The check needs the owner certificate to be trusted on the server (the certificate chain and timestamp of Windows).
+- Developers: after any change of a protected file, rebuild the guides (`tools\Build-Documentation.ps1`), then regenerate and sign the scripts and the manifest. `tools\New-ExchangeLogReportPackage.ps1` never regenerates a protected file; it fails if the package does not pass the check.
+
 <!-- icon: settings -->
 ## 6. Configuration
 
@@ -231,7 +246,7 @@ The names are enough: where each server really writes its logs is found by **`-M
 
 | What | Read from |
 |---|---|
-| HttpProxy, MAPI back end | Installation folder (`Get-ExchangeServer` › `DataPath`) |
+| HttpProxy, MAPI HTTP back end | Physical application paths from IIS, then each application's `web.config`; the installation folder (`Get-ExchangeServer` › `DataPath`) supplies the defaults |
 | SMTP protocol logs, per role and direction | `*ProtocolLogPath` of `Get-FrontEndTransportService`, `Get-TransportService`, `Get-MailboxTransportService` |
 | Message tracking | `Get-TransportService` › `MessageTrackingLogPath`, `MessageTrackingLogEnabled` |
 | POP3, IMAP4 | `Get-PopSettings` / `Get-ImapSettings` › `LogFileLocation`, `ProtocolLogEnabled` |
@@ -243,10 +258,26 @@ The Exchange cmdlets run in **Windows PowerShell 5.1**: the tool starts `powersh
 
 A custom IIS site is recognised from its virtual directories alone (an application that points to the Exchange front end `FrontEnd\HttpProxy` or back end `ClientAccess`): Exchange is not queried for it. Its logs are read with the IIS front end (OWA, ECP...) or, for a back-end site with ActiveSync, with the ActiveSync back end.
 
+**Application logs are separate from IIS W3C logs.** A protocol logger can be moved in `web.config` without changing the IIS log folder. The tool reads these settings at discovery and every collection:
+
+| Source | Application and setting |
+|---|---|
+| MAPI HTTP back end | `/mapi/emsmdb` and `/mapi/nspi`, normally `ClientAccess\mapi\emsmdb\web.config` and `ClientAccess\mapi\nspi\web.config`: `RequestDetailsLogger.MapiHttpMailboxLogFolder` |
+| HttpProxy | Front-end applications, normally under `FrontEnd\HttpProxy`: `RequestDetailsLogger.HttpProxyProtocolLogFolder` |
+
+The files are located from `applicationHost.config`, not from a hard-coded installation on `C:`. Inherited application settings, scoped locations, `clear` / `remove`, `configSource` and external `file` settings are read as XML, without loading the Exchange applications. `%ExchangeInstallPath%`, `%SystemDrive%`, `%SystemRoot%` and `%windir%` are resolved for the server; an unknown variable or a relative log folder is reported rather than guessed.
+
+Different application folders are recorded as `ApplicationLogSources` in the paths file. MAPI mailbox and address-book HTTP logs can use separate folders; shared folders and overlapping HttpProxy folders are read once. A changed or removed override is followed at the next collection and reported until `-Mode Discover` records it. An unreadable, invalid or encrypted setting produces a warning and retains a previously known path, not a success with silently empty data.
+
+Forced `MapiHttpPath`, `HttpProxyPath` or `LoggingPath` take precedence over these application settings. `ExchangePath` specifies the installation location; it does not prevent a customized protocol log folder from being detected. This lookup runs only for enabled sources, during discovery or collection: a report with `-NoCollect` does not open any Exchange configuration file.
+
+**Other log formats are not substituted.** MAPI `LogPath` / `LogFilePath`, `SyncLogDirectory` and `RequestDetailsLogger.EWSProtocolLogFolder` refer to other application logs; these files are not input to the MAPI HTTP or HttpProxy parsers. In particular, native EWS back-end logging is not collected by this tool. The [Microsoft EWS logging procedure](https://learn.microsoft.com/en-us/archive/blogs/karywa/exchange-server-20132016-ews-logging-configuration) explains the customization mechanism, but its EWS key is not the MAPI key.
+
 What every collection checks, without Exchange cmdlets:
 
 ```cards
 server | IIS sites | `applicationHost.config` of each mailbox server is read again: a moved IIS log folder, a new or removed custom Exchange site are **followed at once** and reported until `-Mode Discover` records them. Not on an Edge Transport server (no IIS).
+file | Application log folders | The enabled HttpProxy and MAPI HTTP applications' `web.config` settings are checked too. Customized folders are followed; unreadable settings retain known paths with a warning.
 folder | Missing folder | HttpProxy, IIS and message tracking folders must exist (row *not found*). SMTP, MAPI, POP/IMAP and custom sites may have no folder until their logging is on and used (row *no folder*).
 clock | Stale source | HttpProxy and the IIS front and back end are written all the time (health probes). Newest file older than `StaleSourceHours`: logging stopped, or the logs were moved and the old folder is read.
 ```
@@ -270,7 +301,7 @@ Servers = @(
 | `IisFrontEnd`, `IisSite` | `$true`, `W3SVC1` | Default Web Site, and the custom sites hosting front-end Exchange virtual directories (OWA, ECP...). `IisSite` is used only until `-Mode Discover` has run. |
 | `SmtpReceive`, `SmtpSend` | `$true` | SMTP protocol logs of the `TransportRoles` listed (`FrontEnd`, `Hub`, `Mailbox`); on an Edge Transport server, its `Edge` folder whatever this list. A missing folder is not an error (protocol logging not enabled for that role). |
 | `MessageTracking` | `$true` | All `MSGTRK*.log` files (hub, delivery, submission, moderation). |
-| `MapiBackEnd` | `$true` | `Logging\MapiHttp\Mailbox`: Outlook version and mode, MAPI status codes. |
+| `MapiBackEnd` | `$true` | `Logging\MapiHttp\Mailbox`, or folders customized in the MAPI applications' `web.config`: Outlook version and mode, MAPI status codes. |
 | `EasBackEnd`, `IisBackEndSite` | `$true`, `W3SVC2` | ActiveSync lines of the Exchange Back End site (the other lines are counted as noise without being parsed). `IisBackEndSite` is used only until `-Mode Discover` has run. |
 | `PopImap` | `$false` | POP3 and IMAP4 protocol logs (front end and back end). Often unused: enable it together with the protocol logging. |
 
@@ -320,6 +351,9 @@ Built-in rules that need no configuration:
 | `Report.IncludeRoutingDetails` | `$true` | Message route and SMTP transcripts **in the CSV files** (always available behind a click in HTML). |
 | `Report.IncludeSessionDetails` | `$true` | Timeline of each client session **in the CSV files** (always available behind a click in HTML). |
 | `Report.MaxHtmlRows` | 200,000 | Per table in the HTML file; the CSV files are always complete. |
+| `Report.MemoryBudgetMB` | 512 | Estimated report buffers and SQLite caches, 64 to 16,384 MB. Retained datasets spill to disk as the shared budget fills; this is not a hard process RAM limit. |
+| `Report.TimeZone` | Europe/Paris | IANA or native Windows ID. On Windows without ICU/IANA lookup, the default falls back to `Romance Standard Time`, preserving Paris winter/summer rules. With an older package, set that Windows ID explicitly if `Europe/Paris` is refused. |
+| `Report.Parallelism` | 0 | Independent report CPU workers, 0 to 16. 0 uses up to four workers, leaving one processor when possible; 1 is sequential. Does not change collection parallelism or multiply database connections. |
 | `Logging.RetentionDays` | **14** | Daily execution log files. |
 
 <!-- icon: clock -->
@@ -536,13 +570,14 @@ One line per session: user, protocol, client, address, front-end and back-end se
 
 The detail of a **user** lists its clients and devices (which Outlook builds and mobile devices are still used) and its client sessions. **Operations** shows which operation is slow or fails, with its share of the protocol. **SMTP clients** answers "which applications, devices and servers still send mail through these servers?" before a decommissioning: address, HELO name, connectors, volume, refusals, TLS and authentication; the detail lists the transactions with their SMTP transcript. Hops between the collected Exchange servers are not listed.
 
+The **authenticated user** is the account that Exchange logged for a successful SMTP `AUTH` of the session. It is shown beside the authentication mechanism and result, and it is not the envelope sender (`MAIL FROM`, which a client can set freely). The HELO name, the client address and the AUTH payload are never used to find it. Technical and machine identities (internal or service accounts) are not presented as human users. When the account is missing, ambiguous or cannot be proven, the report shows *Not available*; for a front-end submission, the account is matched to its back-end session by SID (11.1).
 ![SMTP clients](images/report-smtp-clients.png)
 
 ### 9.4 Messages
 
 ![Message route](images/report-message-route.png)
 
-The **Messages** tab keeps one line per message; the dialog shows the recipients with their own status, the **route** (every tracking event and SMTP session, in order, on every server) and the SMTP transcripts. Mail refused during the SMTP conversation (relay denied, unknown recipient: no Message-ID) has its own line.
+The **Messages** tab keeps one line per message; the dialog shows the recipients with their own status, the **route** (every tracking event and SMTP session, in order, on every server, each SMTP session with its authenticated user, distinct from its sender) and the SMTP transcripts. Mail refused during the SMTP conversation (relay denied, unknown recipient: no Message-ID) has its own line.
 
 ### 9.5 Statuses
 
@@ -578,6 +613,15 @@ The **Messages** tab keeps one line per message; the dialog shows the recipients
 | Rejected / Deferred | `5xx` / `4xx` (during `RCPT` or after the data). |
 | Incomplete | The session ended before the data. |
 
+| Identity evidence (SMTP) | Meaning |
+|---|---|
+| Direct server log | The authenticated user was read from the server's own log of the session. |
+| Front end proxy | Read from the mailbox server's proxy line, matched to the front-end session by SID. |
+| Not applicable | No `AUTH` in the session: the mechanism shows *None*. |
+| Missing | No account proven for this session: shown as *Not available*. |
+| Ambiguous | Conflicting or several candidate accounts: none shown. |
+| Legacy | Stored before this version: not back-filled, shown as *Not available*. |
+
 ### 9.6 Edge Transport report
 
 When **every server of the report is an Edge Transport server** (an Edge's own tool folder, or `-Server EDGE01`), the report is an **Edge report**: mail flow only, without any client access view. Its title is *Edge Transport mail flow* (unless `Report.Title` was changed) and its folder `<FilePrefix>_Edge<Type>_…`.
@@ -604,12 +648,12 @@ Each execution writes a new folder `<FilePrefix>_<Type>_<period>[_<users>]_<time
 | `…-Users.csv` | ✓ | ✓ | One row per real user: protocols, clients, servers, failures, last IP and client. |
 | `…-Clients.csv` | ✓ | ✓ | One row per user × protocol × client (user agent or ActiveSync device): versions, devices, addresses, servers. |
 | `…-Operations.csv` | ✓ | ✓ | One row per protocol × operation: volume, failure rate, slow requests, average and maximum latency. |
-| `…-SmtpClients.csv` | ✓ | ✓ | One row per SMTP client (address + HELO): volume, refusals, TLS, authentication, senders. |
+| `…-SmtpClients.csv` | ✓ | ✓ | One row per SMTP client (address + HELO): volume, refusals, TLS, authentication, authenticated users, senders. |
 | `…-ClientAccess-Daily.csv` | ✓ | ✓ | Per day × server × user × protocol (the detail behind the usage views). |
 | `…-ClientSessions.csv` |  | ✓ | **One row per client session** with its outcome (`Timeline` column if `IncludeSessionDetails`). |
 | `…-ClientAccess-Requests.csv` |  | ✓ | Every failed request with its **resolution**, every **slow** success, every request of `FullDetailUsers`. |
 | `…-Messages.csv` |  | ✓ | **One row per message** with status and route (`Route` column if `IncludeRoutingDetails`), plus the mail refused during the SMTP conversation. |
-| `…-SmtpSessions.csv` |  | ✓ | One row per SMTP transaction, every hop included (`Transcript` column if `IncludeRoutingDetails`). |
+| `…-SmtpSessions.csv` |  | ✓ | One row per SMTP transaction, every hop included, with its authentication mechanism, result, authenticated user and identity evidence (`Transcript` column if `IncludeRoutingDetails`). |
 
 Edge report (9.6): `Servers` and `Daily` without the client access columns, `SmtpClients`, **`SmtpDestinations`** (one row per destination: remote address, remote host, send connector, sent, deferred, failed, TLS, last error) and, Detailed, `Messages` and `SmtpSessions`. No `Users`, `Clients`, `Operations`, `ClientSessions` or `ClientAccess-*` file.
 
@@ -652,7 +696,8 @@ file | One row per message | status, recipients, route, transcripts
 - **MAPI front end ↔ back end**: same key computed from `Logging\MapiHttp\Mailbox` (user, `ClientIP`, `MailboxId`, `MapiClientInfo`); same `RequestId` for the detail of one request.
 - **ActiveSync front end ↔ back end**: same user and user agent in `W3SVC2` (`Log=Error:…`, `As:`, `Ver1:`).
 - **IMAP/POP front end ↔ back end**: the back end only knows the front-end server: its connections are attached, at the end of the collection, to the session of the same user and protocol whose proxy target is that back end, at the same time; otherwise they get their own session *via* the front end.
-- **SMTP submission (587)**: the real client of a session proxied by a front end is read from `XPROXY` on the mailbox server.
+- **SMTP submission (587)**: the real client of a session proxied by a front end is read from `XPROXY` on the mailbox server. The authenticated user of such a session is matched between the front-end and the mailbox server by SID, and shown only when that match is unambiguous.
+- **SMTP authenticated user**: the account that Exchange logged for a successful `AUTH` of the same session (`* data=<account> context=authenticated`). It is never decoded from the AUTH payload and never derived from `MAIL FROM`, HELO or the client address.
 - **Identities**: `sam` or `sam@upn-suffix` (IMAP, POP, back-end logs) becomes `domain\sam` when that account is already known (and not ambiguous between two domains).
 
 ### 11.2 Data model
@@ -666,12 +711,12 @@ file | One row per message | status, recipients, route, transcripts
 | `client_session` | One row per client session: counters, servers, client, errors, back-end information | `DetailRetentionDays` |
 | `session_step` | Timeline of a session: one JSON row per session and log file read (with the log file of each step) | `DetailRetentionDays` |
 | `iis_status` | IIS sub-status / Win32 status of failed proxied requests | `DetailRetentionDays` |
-| `smtp_transaction` | SMTP transactions; `transcript` (compressed, 2.0.0) | `RetentionDays`; transcript `DetailRetentionDays` |
+| `smtp_transaction` | SMTP transactions with their authentication mechanism, result, authenticated user and identity evidence; `transcript` (compressed, 2.0.0) | `RetentionDays` (identity kept after the transcript expires); transcript `DetailRetentionDays` |
 | `message_event` | Tracking events of real messages | `RetentionDays` |
 | `source_file` | Read position of every log file, by file identity: its path on its own server, case ignored (`\\EXCH01\D$\Logs\x.log` and `D:\Logs\x.log` are the same file, read once) | as long as the file exists |
 | `noise`, `run` | Removed lines per reason and execution | `RetentionDays` |
 
-Raw log lines are **never** stored. A database of an older version is upgraded automatically (new tables and columns only). Since 2.0.0, the SMTP transcripts and the session timelines are written compressed (Deflate, about 6 times smaller); those of an older version stay readable as they are.
+Raw log lines are **never** stored. A database of an older version is upgraded automatically (new tables and columns only). Since 2.0.0, the SMTP transcripts and the session timelines are written compressed (Deflate, about 6 times smaller); those of an older version stay readable as they are. The schema 5 to 6 upgrade (SMTP authenticated user) only adds columns and indexes: no reset, no rebuild, and the log read positions are kept, so earlier SMTP rows stay *Not available* (*Legacy*) and are not back-filled. New AUTH payloads, challenges and tokens are redacted before storage. Transcripts stored by an earlier version may still hold AUTH data: reports and CSV exports redact them when written, but the existing database content is not rewritten.
 
 <!-- icon: database -->
 ## 12. Volumes and performance
@@ -772,12 +817,38 @@ A report only reads the database, so its time depends on the period, the number 
 
 What 2.0.0 changes:
 
-- **Page cache.** A report opens the database with the same 256 MB page cache as a collection, and sorts in memory. Before, it used the 2 MB SQLite default and sorted in temporary files: with a large database on a hard disk, every message, session and index page was read again from the disk.
+- **Page cache.** A report opens the database with the same 256 MB page cache as a collection. Large temporary sorts can spill to disk; the cache is not a total process memory limit. In 2.0.0, these sorts were forced into RAM.
 - **Messages per server and per hour.** These are counted in a single pass over a covering index of the tracking events (`ix_msg_flow`), using a 64-bit hash of each message id. Before, two `COUNT(DISTINCT …)` queries sorted every message id of the period, which took 67 s of the 3 minutes above. The SMTP counts use a covering index too (`ix_smtp_flow`).
 - **SMTP transcripts.** They are read only for the transactions that the report shows: none for a Usage report, at most 200 per SMTP client for a Detailed report. Before, every transcript of the period was read and decompressed.
 - **Timing.** The execution log gives the 8 slowest steps of every report (`Report step: …`): query or file, time and rows.
 
 The first opening of a 1.x database by 2.0.0 builds `ix_msg_flow` and `ix_smtp_flow`: about 10 s for 3.4 million tracking events on the load-test PC, a few minutes for a large database on a slow disk.
+
+**Large Detailed reports (local, unreleased correction).** `-NoCollect` skips log collection, not the reconstruction of report details. Session JSON and timelines are reconstructed in batches bounded by count (128) and estimated bytes; tracking and SMTP are correlated one message at a time. Datasets share a memory allowance: the largest retained dataset is spooled to `.report-<id>.tmp` in the new report folder when that allowance fills. HTML is written progressively in chunks of at most 5,000 rows, normally about 1 MB of estimated row memory (smaller with a low budget and many workers); a single larger row remains complete. CSV files are never truncated, and `MaxHtmlRows` still applies only to HTML.
+
+`Report.MemoryBudgetMB` defaults to **512 MB**. One quarter is reserved for the source SQLite cache (at most 256 MB), 8 MB for the temporary SQLite cache, half less 8 MB for retained row estimates, and one quarter for ordered in-flight CPU work. This is a budget for these components, **not a ceiling for the PowerShell process**: runtime/GC overhead, identity aggregates, loader lookahead and an individually oversized row/session can require more memory. The caller's SQLite cache setting is restored after a report.
+
+`Report.Parallelism` defaults to **0** (up to four CPU workers, leaving one processor when possible). It parallelizes session JSON parsing, timeline reconstruction and HTML compression, **not collection or database reads**. Pending work is limited by both worker count and estimated bytes; results are exported in their original order. `1` disables CPU parallelism. Increasing workers is useful only while CPU is the bottleneck; on a busy Exchange server or slow disk, start with one or two.
+
+SMTP client and Edge destination samples use the existing rule (200 transactions, failures first), in memory or on disk according to the budget. Samples are independent arrays and their intermediate dataset and charged grouping structures are released after selection. Transcripts remain immutable IDs in HTML-only columns until an emitted row is resolved. The byte-bounded LRU uses at most one eighth of the working allowance (capped at 16 MB); chunk sizes are measured after resolution. No transcript is truncated. Edge banner discovery reads at most three candidate transcripts per destination with the same bounded cache, keeping only the host name.
+
+Message correlation stages compact SMTP metadata in private scratch tables. A short-key scratch index preserves .NET Unicode `OrdinalIgnoreCase` semantics, while source reads use the existing binary message-ID indexes. No custom source collation or new persistent index is required. Transcripts outside the HTML row cap are not decoded for the message view or copied into scratch.
+
+The complete `SmtpSessions.csv` is streamed directly from the source database, one transaction at a time: these CSV-only transcripts are not copied into the temporary database. An HTML-only report counts SMTP transactions but does not read their complete CSV transcripts. `Report stage: ...` lines are written at each major phase, before it completes; the final `Report step: ...` lines still give the slowest timings.
+
+Spilled message rows are physically materialized into a different dataset table in UTC-millisecond order once, then exported sequentially. There is no self-insert, window function or whole-report group-index build. Message routes and samples also use UTC keys with stable ties; local display timestamps and native DST rules are unchanged.
+
+**Full-volume lab run of the current candidate.** Seven-day Detailed reports on the same isolated database snapshot, with a **512 MiB** budget, produced **504,470 message-view rows**, **1,029,919 SMTP transactions** and **5.91 GiB of CSV/HTML files** per run. One worker completed in **7 min 56 s**, with **771 MiB** peak working set; two workers took **19 min 29 s**, with **570 MiB** peak. Complete CSV hashes and decoded HTML rows matched; the source and snapshot database hashes were unchanged. These were consecutive HDD runs with different cache/I/O conditions, not a controlled CPU speedup experiment: no parallel acceleration is demonstrated. Start with `Report.Parallelism = 1` on this kind of I/O-bound collector and measure before increasing it; the default is unchanged. The initial 20-minute watchdog interrupted a progressing, multi-GiB SMTP CSV export, not an out-of-memory failure.
+
+All report queries, including deferred text and streamed SMTP rows, use one read snapshot. Concurrent WAL collections can continue, but their newer rows appear only in the next report; a long-lived report may delay WAL truncation until its snapshot closes. The existing old-schema upgrade procedure is unchanged. CSV/HTML files use `.partial` names while being written and are renamed only after closing successfully; execution folders have a unique suffix. Worker failures are drained without hiding the first error, cleanup errors are surfaced too, and malformed timeline JSON stops the report instead of silently dropping steps.
+
+The e-mail's top-10 failure summaries are accumulated without retaining every failed session. Identity aggregates and the details of an individually oversized message/session still consume RAM; this is not a fixed process-wide memory ceiling.
+
+Keep enough free disk space for both the final exports and the temporary datasets. Temporary rows contain the same sensitive details as the reports, inherit the report folder's access controls, and are removed on normal completion or a handled error. A killed process or power loss may leave the temporary file in its report folder; remove that interrupted report folder when no process is using it. Reports may take longer on slow storage. Collection cache, schema, retention and source data are unchanged.
+
+SQLite connections normalize Windows drive and UNC paths to extended form internally, including the report-local scratch database and collector worker connections. Deeply nested database and report folders can exceed the legacy 260-character path boundary; configured locations, displayed paths and access controls are unchanged.
+
+Initial comparison of the **disk-only** correction on an unchanged synthetic database (2 servers, 7 days, 1.8 GB of source logs, 118,275 sessions): peak working set **1,567 -> 619 MiB**, generation **28 -> 80 s**. The complete CSV contents and decoded HTML details were unchanged (messages with the same timestamp can have a different tie order). The actual `-Range Last7Days -ReportType Detailed -NoCollect` entry command then completed at **546 MiB** peak, without changing the database. These are PC measurements of the previous disk-only candidate, not measurements of the configurable hybrid/parallel engine or a universal RAM/time guarantee.
 
 <!-- icon: wrench -->
 ## 13. Modifying the tool
@@ -786,7 +857,7 @@ The first opening of a 1.x database by 2.0.0 builds `ix_msg_flow` and `ix_smtp_f
 |---|---|
 | A noise rule (account, client, URL, sender) | `config\…psd1`, section `Noise`. New lines are filtered at the next collection; what is already stored is not changed. |
 | Texts, colours, tabs, columns shown | `templates\Report.template.html` (no rebuild). Columns are described in the report metadata. |
-| Parsing, a new field, a new status | `src\Engine.Collector.cs` (collection), `src\Engine.Sessions.cs` (sessions, back-end logs, POP/IMAP), `src\Engine.Report.cs` and `src\Engine.ReportSessions.cs` (datasets). The engine is recompiled automatically at the next start (hash of the sources). Add a test. A `Parse…` method runs on a parse thread: it may only fill the records of its `ParseContext` (no database, no session, no shared dictionary); what depends on other files goes to the apply side (`HandleAccess`, `Apply…`, `EmitPopImap`). |
+| Parsing, a new field, a new status | `src\Engine.Collector.cs` (collection), `src\Engine.Sessions.cs` (sessions, back-end logs, POP/IMAP), `src\Engine.Report.cs` and `src\Engine.ReportSessions.cs` (datasets), `src\Engine.ReportRows.cs` (hybrid report rows), `src\Engine.ReportExecution.cs` (ordered CPU workers), `src\Engine.ReportTranscripts.cs` (compact links/deferred text). The engine is compiled in memory at every start; a changed source no longer passes the integrity check until the integrity manifest is regenerated and signed (below the table). Add a test. A `Parse…` method runs on a parse thread: it may only fill the records of its `ParseContext` (no database, no session, no shared dictionary); what depends on other files goes to the apply side (`HandleAccess`, `Apply…`, `EmitPopImap`). |
 | Collection pipeline, threads, batches | `src\Engine.Pipeline.cs` (plan, parse threads, apply thread, prepared statements, background WAL copies). Check a change on a load test (chapter 12.2) and with `Parallelism = 1` against the default: the *Parallel collection* test compares both. |
 | E-mail | `src\Engine.Mail.cs` (SMTP client, MIME, summary of the report), `ExchangeLogReport.psm1` region 10 (settings, DPAPI credential file). |
 | Database schema | `src\Engine.Store.cs` (`Schema`, `Migrate`). New tables: `CREATE … IF NOT EXISTS`; a new column of an existing table: `ALTER TABLE` in `Migrate` (done at the next collection) and a new `schema_version`. |
@@ -798,8 +869,8 @@ The first opening of a 1.x database by 2.0.0 builds `ix_msg_flow` and `ix_smtp_f
 
 ```steps
 Test | `Invoke-Pester -Path .\tests\ExchangeLogReport.Tests.ps1 -Output Detailed` — no Exchange needed: the logs are generated with the exact Exchange formats.
-Build the guides | `.\tools\Build-Documentation.ps1` writes `package\docs\ExchangeLogReport-Guide.html` and `package\docs\ExchangeLogReport-UserGuide.html` (self-contained: images inline).
-Build the package | `.\tools\New-ExchangeLogReportPackage.ps1` — no database, no reports, no logs; both HTML guides are included.
+Build the guides | Before the integrity manifest is generated and signed: `.\tools\Build-Documentation.ps1` writes `package\docs\ExchangeLogReport-Guide.html` and `package\docs\ExchangeLogReport-UserGuide.html` (self-contained: images inline).
+Build the package | `.\tools\New-ExchangeLogReportPackage.ps1` — checks the signed source, copies the protected files unchanged (it does not rebuild the guides), checks the copy; no database, no reports, no logs.
 ```
 
 <!-- icon: beaker -->
@@ -904,6 +975,9 @@ E-mail, from EXCH02 to the receive connectors of EXCH01 (Exchange Server SE, sel
 | Edge Transport server: *SMTP in (Edge)* always *no file* | Protocol logging is off on its receive connector: `Set-ReceiveConnector '<Edge>\Default internal receive connector <Edge>' -ProtocolLoggingLevel Verbose` on the Edge. EdgeSync send connectors are set from a mailbox server (`Set-SendConnector`). |
 | `IIS settings not readable (\\<server>\ADMIN$…)` | The account is not local administrator of the server, or the `ADMIN$` share is disabled. The default IIS folders are used meanwhile. |
 | `IIS logs of '…' moved to …` | The IIS log folder of a site changed: the collection already reads the new folder. Run `-Mode Discover` to record it (exit code 2 until then). |
+| MAPI back end stays at zero after logs were moved | Check `RequestDetailsLogger.MapiHttpMailboxLogFolder` in the `emsmdb` / `nspi` applications' `web.config`, then run `-Mode Discover` and `-Mode Collect`. `LogPath` and `LogFilePath` designate other MAPI formats, not the MAPI HTTP logs. |
+| `Application logs of '…' moved to …` | The protocol logger moved independently of IIS W3C logging. The collection follows the new folder; run `-Mode Discover` to record it. |
+| `log settings could not be read` | Check the indicated XML or external settings file and its permissions as the task's account. Known paths are retained, but coverage is not guaranteed until the warning is resolved. Encrypted settings or unknown path variables require a supported readable setting or an explicit log path in the tool configuration. |
 | A source is **stale** | No new HttpProxy or IIS file for `StaleSourceHours`: the server was stopped, logging was turned off, or the logs were moved and the old folder is read. Check the folder on the server, then run `-Mode Discover`. |
 | `The paths file was written on …` | The paths file comes from another collector: run `-Mode Discover` on this one. |
 | A server is *No real usage* but users say they use it | Check the load balancer (are requests reaching it?) and the noise counters in `-Mode Status`: a too broad `SystemUserPatterns` or `ExcludedClientIps` rule can remove real users. |
@@ -913,11 +987,13 @@ E-mail, from EXCH02 to the receive connectors of EXCH01 (Exchange Server SE, sel
 | Same user split between `domain\sam` and `sam` | IMAP, POP and some back-end logs give the account without domain: it is merged with `domain\sam` once this account has been seen in a front-end log. |
 | No SMTP transaction | Protocol logging is off on the connectors (`Set-ReceiveConnector -ProtocolLoggingLevel Verbose`), or all sessions were probes (see *Connection without message* in `-Mode Status`). |
 | SMTP clients shows a front-end server as client | Submissions proxied by a front end are shown with their real client only when the mailbox server logs `XPROXY` (Exchange 2016 and later): check that protocol logging is on for the *Client Proxy* receive connector of the mailbox servers. |
+| Authenticated user *Not available* | No account is proven for the session: the connectors do not log `Verbose`, the session did not authenticate successfully, the account is ambiguous, or a front-end submission cannot be matched by SID to its mailbox-server line. Never taken from the sender, HELO or IP. Transactions collected before this version are not back-filled (*Legacy*). |
 | Messages *In transit* | The next server of the route is not in the configuration, or its tracking logs are not readable yet. |
 | `Another execution is already collecting` | A collection is running (lock `…sqlite.lock`): `-Mode Collect` or `-Collect` waited 30 s. Wait for it to finish; a report without `-Collect` never waits (it uses the data already collected). |
 | `No collection in the database yet` | A report never starts the first collection on its own: run `-Mode Collect` once, then schedule it (chapter 7). |
 | Every report says *more than 90 min (Report.MaxDataAgeMinutes)* | The hourly scheduled collection is not running: last result of the task (`Get-ScheduledTaskInfo`), *Log on as a batch job*, lock left by a stopped execution. |
-| `Unable to load the engine` / compilation error after an edit | Fix the C# error shown, or delete `bin\` to force a rebuild. |
+| `Unable to load the engine` / compilation error after an edit | Fix the C# error shown. `bin\` is not used any more (a compiled copy is never loaded); an old `bin\` can be deleted. |
+| `Package integrity: …` | A protected file is missing, changed or unknown, or a signature is not valid: see "Package integrity" in chapter 5. Restore the package from the release; do not edit protected files. |
 | The report is slow to open | More than ~200,000 rows: lower `MaxHtmlRows` and use the CSV, or narrow the period / users. |
 | Collection slow | The statistics line of the execution log says what limits it (chapter 12.3): processors, write thread or disk. Administrative shares are slower than local disks: run one collector per site, and schedule hourly so that each run reads one hour only. |
 
@@ -931,7 +1007,7 @@ E-mail, from EXCH02 to the receive connectors of EXCH01 (Exchange Server SE, sel
 | MapiHttp (back end) | DateTime, RequestId, RequestType, HttpStatusCode, ResponseCode, StatusCode, ReturnCode, TotalRequestLatency, AuthenticatedUserEmail, MailboxId, ClientIP, SourceCafeServer, MapiClientInfo, ClientSoftware, ClientSoftwareVersion, ClientMode, OperationSpecific, GenericErrors |
 | IIS back end (`W3SVC2`) | ActiveSync lines only: cs-uri-query (`Cmd`, `DeviceId`, `Log=` tokens `Error`, `As`, `Ver1`), cs-username, cs(User-Agent), sc-status, time-taken |
 | POP3 / IMAP4 | dateTime, sessionId, cIp, user, duration, rqsize, rpsize, command, parameters, context (`R=` result, `Proxy:` back-end server) |
-| SMTP protocol | date-time, connector-id, session-id, local-endpoint, remote-endpoint, event (`+ - > < *`), data (`XPROXY` of proxied submissions), context |
+| SMTP protocol | date-time, connector-id, session-id, local-endpoint, remote-endpoint, event (`+ - > < *`), data (`XPROXY` of proxied submissions; `* data=<account> context=authenticated` for the authenticated user, AUTH payloads never decoded), context |
 | Message tracking | date-time, client-ip, client-hostname, server-ip, server-hostname, source-context, connector-id, source, event-id, internal-message-id, message-id, network-message-id, recipient-address, recipient-status, total-bytes, recipient-count, related-recipient-address, reference, message-subject, sender-address, return-path, message-info, directionality, log-id |
 
 The columns are found by name in the `#Fields:` header of each file: a different column order or an Exchange update adding columns does not break the parsing.
