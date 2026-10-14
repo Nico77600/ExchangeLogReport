@@ -140,7 +140,7 @@ Reports read the database: they take seconds to minutes, never wait for the coll
 
 - **Nothing to install on Exchange.** One collector — an Exchange server running the tool as SYSTEM, or an administration server — reads the log folders of every server over the administrative shares, every hour, and only the **new lines** of each file.
 - **Fast, even on months of logs.** Every server and every source is read at the same time, and a single thread writes the database in large transactions. On the same lab collector and the same 14 days of logs of two servers (14.6 GB), 2.0.0 collects in **6 minutes** where 1.6 took **4 h 56 min**, and a 30-day usage report takes 2 min 30 s instead of 15 minutes. The hourly collection reads one hour of logs: a few seconds per server.
-- **The real log folders, checked at every run.** `-Mode Discover` asks Exchange where each server really writes its logs — Exchange on another drive, SMTP logs moved per role, message tracking, POP/IMAP — and reads the IIS sites from `applicationHost.config`, including a second OWA/ECP site. Every collection then follows a moved IIS log folder and warns when an expected folder is missing or a source has stopped writing.
+- **The real log folders, checked at every run.** `-Mode Discover` asks Exchange where each server really writes its logs — Exchange on another drive, SMTP logs moved per role, message tracking, POP/IMAP — and reads the IIS sites from `applicationHost.config`, including a second OWA/ECP site. It also reads the MAPI HTTP (`emsmdb` / `nspi`) and HttpProxy log folders moved in the applications' `web.config`; forced log paths still win. Every collection then follows a moved IIS log folder and warns when an expected folder is missing or a source has stopped writing.
 - **One entry point, one configuration file.** `Invoke-ExchangeLogReport.ps1` finds the log folders (`-Mode Discover`), collects (`-Mode Collect`), builds a report from the database (`-Range`, `-Date`, `-Month`, `-Start` / `-End`, `-ReportType`, `-User`, `-Server`), sends it by e-mail (`-SendMail`, `-Mode MailTest`) or shows what the database holds (`-Mode Status`). No parameter is ignored silently: a period that contradicts another is an error, and a parameter that the mode does not use is shown with the reason.
 - **Edge Transport servers too.** Run on the Edge itself, the tool reads only its SMTP protocol logs and message tracking, and builds an **Edge report**: messages, SMTP clients (who sends to the Edge) and SMTP destinations (Exchange Online, internet MX, the mailbox servers).
 - **Read-only** for Exchange: the tool only reads log files and settings (`Get-*` cmdlets, IIS configuration) and never changes a setting. The reports stay on the local disk, unless the `Mail` section sends them by e-mail: anonymous, Basic or Kerberos (GSSAPI) authentication, STARTTLS or TLS.
@@ -165,7 +165,7 @@ The 1–3 GB of logs per day and server of a production environment never reach 
 </picture>
 
 - **One row per client session** — Outlook (MAPI), ActiveSync device, OWA, EWS, IMAP/POP client — with the result hidden behind HTTP 200 in the back end (MAPI status, `DeviceNotProvisioned`, `UserDisabledForSync`), the wrong passwords seen by IIS, slow requests, latencies, user agents and devices. Each step of the timeline shows the log files and a ready-to-copy command that finds the raw lines.
-- **One row per message**, received or sent, with its status and its full route behind a click, plus the mail refused during the SMTP conversation. **SMTP clients** lists the applications, devices and servers that still send mail through the servers.
+- **One row per message**, received or sent, with its status and its full route behind a click, plus the mail refused during the SMTP conversation. **SMTP clients** lists the applications, devices and servers that still send mail through the servers, with their authenticated user when Exchange logged one. The user comes only from explicit successful server evidence and is bound at the original accepted proxy handoff: a later login cannot replace an earlier transaction's user, and contradictory evidence withdraws it. Otherwise it shows *Not available*.
 
 ## Reports
 
@@ -231,6 +231,16 @@ Invoke-Pester -Path .\tests      # Pester 5+, logs generated in the exact Exchan
 `tools\New-ExlSyntheticLogs.ps1` writes logs with the volumes of a production server (or a decommissioning case), and `tools\Measure-ExlCollection.ps1` measures a collection on them: the performance figures above come from these tools, on a PC and on the lab ([developer guide, chapter 12](package/docs/ExchangeLogReport-Guide.md#12-volumes-and-performance)).
 
 The tool was also validated on a lab of four Exchange Server SE servers (two sites, one DAG) and an Edge Transport server with generated traffic: Outlook, iPhone and Android ActiveSync, OWA, EWS, Outlook for Mac, IMAP, POP, SMTP submission and relay, wrong passwords, blocked devices, internet mail through the Edge; and with a collector on an administration server, log folders moved to another drive and a second OWA/ECP web site (developer guide, chapter 14).
+
+## Data handling
+
+The package includes PowerShell scripts, C# source compiled in memory at each start, and third-party SQLite binaries; it is not a plain-text PowerShell-only tool. A signed manifest (`PackageIntegrity.psd1`, at the package root) and `src\Test-PackageIntegrity.ps1` verify the signatures and the hash of every protected file before anything runs, including all 12 C# sources and all six SQLite DLLs. C# and DLLs are protected by raw SHA256 entries in the owner-signed manifest, not individually Authenticode-signed. The configuration is not protected, and no compiled copy is loaded from `bin\`. It is read-only for Exchange, but writes its database, reports and execution logs locally.
+
+Report e-mail is disabled in the delivered configuration. `-SendMail` or `Mail.Enabled` enables it; `-SendMail:$false` suppresses it for one report. `-Mode MailTest` sends a test message independently of `Mail.Enabled`.
+
+Noise removal is not anonymisation. The database and reports can contain account names, e-mail and IP addresses, device identifiers, message subjects and SMTP transcripts. Restrict access to the output folders and review the recipients before enabling e-mail. Database retention does not delete exported HTML/CSV reports or copies sent by e-mail; their protection and deletion remain the operator's responsibility.
+
+SMTP AUTH payloads, challenges and tokens are removed before the database stores them. Transcripts stored by an earlier version are redacted in reports and CSV exports; the existing database content is not rewritten.
 
 ## License
 

@@ -87,9 +87,13 @@ namespace ExchangeLogReport
         readonly SQLitePCL.sqlite3_stmt _stmt;
         readonly int[] _index;
 
-        public Prepared(Store store, string sql, int parameters)
+        public Prepared(Store store, string sql, int parameters) : this(store.Connection, sql, parameters) { }
+
+        public Prepared(SqliteCommand command, int parameters) : this(command.Connection, command.CommandText, parameters) { }
+
+        Prepared(SqliteConnection connection, string sql, int parameters)
         {
-            _db = store.Connection.Handle;
+            _db = connection.Handle;
             int rc = SQLitePCL.raw.sqlite3_prepare_v2(_db, sql, out _stmt);
             if (rc != SQLitePCL.raw.SQLITE_OK) throw new SqliteException("SQLite: " + SQLitePCL.raw.sqlite3_errmsg(_db).utf8_to_string() + " (" + sql + ")", rc);
             _index = new int[parameters];
@@ -99,6 +103,7 @@ namespace ExchangeLogReport
         public void Use(SqliteTransaction tx) { }
 
         byte[] _utf8 = new byte[4096];
+        char[] _characters;
 
         public void Set(int i, object value)
         {
@@ -143,6 +148,53 @@ namespace ExchangeLogReport
             return changes;
         }
 
+        public int ExecuteNonQuery() { return Run(); }
+
+        public Rows ExecuteReader() { return new Rows(this); }
+
+        public readonly struct Rows : IDisposable
+        {
+            readonly Prepared _owner;
+            internal Rows(Prepared owner) { _owner = owner; }
+            public bool Read()
+            {
+                int rc = SQLitePCL.raw.sqlite3_step(_owner._stmt);
+                _owner.Check(rc);
+                return rc == SQLitePCL.raw.SQLITE_ROW;
+            }
+            public bool IsDBNull(int i) { return SQLitePCL.raw.sqlite3_column_type(_owner._stmt, i) == SQLitePCL.raw.SQLITE_NULL; }
+            public long GetInt64(int i)
+            {
+                if (IsDBNull(i)) throw new InvalidOperationException("The column is NULL.");
+                return SQLitePCL.raw.sqlite3_column_int64(_owner._stmt, i);
+            }
+            public string GetString(int i)
+            {
+                if (IsDBNull(i)) throw new InvalidOperationException("The column is NULL.");
+                return SQLitePCL.raw.sqlite3_column_text(_owner._stmt, i).utf8_to_string();
+            }
+            // Borrowed from SQLite: consume before the next Read or Dispose; never retain the span.
+            public ReadOnlySpan<byte> GetUtf8(int i)
+            {
+                if (IsDBNull(i)) throw new InvalidOperationException("The column is NULL.");
+                return SQLitePCL.raw.sqlite3_column_blob(_owner._stmt, i);
+            }
+            public bool TextEquals(int i, string value)
+            {
+                if (value == null) return IsDBNull(i);
+                if (IsDBNull(i)) return false;
+                var bytes = GetUtf8(i);
+                int count = System.Text.Encoding.UTF8.GetCharCount(bytes);
+                if (count != value.Length) return false;
+                if (_owner._characters == null || _owner._characters.Length < count)
+                    _owner._characters = new char[Math.Max(32, count)];
+                System.Text.Encoding.UTF8.GetChars(bytes, _owner._characters);
+                for (int j = 0; j < count; j++) if (_owner._characters[j] != value[j]) return false;
+                return true;
+            }
+            public void Dispose() { SQLitePCL.raw.sqlite3_reset(_owner._stmt); }
+        }
+
         /// <summary>Runs the statement and returns the integer of the first row (RETURNING id), null without row.</summary>
         public object Scalar()
         {
@@ -164,7 +216,7 @@ namespace ExchangeLogReport
     /// <summary>Every statement written by a collection, prepared once.</summary>
     sealed class Writer : IDisposable
     {
-        public Prepared InsertEvent, InsertIis, InsertSmtp, InsertMessage, Usage, Action, Client, SaveFile, Noise;
+        public Prepared InsertEvent, InsertIis, InsertSmtp, InsertFragment, LookupFragment, UpdateAuth, InsertMessage, Usage, Action, Client, SaveFile, Noise;
         public Prepared SessionInsert, SessionUpdate, SessionStep, SessionRepoint, SessionDelete;
         public const string SessionColumns = "skey,day,start_ms,end_ms,user,protocol,mailbox,client_ip,user_agent,device_id,device_type,software,client_mode,front_ends,back_ends," +
             "requests,successes,failures,slow,first_success_ms,last_success_ms,first_failure_ms,last_failure_ms,total_ms,max_ms,bytes_in,bytes_out,actions,statuses," +
@@ -179,7 +231,10 @@ namespace ExchangeLogReport
         {
             InsertEvent = Add(store, "INSERT OR IGNORE INTO access_event(time_ms,server,source,protocol,user,mailbox,client_ip,user_agent,method,url,action,status,sub_status,win32,backend_status,error_code,target_server,auth_type,routing,bytes_in,bytes_out,duration_ms,outcome,request_id,errors) VALUES(" + Values(25) + ") RETURNING id;", 25);
             InsertIis = Add(store, "INSERT OR REPLACE INTO iis_status(server,request_id,time_ms,status,sub_status,win32,time_taken) VALUES(" + Values(7) + ");", 7);
-            InsertSmtp = Add(store, "INSERT OR IGNORE INTO smtp_transaction(time_ms,end_ms,server,direction,role,connector,session_id,local_ep,remote_ep,helo,tls,auth,mail_from,rcpt_count,rcpts,message_id,internal_id,status,response,transcript) VALUES(" + Values(20) + ");", 20);
+            InsertSmtp = Add(store, "INSERT OR IGNORE INTO smtp_transaction(time_ms,end_ms,server,direction,role,connector,session_id,local_ep,remote_ep,helo,tls,auth,mail_from,rcpt_count,rcpts,message_id,internal_id,status,response,transcript,auth_fragment_id,auth_sequence,auth_source,auth_result) VALUES(" + Values(24) + ");", 24);
+            InsertFragment = Add(store, "INSERT INTO smtp_auth_fragment(source_file_id,source_key,first_offset,part,first_ms,last_ms,server,direction,role,connector,session_id,local_ep,remote_ep,helo,first_sequence,last_sequence,complete_start,complete_end,coverage,proxy_sid,proxy_ip,proxy_port,proxy_helo,observations,conflicted,origin_first_ms,evidence_format,conflict_positions) VALUES(" + Values(28) + ") ON CONFLICT DO NOTHING RETURNING id;", 28);
+            LookupFragment = Add(store, "SELECT id FROM smtp_auth_fragment WHERE server=@p0 AND direction=@p1 AND role=@p2 AND source_key=@p3 AND session_id=@p4 AND first_offset=@p5 AND COALESCE(origin_first_ms,first_ms)=@p6 AND COALESCE(evidence_format,1)=@p7 AND part=@p8;", 9);
+            UpdateAuth = Add(store, "UPDATE smtp_transaction SET auth_user=@p0,auth_mechanism=@p1,auth_result=@p2,auth_attempt_result=@p3,auth_source=@p4,auth_evidence_id=@p5 WHERE id=@p6;", 7);
             InsertMessage = Add(store, "INSERT OR IGNORE INTO message_event(time_ms,server,event_id,source,message_id,internal_id,network_id,sender,recipients,recipient_status,recipient_count,total_bytes,subject,client_ip,client_host,server_ip,server_host,connector,source_context,related_recipient,reference,directionality,message_info,return_path,log_id) VALUES(" + Values(25) + ");", 25);
             Usage = Add(store, @"INSERT INTO access_usage(day,server,user,protocol,mailbox,requests,successes,client_errors,server_errors,bytes_in,bytes_out,total_ms,max_ms,first_ms,last_ms,last_success_ms,last_failure_ms,client_ip,user_agent,slow)
 VALUES(" + Values(20) + @")
@@ -213,16 +268,24 @@ ON CONFLICT(day,user,protocol,client_ip,user_agent,device_id) DO UPDATE SET requ
         public void Dispose() { foreach (var p in _all) p.Dispose(); }
     }
 
-    /// <summary>A parsed file waiting for the apply thread.</summary>
-    sealed class ParsedFile
+    /// <summary>A parsed file waiting for the apply thread. It owns the SMTP spool of the file, deleted when the file is applied or abandoned.</summary>
+    sealed class ParsedFile : IDisposable
     {
         public FileWork Work;
         public FileResult Result;
         public object Context;          // Collector.ParseContext
+        public SmtpSpool Spool;
         public long StartOffset, NewOffset;
         public string Fields;
         public double Started, Ended;   // seconds since the start of the run
         public double ApplySeconds;     // time spent by the apply thread on its records
+
+        public void Dispose()
+        {
+            var spool = Spool;
+            Spool = null;
+            if (spool != null) spool.Dispose();
+        }
     }
 
     /// <summary>A collection running in the background. PowerShell polls it: Wait, Progress, TakeFinished.</summary>
@@ -411,7 +474,8 @@ ON CONFLICT(day,user,protocol,client_ip,user_agent,device_id) DO UPDATE SET requ
                             finally { done(w); }
                             memo.Trim();
                             lock (run.Lock) run.Reading.Remove(slot);
-                            output.Add(parsed, token);
+                            try { output.Add(parsed, token); }
+                            catch (Exception) { parsed.Dispose(); throw; }
                         }
                     }
                     catch (OperationCanceledException) { }
@@ -430,6 +494,7 @@ ON CONFLICT(day,user,protocol,client_ip,user_agent,device_id) DO UPDATE SET requ
                 try
                 {
                     _writer = new Writer(_store);
+                    _auth = new AuthResolver(_store, _writer, _o.SmtpIdleMs);
                     _times = run.ApplyTimes;
                     // The WAL is copied into the database by a thread of its own (another connection): the commits of the
                     // apply thread only append to the WAL, the copy and its flush to the disk run at the same time.
@@ -464,7 +529,9 @@ ON CONFLICT(day,user,protocol,client_ip,user_agent,device_id) DO UPDATE SET requ
                 {
                     lock (gate) Monitor.PulseAll(gate);
                     // Let the parse threads finish (they stop at the cancellation) before the database is used again.
-                    try { foreach (var _ in output.GetConsumingEnumerable()) { } } catch (Exception) { }
+                    try { foreach (var left in output.GetConsumingEnumerable()) { try { left.Dispose(); } catch (Exception) { /* the run already failed or was cancelled: that failure is the one reported */ } } } catch (Exception) { }
+                    // Files that were taken from the queue before the failure have been disposed by Apply; the resolver's work file goes with it.
+                    if (_auth != null) { try { _auth.Dispose(); } catch (Exception ex) { lock (run.Lock) { if (run.Error == null) run.Error = ex; } } _auth = null; }
                     if (_writer != null) { _writer.Dispose(); _writer = null; }
                     stopCheckpoints.Set();
                     if (checkpointer != null) checkpointer.Join();
@@ -492,7 +559,7 @@ ON CONFLICT(day,user,protocol,client_ip,user_agent,device_id) DO UPDATE SET requ
         {
             try
             {
-                var builder = new SqliteConnectionStringBuilder { DataSource = _store.FilePath, Mode = SqliteOpenMode.ReadWrite, Pooling = false };
+                var builder = new SqliteConnectionStringBuilder { DataSource = Store.SqlitePath(_store.FilePath), Mode = SqliteOpenMode.ReadWrite, Pooling = false };
                 using (var db = new SqliteConnection(builder.ToString()))
                 {
                     db.Open();
@@ -522,6 +589,7 @@ ON CONFLICT(day,user,protocol,client_ip,user_agent,device_id) DO UPDATE SET requ
             var result = new FileResult { Server = w.Job.Server, Kind = w.Job.Kind, Path = w.Path };
             var parsed = new ParsedFile { Work = w, Result = result, Started = run.Clock.Elapsed.TotalSeconds };
             var clock = Stopwatch.StartNew();
+            ParseContext c = null;
             try
             {
                 var info = new FileInfo(w.Path);
@@ -531,19 +599,29 @@ ON CONFLICT(day,user,protocol,client_ip,user_agent,device_id) DO UPDATE SET requ
                 if (length < start) { start = 0; fields = null; result.Reset = true; }
                 parsed.StartOffset = start;
                 if (length == start) { result.Unchanged = true; parsed.NewOffset = start; parsed.Fields = fields; return parsed; }
-                var c = new ParseContext
+                c = new ParseContext
                 {
                     Work = w, Result = result, Server = w.Job.Server, Role = w.Job.Role, Path = w.Path, Fields = fields, StartOffset = start,
-                    LastWriteMs = new DateTimeOffset(info.LastWriteTimeUtc).ToUnixTimeMilliseconds(), Split = memo.Split, Memo = memo, Days = memo.Days
+                    LastWriteMs = new DateTimeOffset(info.LastWriteTimeUtc).ToUnixTimeMilliseconds(), Split = memo.Split, Memo = memo, Days = memo.Days,
+                    SpoolFolder = System.IO.Path.GetDirectoryName(_store.FilePath)
                 };
                 parsed.NewOffset = Parse(c, w.Job.Kind);
                 parsed.Fields = c.Fields;
                 parsed.Context = c;
+                parsed.Spool = c.Spool;
+                c.Spool = null;
                 w.Length = length;
                 w.LastWriteUtc = info.LastWriteTimeUtc;
                 result.BytesRead = parsed.NewOffset - start;
             }
-            catch (Exception ex) { result.Error = ex.GetType().Name + ": " + ex.Message; parsed.Context = null; }
+            catch (Exception ex)
+            {
+                result.Error = ex.GetType().Name + ": " + ex.Message;
+                parsed.Context = null;
+                // The spool of a file that failed is deleted at once; a failure of that deletion is added to the error of the file, never hides it.
+                try { if (c != null && c.Spool != null) c.Spool.Dispose(); parsed.Dispose(); }
+                catch (Exception cleanup) { result.Error += " (the SMTP work file could not be deleted: " + cleanup.Message + ")"; }
+            }
             finally
             {
                 result.Seconds = clock.Elapsed.TotalSeconds;
@@ -565,10 +643,12 @@ ON CONFLICT(day,user,protocol,client_ip,user_agent,device_id) DO UPDATE SET requ
             public readonly HashSet<ClientSession> Touched = new HashSet<ClientSession>();
             public readonly Dictionary<string, long> Noise = new Dictionary<string, long>(StringComparer.Ordinal);
             public readonly List<ParsedFile> Files = new List<ParsedFile>();
+            public readonly Dictionary<FileState, FileState> PendingFiles = new Dictionary<FileState, FileState>();
         }
 
         Batch _batch;
         Writer _writer;
+        AuthResolver _auth;
         double[] _times;   // apply thread: seconds per task (CollectionRun.ApplyTimes)
 
         void Time(int slot, long since) { if (_times != null) _times[slot] += Stopwatch.GetElapsedTime(since).TotalSeconds; }
@@ -589,13 +669,197 @@ ON CONFLICT(day,user,protocol,client_ip,user_agent,device_id) DO UPDATE SET requ
             _tx = null;
             // Sessions in memory may hold requests that were not saved.
             ResetSessions();
+            if (_auth != null) _auth.Clear();
+        }
+
+        /// <summary>
+        /// Stores one part of the authentication evidence of a session and returns its id. The same part read again is ignored; a part
+        /// that differs from the stored one marks the session conflicted (its transactions then show no user: never first or last).
+        /// </summary>
+        long StoreFragment(AuthFragment f, long fileId)
+        {
+            var ins = _writer.InsertFragment;
+            ins.Set(0, fileId); ins.Set(1, f.SourceKey); ins.Set(2, f.FirstOffset); ins.Set(3, f.StoredPart); ins.Set(4, f.FirstMs); ins.Set(5, f.LastMs);
+            ins.Set(6, f.Server); ins.Set(7, f.Direction); ins.Set(8, f.Role); ins.Set(9, f.Connector); ins.Set(10, f.SessionId); ins.Set(11, f.LocalEp);
+            ins.Set(12, f.RemoteEp); ins.Set(13, f.Helo); ins.Set(14, f.FirstSeq >= 0 ? (object)f.FirstSeq : null); ins.Set(15, f.LastSeq >= 0 ? (object)f.LastSeq : null);
+            ins.Set(16, f.CompleteStart ? 1L : 0L); ins.Set(17, f.CompleteEnd ? 1L : 0L); ins.Set(18, f.Coverage); ins.Set(19, f.ProxySid); ins.Set(20, f.ProxyIp);
+            ins.Set(21, f.ProxyPort > 0 ? (object)f.ProxyPort : null); ins.Set(22, f.ProxyHelo); ins.Set(23, f.Observations); ins.Set(24, 0L);
+            ins.Set(25, f.OriginMs); ins.Set(26, (long)f.Format); ins.Set(27, null);
+            object id = ins.Scalar();
+            _batch.Rows++;
+            if (id != null) { _auth.Touch(f.Server, f.Direction, f.Role, f.SessionId); return (long)id; }
+            long existing, lastMs;
+            bool complete, conflicted;
+            string coverage, observations, previousConflicts;
+            using (var c = _store.Command(@"SELECT id, complete_end, last_ms, COALESCE(coverage,''), observations, conflicted, conflict_positions FROM smtp_auth_fragment
+WHERE server=@srv AND direction=@d AND role=@role AND source_key=@k AND session_id=@sid AND first_offset=@off AND COALESCE(origin_first_ms,first_ms)=@origin AND COALESCE(evidence_format,1)=@fmt AND part=@part;", _batch.Tx))
+            {
+                c.Parameters.AddWithValue("@srv", f.Server); c.Parameters.AddWithValue("@d", f.Direction); c.Parameters.AddWithValue("@role", f.Role); c.Parameters.AddWithValue("@k", f.SourceKey);
+                c.Parameters.AddWithValue("@sid", f.SessionId); c.Parameters.AddWithValue("@off", f.FirstOffset); c.Parameters.AddWithValue("@origin", f.OriginMs);
+                c.Parameters.AddWithValue("@fmt", (long)f.Format); c.Parameters.AddWithValue("@part", f.StoredPart);
+                using (var r = c.ExecuteReader())
+                {
+                    if (!r.Read()) throw new InvalidOperationException("SMTP authentication evidence was neither inserted nor found.");
+                    existing = r.GetInt64(0); complete = r.GetInt64(1) != 0; lastMs = r.GetInt64(2); coverage = r.GetString(3); observations = r.GetString(4); conflicted = r.GetInt64(5) != 0;
+                    previousConflicts = r.IsDBNull(6) ? null : r.GetString(6);
+                }
+            }
+            if (observations == f.Observations && coverage == (f.Coverage ?? "") && complete == f.CompleteEnd) return existing;
+            // The same session read again by a later collection: the part grew (a session that was cut at the end of an active file) or it
+            // is an older cut of what is stored. Neither is a conflict; only a different content at the same position is.
+            if (!complete && f.LastMs >= lastMs && Extends(observations, f.Observations) && CoverageExtends(coverage, f.Coverage))
+            {
+                using (var c = _store.Command("UPDATE smtp_auth_fragment SET observations=@o, coverage=@c, last_ms=@m, last_sequence=@s, complete_end=@e, proxy_sid=COALESCE(@ps,proxy_sid), proxy_ip=COALESCE(@pi,proxy_ip), proxy_port=COALESCE(@pp,proxy_port), proxy_helo=COALESCE(@ph,proxy_helo) WHERE id=@id;", _batch.Tx))
+                {
+                    c.Parameters.AddWithValue("@o", f.Observations); c.Parameters.AddWithValue("@c", (object)f.Coverage ?? DBNull.Value); c.Parameters.AddWithValue("@m", f.LastMs);
+                    c.Parameters.AddWithValue("@s", f.LastSeq >= 0 ? (object)f.LastSeq : DBNull.Value); c.Parameters.AddWithValue("@e", f.CompleteEnd ? 1L : 0L);
+                    c.Parameters.AddWithValue("@ps", (object)f.ProxySid ?? DBNull.Value); c.Parameters.AddWithValue("@pi", (object)f.ProxyIp ?? DBNull.Value);
+                    c.Parameters.AddWithValue("@pp", f.ProxyPort > 0 ? (object)f.ProxyPort : DBNull.Value); c.Parameters.AddWithValue("@ph", (object)f.ProxyHelo ?? DBNull.Value);
+                    c.Parameters.AddWithValue("@id", existing);
+                    c.ExecuteNonQuery();
+                }
+                _auth.Touch(f.Server, f.Direction, f.Role, f.SessionId);
+                return existing;
+            }
+            if (Extends(f.Observations, observations) && CoverageExtends(f.Coverage, coverage)) return existing;
+            string positions = ConflictingPositions(observations, f.Observations, f.Part);
+            if (conflicted && previousConflicts == null) positions = null;
+            else if (previousConflicts != null) positions = string.Join(",", previousConflicts.Split(',').Concat((positions ?? "").Split(',')).Where(x => x.Length > 0).Distinct().OrderBy(x => x, StringComparer.Ordinal));
+            if (!conflicted || positions != previousConflicts)
+            {
+                using (var c = _store.Command("UPDATE smtp_auth_fragment SET conflicted=1, conflict_positions=@p WHERE id=@id;", _batch.Tx))
+                {
+                    c.Parameters.AddWithValue("@id", existing); c.Parameters.AddWithValue("@p", (object)positions ?? DBNull.Value); c.ExecuteNonQuery();
+                }
+                _auth.Touch(f.Server, f.Direction, f.Role, f.SessionId);
+            }
+            return existing;
+        }
+
+        /// <summary>The observations (JSON array) of a part begin with those of an earlier cut of the same part.</summary>
+        static bool Extends(string older, string newer)
+        {
+            if (older == null || newer == null || older.Length < 2 || newer.Length < 2) return false;
+            if (older == "[]") return true;
+            string head = older.Substring(0, older.Length - 1);
+            return newer.Length > head.Length && newer.StartsWith(head, StringComparison.Ordinal) && (newer[head.Length] == ',' || newer[head.Length] == ']');
+        }
+
+        static string ConflictingPositions(string older, string newer, long part)
+        {
+            var a = SmtpAuthStore.Read(older, 0, part);
+            var b = SmtpAuthStore.Read(newer, 0, part);
+            var positions = new HashSet<long>();
+            foreach (var x in a)
+                foreach (var y in b)
+                    if (x.Pos == y.Pos && x.Sub == y.Sub && (x.K != y.K || x.Ms != y.Ms || x.A != y.A || x.B != y.B || x.Code != y.Code))
+                        positions.Add(x.Pos);
+            return positions.Count == 0 ? null : string.Join(",", positions.OrderBy(x => x));
+        }
+
+        /// <summary>The ranges of sequence numbers of a part contain those of an earlier cut of it, the last one being possibly longer.</summary>
+        static bool CoverageExtends(string older, string newer)
+        {
+            var a = SmtpAuthStore.ReadCoverage(older);
+            var b = SmtpAuthStore.ReadCoverage(newer);
+            if (b.Count < a.Count) return false;
+            for (int i = 0; i < a.Count; i++)
+            {
+                if (a[i][0] != b[i][0]) return false;
+                if (i < a.Count - 1 ? a[i][1] != b[i][1] : b[i][1] < a[i][1]) return false;
+            }
+            return true;
+        }
+
+        const int SpoolSessionPage = 32, SpoolTxPage = 32, FragmentIdCache = 64;
+
+        /// <summary>
+        /// Writes what the parse stage spooled for an SMTP file: for each finished session, its evidence parts first (the transactions point at
+        /// them), then its transactions, page by page. Only a page of sessions, of transactions and a few part ids are in memory.
+        /// </summary>
+        void ApplySmtp(ParsedFile p, ApplyFile f, FileResult r, string server, string role, string direction)
+        {
+            var spool = p.Spool;
+            if (spool == null) return;
+            long after = 0;
+            var ids = new Dictionary<long, long>();
+            while (true)
+            {
+                var sessions = spool.ReadSessions(after, SpoolSessionPage);
+                foreach (var s in sessions)
+                {
+                    after = s.Ord;
+                    AuthFragment head = null;
+                    for (long part = 0; part < s.Parts; part++)
+                    {
+                        var evidence = spool.ReadPart(s.Id, part);
+                        if (head == null) head = evidence;
+                        StoreFragment(evidence, f.FileId);
+                    }
+                    ids.Clear();
+                    int first = 0;
+                    while (first < s.Txns)
+                    {
+                        var page = spool.ReadTx(s.Id, first, SpoolTxPage);
+                        if (page.Count == 0) throw new InvalidOperationException("A transaction of the SMTP spool is missing.");
+                        foreach (var kv in page)
+                        {
+                            var x = kv.Value;
+                            long? fragment = null;
+                            if (direction == "Receive" && x.Part >= 0)
+                            {
+                                if (head == null) throw new InvalidOperationException("A transaction of the SMTP spool points at evidence that was not spooled.");
+                                long id;
+                                if (!ids.TryGetValue(x.Part, out id))
+                                {
+                                    if (ids.Count >= FragmentIdCache) ids.Clear();
+                                    id = FragmentId(s, head, x.Part);
+                                    ids[x.Part] = id;
+                                }
+                                fragment = id;
+                            }
+                            var row = SmtpRow(server, role, direction, s, x, fragment);
+                            var ins = _writer.InsertSmtp;
+                            for (int i = 0; i < row.Length; i++) ins.Set(i, row[i]);
+                            if (ins.Run() > 0)
+                            {
+                                r.Stored++;
+                                if (fragment.HasValue) _auth.Touch(server, direction, role ?? "", s.SessionId);
+                            }
+                            _batch.Rows++;
+                        }
+                        first = page[page.Count - 1].Key + 1;
+                    }
+                    if (_auth.Count >= AuthResolver.Limit) _auth.Flush(_batch.Tx);
+                }
+                if (sessions.Count < SpoolSessionPage) break;
+            }
+        }
+
+        /// <summary>Id of the evidence part of a session in the database (it was stored before the transactions that point at it).</summary>
+        long FragmentId(SmtpSpoolSession s, AuthFragment head, long part)
+        {
+            var q = _writer.LookupFragment;
+            q.Set(0, head.Server); q.Set(1, head.Direction); q.Set(2, head.Role); q.Set(3, head.SourceKey); q.Set(4, s.SessionId); q.Set(5, head.FirstOffset);
+            q.Set(6, head.OriginMs); q.Set(7, (long)head.Format); q.Set(8, -1L - part);
+            object id = q.Scalar();
+            if (id == null) throw new InvalidOperationException("SMTP authentication evidence of a transaction was not stored.");
+            return (long)id;
         }
 
         void Apply(ParsedFile p, CollectionRun run)
         {
             var watch = Stopwatch.StartNew();
+            Exception failure = null;
             try { ApplyFileRecords(p, run); }
-            finally { p.ApplySeconds = watch.Elapsed.TotalSeconds; }
+            catch (Exception ex) { failure = ex; throw; }
+            finally
+            {
+                p.ApplySeconds = watch.Elapsed.TotalSeconds;
+                // The work file of the file is deleted now; when the apply already failed, its failure is the one that is reported.
+                try { p.Dispose(); }
+                catch (Exception) when (failure != null) { }
+            }
         }
 
         void ApplyFileRecords(ParsedFile p, CollectionRun run)
@@ -616,7 +880,8 @@ ON CONFLICT(day,user,protocol,client_ip,user_agent,device_id) DO UPDATE SET requ
                 return;
             }
             var c = (ParseContext)p.Context;
-            var state = w.State;
+            var state = w.State.CopyFor(w.State.Path);
+            _batch.PendingFiles[w.State] = state;
             long mark = Stopwatch.GetTimestamp();
             var f = new ApplyFile { Server = job.Server, Role = job.Role, Kind = job.Kind, Path = w.Path, Result = r };
             f.FileId = _store.FileId(state, _batch.Tx);
@@ -642,13 +907,7 @@ ON CONFLICT(day,user,protocol,client_ip,user_agent,device_id) DO UPDATE SET requ
                 case "Pop3": slot = 1; foreach (var x in c.PopImap) EmitPopImap(f, x, job.Kind, c.PopImapBackEnd); break;
                 case "SmtpReceive":
                 case "SmtpSend":
-                    foreach (var row in c.Smtp)
-                    {
-                        var ins = _writer.InsertSmtp;
-                        for (int i = 0; i < row.Length; i++) ins.Set(i, row[i]);
-                        if (ins.Run() > 0) r.Stored++;
-                        _batch.Rows++;
-                    }
+                    ApplySmtp(p, f, r, job.Server, job.Role, job.Kind == "SmtpReceive" ? "Receive" : "Send");
                     break;
                 case "Tracking":
                     foreach (var row in c.Messages)
@@ -704,6 +963,7 @@ ON CONFLICT(day,user,protocol,client_ip,user_agent,device_id) DO UPDATE SET requ
             Time(4, mark); mark = Stopwatch.GetTimestamp();
             FlushSessions(_batch.Tx, _batch.Touched);
             Time(3, mark); mark = Stopwatch.GetTimestamp();
+            _auth.Flush(_batch.Tx);
             var noise = _writer.Noise;
             foreach (var kv in _batch.Noise)
             {
@@ -713,6 +973,13 @@ ON CONFLICT(day,user,protocol,client_ip,user_agent,device_id) DO UPDATE SET requ
             }
             _batch.Tx.Commit();
             _batch.Tx.Dispose();
+            foreach (var pair in _batch.PendingFiles)
+            {
+                var state = pair.Key; var saved = pair.Value;
+                state.Id = saved.Id; state.Offset = saved.Offset; state.Size = saved.Size; state.Fields = saved.Fields;
+                state.LastWriteMs = saved.LastWriteMs; state.FirstMs = saved.FirstMs; state.LastMs = saved.LastMs;
+                state.Lines = saved.Lines; state.Kept = saved.Kept; state.Noise = saved.Noise;
+            }
             Time(5, mark);
             run.Batches++;
             var files = _batch.Files;

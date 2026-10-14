@@ -238,7 +238,8 @@ namespace ExchangeLogReport
             public readonly List<AccessRecord> Access = new List<AccessRecord>();
             public readonly List<object[]> IisStatus = new List<object[]>();
             public readonly List<BackEndLine> BackEnd = new List<BackEndLine>();
-            public readonly List<object[]> Smtp = new List<object[]>();
+            public SmtpSpool Spool;          // sanitized SMTP sessions and transactions of the file, on disk (SMTP logs only)
+            public string SpoolFolder;
             public readonly List<object[]> Messages = new List<object[]>();
             public readonly List<PiConnection> PopImap = new List<PiConnection>();
             public bool PopImapBackEnd;
@@ -738,12 +739,15 @@ namespace ExchangeLogReport
 
         sealed class SmtpTxn
         {
-            public long StartMs, EndMs;
+            public long StartMs, EndMs, RcptCount;
             public string MailFrom, MessageId, InternalId, Response, LastError;
-            public List<string> Rcpts = new List<string>();
+            public readonly StringBuilder Rcpts = new StringBuilder();   // at most RcptTextMax characters: what is stored is capped to 4000
             public List<SmtpLine> Lines = new List<SmtpLine>();
             public bool DataSent;
+            public MailRef Ref;   // where its MAIL is in the authentication evidence (not valid: not observed)
         }
+
+        const int RcptTextMax = 4001, TranscriptTextMax = 12001;
 
         sealed class SmtpSession
         {
@@ -752,9 +756,21 @@ namespace ExchangeLogReport
             public bool Proxied;                          // front end: the session was handed over to a mailbox server
             public long StartMs, LastMs, StartOffset;
             public int Lines;
+            public SmtpAuthTracker Tracker;
+            public AuthFragment Head;                     // what the parts of the evidence say of the session
+            public long Spooled;                          // number of the session in the spool
+            public int Txns, KeptTxns, SpooledTxns;       // transactions seen, kept, written to the spool
             public List<SmtpLine> Preamble = new List<SmtpLine>();
             public SmtpTxn Current;
-            public List<SmtpTxn> Done = new List<SmtpTxn>();
+        }
+
+        SmtpSession StartSmtpSession(ParseContext c, string direction, bool receive, string sid, long t, long start)
+        {
+            if (c.Spool == null) c.Spool = new SmtpSpool(c.SpoolFolder);
+            var s = new SmtpSession { Id = sid, StartMs = t, StartOffset = start, Spooled = c.Spool.NewSession() };
+            s.Head = new AuthFragment { Server = c.Server, Direction = direction, Role = c.Role ?? "", SessionId = sid, SourceKey = Store.FileKey(c.Server, c.Path), FirstOffset = start, FirstMs = t };
+            s.Tracker = new SmtpAuthTracker(receive, s.Head, c.Spool, s.Spooled);
+            return s;
         }
 
         /// <summary>
@@ -767,12 +783,12 @@ namespace ExchangeLogReport
         {
             var sessions = new Dictionary<string, SmtpSession>(StringComparer.Ordinal);
             long offset = c.StartOffset, lineStart = offset, fileLastMs = 0;
-            int iTime = -1, iConn = -1, iSess = -1, iLocal = -1, iRemote = -1, iEvt = -1, iData = -1, iCtx = -1;
+            int iTime = -1, iConn = -1, iSess = -1, iLocal = -1, iRemote = -1, iEvt = -1, iData = -1, iCtx = -1, iSeq = -1;
             Action bind = () =>
             {
                 var m = c.Map;
                 iTime = m.Index("date-time"); iConn = m.Index("connector-id"); iSess = m.Index("session-id"); iLocal = m.Index("local-endpoint");
-                iRemote = m.Index("remote-endpoint"); iEvt = m.Index("event"); iData = m.Index("data"); iCtx = m.Index("context");
+                iRemote = m.Index("remote-endpoint"); iEvt = m.Index("event"); iData = m.Index("data"); iCtx = m.Index("context"); iSeq = m.Index("sequence-number");
             };
             if (c.Map.Load(c.Fields)) bind();
             bool receive = direction == "Receive";
@@ -799,28 +815,33 @@ namespace ExchangeLogReport
                 string evt = c.Split.GetRaw(iEvt) ?? "";
                 string data = c.Split.Get(iData) ?? "";
                 string ctx = c.Split.Get(iCtx) ?? "";
+                long seq = c.Split.GetLong(iSeq, -1);
                 SmtpSession s;
                 if (evt == "+")
                 {
                     if (sessions.TryGetValue(sid, out s)) EmitSession(c, s, direction);
-                    s = new SmtpSession { Id = sid, StartMs = t, StartOffset = start };
+                    s = StartSmtpSession(c, direction, receive, sid, t, start);
                     sessions[sid] = s;
                 }
                 else if (!sessions.TryGetValue(sid, out s))
                 {
-                    s = new SmtpSession { Id = sid, StartMs = t, StartOffset = start };
+                    s = StartSmtpSession(c, direction, receive, sid, t, start);
                     sessions[sid] = s;
                 }
                 s.Lines++;
                 s.LastMs = t;
-                if (s.Connector == null) s.Connector = c.Split.Get(iConn);
-                if (s.Local == null) s.Local = c.Split.Get(iLocal);
-                if (s.Remote == null) s.Remote = c.Split.Get(iRemote);
+                if (s.Connector == null) { s.Connector = c.Split.Get(iConn); s.Head.Connector = s.Connector; }
+                if (s.Local == null) { s.Local = c.Split.Get(iLocal); s.Head.LocalEp = s.Local; }
+                if (s.Remote == null) { s.Remote = c.Split.Get(iRemote); s.Head.RemoteEp = s.Remote; }
                 bool command = receive ? evt == "<" : evt == ">";
                 bool response = receive ? evt == ">" : evt == "<";
-                var entry = new SmtpLine { Time = t, Tag = command ? "C:" : response ? "S:" : evt, Data = data, Context = ctx };
+                // What is stored of the line has no AUTH payload nor challenge; the commands below read the line as logged and keep none of it.
+                string cleanData, cleanCtx;
+                bool payload;
+                s.Tracker.Line(evt, command, response, t, seq, start, data, ctx, out cleanData, out cleanCtx, out payload);
+                var entry = new SmtpLine { Time = t, Tag = command ? "C:" : response ? "S:" : evt, Data = cleanData, Context = cleanCtx };
                 // MAIL FROM opens a new transaction: its line is added to that transaction below.
-                bool opensTransaction = command && data.TrimStart().StartsWith("MAIL FROM:", StringComparison.OrdinalIgnoreCase);
+                bool opensTransaction = command && !payload && data.TrimStart().StartsWith("MAIL FROM:", StringComparison.OrdinalIgnoreCase);
                 var target = s.Current != null ? s.Current.Lines : s.Preamble;
                 if (!opensTransaction && target.Count < _o.MaxTranscriptLines) target.Add(entry);
 
@@ -833,11 +854,11 @@ namespace ExchangeLogReport
                     if (id.Success && s.Current != null && s.Current.MessageId == null) s.Current.MessageId = "<" + id.Groups[1].Value + ">";
                     if (text.IndexOf("Proxy session was successfully set up", StringComparison.OrdinalIgnoreCase) >= 0) s.Proxied = true;
                 }
-                else if (command)
+                else if (command && !payload)
                 {
                     string cmd = data.TrimStart();
                     string up = cmd.ToUpperInvariant();
-                    if (up.StartsWith("EHLO ") || up.StartsWith("HELO ")) s.Helo = cmd.Substring(5).Trim();
+                    if (up.StartsWith("EHLO ") || up.StartsWith("HELO ")) { s.Helo = cmd.Substring(5).Trim(); s.Head.Helo = s.Helo; }
                     else if (up.StartsWith("XPROXY "))
                     {
                         // Client submission (587) proxied by a front end: the real client is in XPROXY.
@@ -850,17 +871,30 @@ namespace ExchangeLogReport
                         }
                     }
                     else if (up.StartsWith("STARTTLS")) { if (s.Tls == null) s.Tls = "STARTTLS"; }
-                    else if (up.StartsWith("AUTH ")) s.Auth = cmd.Substring(5).Trim().Split(' ')[0];
-                    else if (up.StartsWith("X-EXPS")) s.Auth = ("X-EXPS " + (cmd.Length > 7 ? cmd.Substring(7).Trim().Split(' ')[0] : "")).Trim();
+                    else if (up.StartsWith("AUTH ") || up.StartsWith("X-EXPS")) s.Auth = s.Tracker.LastMechanism;
                     else if (up.StartsWith("MAIL FROM:"))
                     {
-                        FinishTxn(s);
+                        FinishTxn(c, s, direction);
                         s.Current = new SmtpTxn { StartMs = t, MailFrom = Identity.SmtpAddress(cmd.Substring(10)) };
+                        s.Current.Ref = s.Tracker.Mail(t, seq, start, t >= _o.RetentionCutoffMs && !IsSystemAddress(s.Current.MailFrom));
                         s.Current.Lines.Add(entry);
                     }
-                    else if (up.StartsWith("RCPT TO:")) { if (s.Current != null) s.Current.Rcpts.Add(Identity.SmtpAddress(cmd.Substring(8))); }
+                    else if (up.StartsWith("RCPT TO:"))
+                    {
+                        if (s.Current != null)
+                        {
+                            var rcpts = s.Current.Rcpts;
+                            if (rcpts.Length < RcptTextMax)
+                            {
+                                if (s.Current.RcptCount > 0) rcpts.Append(';');
+                                rcpts.Append(Identity.SmtpAddress(cmd.Substring(8)));
+                                if (rcpts.Length > RcptTextMax) rcpts.Length = RcptTextMax;
+                            }
+                            s.Current.RcptCount++;
+                        }
+                    }
                     else if (up.StartsWith("DATA") || up.StartsWith("BDAT")) { if (s.Current != null) s.Current.DataSent = true; }
-                    else if (up.StartsWith("RSET") || up.StartsWith("QUIT")) FinishTxn(s);
+                    else if (up.StartsWith("RSET") || up.StartsWith("QUIT")) FinishTxn(c, s, direction);
                 }
                 else if (response && s.Current != null)
                 {
@@ -892,11 +926,26 @@ namespace ExchangeLogReport
             return safe;
         }
 
-        static void FinishTxn(SmtpSession s)
+        /// <summary>
+        /// A mail transaction of the session is finished: what is stored of it goes to the spool at once (nothing of it stays in memory).
+        /// A transaction that is not kept (older than the retention, or of the system) only counts.
+        /// </summary>
+        void FinishTxn(ParseContext c, SmtpSession s, string direction)
         {
-            if (s.Current == null) return;
-            s.Done.Add(s.Current);
+            var x = s.Current;
+            if (x == null) return;
             s.Current = null;
+            s.Txns++;
+            if (x.StartMs < _o.RetentionCutoffMs || IsSystemAddress(x.MailFrom)) return;
+            s.KeptTxns++;
+            var t = new SmtpSpoolTx
+            {
+                StartMs = x.StartMs, EndMs = x.EndMs, Rcpts = x.RcptCount, MailFrom = x.MailFrom, RcptText = x.Rcpts.ToString(), MessageId = x.MessageId, InternalId = x.InternalId,
+                Status = TxnStatus(x, direction), Response = Identity.Cap(x.Response ?? x.LastError, 500),
+                Body = x.StartMs >= _o.DetailCutoffMs ? TranscriptText(x.Lines) : null
+            };
+            if (x.Ref.Valid) { t.Part = x.Ref.Part; t.Position = x.Ref.Position; }
+            c.Spool.AddTx(s.Spooled, s.SpooledTxns++, t);
         }
 
         static string TxnStatus(SmtpTxn x, string direction)
@@ -912,8 +961,20 @@ namespace ExchangeLogReport
         /// <summary>One smtp_transaction row per mail transaction of the session (columns of Writer.InsertSmtp).</summary>
         void EmitSession(ParseContext c, SmtpSession s, string direction)
         {
-            FinishTxn(s);
-            if (s.Done.Count == 0)
+            FinishTxn(c, s, direction);
+            // Authentication evidence: a front-end session that only proxied the client has no transaction, but its proof is
+            // what a mailbox server needs to show who the transaction was submitted by.
+            long parts = s.Tracker.Finish(_o.RetentionCutoffMs);
+            if (parts == 0) c.Spool.Drop(s.Spooled);
+            if (parts > 0 || s.SpooledTxns > 0)
+            {
+                c.Spool.Finish(s.Spooled, new SmtpSpoolSession
+                {
+                    Id = s.Spooled, Parts = parts, Txns = s.SpooledTxns, SessionId = s.Id, Connector = s.Connector, Local = s.Local, Remote = s.Remote, Helo = s.Helo, Tls = s.Tls, Auth = s.Auth,
+                    ProxyIp = s.ProxyIp, ProxyPort = s.ProxyPort, ProxyHelo = s.ProxyHelo, Preamble = s.SpooledTxns > 0 ? TranscriptText(s.Preamble) : null
+                });
+            }
+            if (s.Txns == 0)
             {
                 if (s.Proxied) { Noise(c, "Client submission proxied to a mailbox server (recorded there)", s.Lines); return; }
                 string ip = s.Remote ?? "";
@@ -925,42 +986,48 @@ namespace ExchangeLogReport
                 Noise(c, reason, s.Lines);
                 return;
             }
-            bool kept = false;
-            foreach (var x in s.Done)
-            {
-                if (x.StartMs < _o.RetentionCutoffMs) continue;
-                if (IsSystemAddress(x.MailFrom)) continue;
-                string remote, helo, auth;
-                if (s.ProxyIp != null)
-                {
-                    // Show the real client of a proxied submission, not the front end that relayed it.
-                    remote = s.ProxyIp + (s.ProxyPort != null ? ":" + s.ProxyPort : "");
-                    helo = s.ProxyHelo;
-                    auth = "Authenticated client (proxied by " + (Identity.ServerName(s.Helo) ?? "front end") + ")";
-                }
-                else { remote = s.Remote; helo = s.Helo; auth = s.Auth; }
-                c.Smtp.Add(new object[] {
-                    x.StartMs, x.EndMs > 0 ? (object)x.EndMs : null, c.Server, direction, c.Role, s.Connector, s.Id, s.Local, remote, helo, s.Tls, auth,
-                    x.MailFrom, (long)x.Rcpts.Count, Identity.Cap(string.Join(";", x.Rcpts), 4000), x.MessageId, x.InternalId, TxnStatus(x, direction),
-                    Identity.Cap(x.Response ?? x.LastError, 500), x.StartMs >= _o.DetailCutoffMs ? Packed.Pack(Transcript(s, x)) : null });
-                kept = true;
-            }
-            if (kept) c.Result.Kept += s.Lines;
+            if (s.KeptTxns > 0) c.Result.Kept += s.Lines;
             else Noise(c, "Probe or system message (SMTP)", s.Lines);
         }
 
-        string Transcript(SmtpSession s, SmtpTxn x)
+        /// <summary>The transcript lines as text, at most what the cap of the stored transcript needs (12000 characters and one more).</summary>
+        string TranscriptText(List<SmtpLine> lines)
         {
             var sb = new StringBuilder();
-            Action<SmtpLine> add = l =>
+            foreach (var l in lines)
             {
                 sb.Append(TimeUtil.Format(l.Time, _o.Zone, "HH:mm:ss.fff")).Append(' ').Append(l.Tag).Append(' ').Append(l.Data);
                 if (!string.IsNullOrEmpty(l.Context)) sb.Append("  [").Append(l.Context).Append(']');
                 sb.Append('\n');
-            };
-            foreach (var l in s.Preamble) add(l);
-            foreach (var l in x.Lines) add(l);
-            return Identity.Cap(sb.ToString(), 12000);
+                if (sb.Length > TranscriptTextMax) break;
+            }
+            if (sb.Length > TranscriptTextMax) sb.Length = TranscriptTextMax;
+            return sb.ToString();
+        }
+
+        /// <summary>One smtp_transaction row of a spooled transaction (columns of Writer.InsertSmtp). fragment: the evidence part of its MAIL, when it has one.</summary>
+        object[] SmtpRow(string server, string role, string direction, SmtpSpoolSession s, SmtpSpoolTx x, long? fragment)
+        {
+            string remote, helo, auth;
+            if (s.ProxyIp != null)
+            {
+                // Show the real client of a proxied submission, not the front end that relayed it.
+                remote = s.ProxyIp + (s.ProxyPort != null ? ":" + s.ProxyPort : "");
+                helo = s.ProxyHelo;
+                auth = "Authenticated client (proxied by " + (Identity.ServerName(s.Helo) ?? "front end") + ")";
+            }
+            else { remote = s.Remote; helo = s.Helo; auth = s.Auth; }
+            // The authenticated user is resolved when the batch is applied: here only the place of the MAIL in the evidence.
+            object fragmentId = null, sequence = null, source = null, result = null;
+            if (direction != "Receive") source = SmtpAuth.NotApplicable;
+            else if (fragment.HasValue) { fragmentId = fragment.Value; sequence = x.Position; }
+            else { source = SmtpAuth.Missing; result = SmtpAuth.Unknown; }
+            object transcript = null;
+            if (x.Body != null) transcript = Packed.Pack(Identity.Cap((s.Preamble ?? "") + x.Body, 12000));
+            return new object[] {
+                x.StartMs, x.EndMs > 0 ? (object)x.EndMs : null, server, direction, role, s.Connector, s.SessionId, s.Local, remote, helo, s.Tls, auth,
+                x.MailFrom, x.Rcpts, Identity.Cap(x.RcptText, 4000), x.MessageId, x.InternalId, x.Status, x.Response, transcript,
+                fragmentId, sequence, source, result };
         }
 
         // ================================================================ message tracking

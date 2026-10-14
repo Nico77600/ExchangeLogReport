@@ -16,7 +16,8 @@
 //    session_step     timeline of a session: one row per session and log file read (JSON steps)
 //    access_event     client access requests kept individually: failures, slow requests (and watched users)
 //    iis_status       IIS sub-status / Win32 status of failed proxied requests (by request id)
-//    smtp_transaction one row per SMTP mail transaction (MAIL FROM ... end of data)
+//    smtp_transaction one row per SMTP mail transaction (MAIL FROM ... end of data), with its authenticated user
+//    smtp_auth_fragment typed evidence of SMTP sessions (AUTH, identity, proxy), kept with the transactions that use it
 //    message_event    message tracking events of real messages
 //  Raw log lines are never stored: only the normalised fields above.
 // =============================================================================
@@ -24,6 +25,7 @@ using System;
 using System.Collections;
 using System.Collections.Generic;
 using System.IO;
+using System.Linq;
 using Microsoft.Data.Sqlite;
 
 namespace ExchangeLogReport
@@ -53,22 +55,31 @@ namespace ExchangeLogReport
 
     public sealed class PurgeResult
     {
-        public long Usage, Events, IisStatus, Smtp, Transcripts, Messages, Runs, Files, Sessions, Actions, Clients;
+        public long Usage, Events, IisStatus, Smtp, Transcripts, AuthFragments, Messages, Runs, Files, Sessions, Actions, Clients;
         public double DeleteSeconds, VacuumSeconds, OptimizeSeconds;
         public long Total { get { return Usage + Events + IisStatus + Smtp + Messages + Sessions + Actions + Clients; } }
     }
 
     public sealed class Store : IDisposable
     {
-        public const string SchemaVersion = "5";
+        public const string SchemaVersion = "6";
         /// <summary>SQLite page cache of a collection, in KB (set before opening the store; 256 MB by default).</summary>
         public static int CacheKilobytes = 262144;
         /// <summary>Page size of a NEW database (an existing one keeps its own). 16 KB: fewer and larger writes, on a
         /// hard disk the copy of the WAL into the database took 2.6 times less time than with 4 KB pages (lab, 2.0.0).</summary>
         public static int PageSize = 16384;
         readonly SqliteConnection _db;
+        SqliteTransaction _reportSnapshot;
         public string FilePath { get; private set; }
         public bool ReadOnly { get; private set; }
+
+        // The shipped SQLite Windows VFS needs extended paths, including for its journal sidecars.
+        internal static string SqlitePath(string path)
+        {
+            path = Path.GetFullPath(path);
+            if (!OperatingSystem.IsWindows() || path.StartsWith(@"\\?\", StringComparison.Ordinal)) return path;
+            return path.StartsWith(@"\\", StringComparison.Ordinal) ? @"\\?\UNC\" + path.Substring(2) : @"\\?\" + path;
+        }
 
         public Store(string path, bool readOnly, string toolVersion)
         {
@@ -77,7 +88,7 @@ namespace ExchangeLogReport
             if (!readOnly) Directory.CreateDirectory(Path.GetDirectoryName(FilePath));
             var builder = new SqliteConnectionStringBuilder
             {
-                DataSource = FilePath,
+                DataSource = SqlitePath(FilePath),
                 Mode = readOnly ? SqliteOpenMode.ReadOnly : SqliteOpenMode.ReadWriteCreate,
                 Cache = SqliteCacheMode.Private,
                 Pooling = false
@@ -98,9 +109,9 @@ namespace ExchangeLogReport
                     Exec("PRAGMA busy_timeout=30000;");
                 }
                 // A report reads index pages again and again (messages by id, steps by session) and sorts large sets:
-                // the same page cache as a collection, and its sorts in memory instead of temporary files.
+                // the same page cache as a collection; large temporary sorts may spill to disk.
                 Exec("PRAGMA cache_size=-" + CacheKilobytes.ToString(System.Globalization.CultureInfo.InvariantCulture) + ";");
-                Exec("PRAGMA temp_store=MEMORY;");
+                Exec("PRAGMA temp_store=FILE;");
                 return;
             }
             // auto_vacuum and page_size must be chosen before the first table is created (new database only).
@@ -165,6 +176,16 @@ CREATE TABLE IF NOT EXISTS smtp_transaction(
 -- 2.0.0: covering index of the SMTP aggregates of the reports (replaces ix_smtp_time).
 CREATE INDEX IF NOT EXISTS ix_smtp_flow ON smtp_transaction(time_ms, server, direction, status);
 CREATE INDEX IF NOT EXISTS ix_smtp_message ON smtp_transaction(message_id);
+-- 2.0.0 (schema 6): typed evidence of the authentication of SMTP sessions. Never holds an AUTH payload, challenge or
+-- password: only the observations the resolver needs (see Engine.SmtpAuth.cs). One row per part of a session read in one file.
+CREATE TABLE IF NOT EXISTS smtp_auth_fragment(
+  id INTEGER PRIMARY KEY, source_file_id INTEGER, source_key TEXT NOT NULL, first_offset INTEGER NOT NULL, part INTEGER NOT NULL DEFAULT 0,
+  first_ms INTEGER NOT NULL, last_ms INTEGER NOT NULL, server TEXT NOT NULL, direction TEXT NOT NULL, role TEXT NOT NULL DEFAULT '',
+  connector TEXT, session_id TEXT NOT NULL, local_ep TEXT, remote_ep TEXT, helo TEXT, first_sequence INTEGER, last_sequence INTEGER,
+  complete_start INTEGER NOT NULL DEFAULT 0, complete_end INTEGER NOT NULL DEFAULT 0, coverage TEXT,
+  proxy_sid TEXT, proxy_ip TEXT, proxy_port INTEGER, proxy_helo TEXT, observations TEXT NOT NULL, conflicted INTEGER NOT NULL DEFAULT 0,
+  origin_first_ms INTEGER, evidence_format INTEGER, conflict_positions TEXT,
+  UNIQUE(server, direction, role, source_key, session_id, first_offset, first_ms, part));
 CREATE TABLE IF NOT EXISTS message_event(
   id INTEGER PRIMARY KEY, time_ms INTEGER NOT NULL, server TEXT NOT NULL, event_id TEXT, source TEXT,
   message_id TEXT, internal_id TEXT, network_id TEXT, sender TEXT, recipients TEXT, recipient_status TEXT,
@@ -254,6 +275,59 @@ CREATE INDEX IF NOT EXISTS ix_step_session ON session_step(session_id, time_ms);
                 }
             }
             Exec("CREATE UNIQUE INDEX IF NOT EXISTS ux_source_file_key ON source_file(server, kind, file_key);");
+            MigrateSmtpAuth();
+        }
+
+        static readonly string[][] SmtpAuthColumns = {
+            new[] { "auth_user", "TEXT" }, new[] { "auth_mechanism", "TEXT" }, new[] { "auth_result", "TEXT" }, new[] { "auth_attempt_result", "TEXT" },
+            new[] { "auth_source", "TEXT" }, new[] { "auth_fragment_id", "INTEGER" }, new[] { "auth_sequence", "INTEGER" }, new[] { "auth_evidence_id", "INTEGER" } };
+
+        static readonly string[][] SmtpAuthFragmentColumns = { new[] { "origin_first_ms", "INTEGER" }, new[] { "evidence_format", "INTEGER" }, new[] { "conflict_positions", "TEXT" } };
+
+        static readonly string[][] SmtpAuthIndexes = {
+            new[] { "ix_authfrag_last", "CREATE INDEX IF NOT EXISTS ix_authfrag_last ON smtp_auth_fragment(last_ms);" },
+            new[] { "ux_authfrag_origin", "CREATE UNIQUE INDEX IF NOT EXISTS ux_authfrag_origin ON smtp_auth_fragment(server, direction, role, source_key, session_id, first_offset, COALESCE(origin_first_ms, first_ms), COALESCE(evidence_format, 1), part);" },
+            new[] { "ix_authfrag_replay", "CREATE INDEX IF NOT EXISTS ix_authfrag_replay ON smtp_auth_fragment(server, role, direction, session_id, COALESCE(origin_first_ms, first_ms), source_key, first_offset, part, id);" },
+            new[] { "ix_authfrag_candidates", "CREATE INDEX IF NOT EXISTS ix_authfrag_candidates ON smtp_auth_fragment(session_id, role, direction, first_ms, id);" },
+            new[] { "ix_authfrag_proxy_page", "CREATE INDEX IF NOT EXISTS ix_authfrag_proxy_page ON smtp_auth_fragment(proxy_sid, first_ms, id) WHERE proxy_sid IS NOT NULL;" },
+            new[] { "ix_authfrag_proxy_replay", "CREATE INDEX IF NOT EXISTS ix_authfrag_proxy_replay ON smtp_auth_fragment(proxy_sid, id, first_ms, last_ms) WHERE proxy_sid IS NOT NULL;" },
+            new[] { "ix_authfrag_candidate_scope", "CREATE INDEX IF NOT EXISTS ix_authfrag_candidate_scope ON smtp_auth_fragment(session_id, role, direction, server, first_ms, last_ms);" },
+            new[] { "ix_authfrag_origin_page", "CREATE INDEX IF NOT EXISTS ix_authfrag_origin_page ON smtp_auth_fragment(server, role, direction, session_id, COALESCE(origin_first_ms,first_ms), COALESCE(source_key,''), first_offset, id);" },
+            new[] { "ix_smtp_auth_fragment", "CREATE INDEX IF NOT EXISTS ix_smtp_auth_fragment ON smtp_transaction(auth_fragment_id, auth_sequence) WHERE auth_fragment_id IS NOT NULL;" },
+            new[] { "ix_smtp_auth_evidence", "CREATE INDEX IF NOT EXISTS ix_smtp_auth_evidence ON smtp_transaction(auth_evidence_id) WHERE auth_evidence_id IS NOT NULL;" },
+            new[] { "ix_smtp_auth_fragment_page", "CREATE INDEX IF NOT EXISTS ix_smtp_auth_fragment_page ON smtp_transaction(auth_fragment_id, auth_sequence, id) WHERE auth_fragment_id IS NOT NULL;" },
+            new[] { "ix_smtp_auth_scope", "CREATE INDEX IF NOT EXISTS ix_smtp_auth_scope ON smtp_transaction(server, role, direction, session_id, auth_fragment_id) WHERE auth_fragment_id IS NOT NULL;" } };
+
+        /// <summary>
+        /// Schema 6: the authenticated user of the SMTP transactions. Nullable columns are added in place (the rows already stored keep NULL:
+        /// shown as legacy, never rebuilt, no file position changes) and their indexes are created once the columns exist; the columns,
+        /// the indexes and the version are written in one transaction, so that an interrupted upgrade starts again from the old schema.
+        /// It also completes a schema-6 database written before the typed evidence got its origin columns: the evidence already stored is
+        /// kept and read as the first format.
+        /// </summary>
+        void MigrateSmtpAuth()
+        {
+            var columns = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            using (var c = Command("PRAGMA table_info(smtp_transaction);"))
+            using (var r = c.ExecuteReader()) while (r.Read()) columns.Add(r.GetString(1));
+            var fragmentColumns = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            using (var c = Command("PRAGMA table_info(smtp_auth_fragment);"))
+            using (var r = c.ExecuteReader()) while (r.Read()) fragmentColumns.Add(r.GetString(1));
+            var indexes = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            using (var c = Command("SELECT name FROM sqlite_master WHERE type='index';"))
+            using (var r = c.ExecuteReader()) while (r.Read()) indexes.Add(r.GetString(0));
+            bool upgrade = StoredSchemaVersion() < 6;
+            if (!upgrade && SmtpAuthColumns.All(d => columns.Contains(d[0])) && SmtpAuthFragmentColumns.All(d => fragmentColumns.Contains(d[0])) && SmtpAuthIndexes.All(d => indexes.Contains(d[0]))) return;
+            using (var tx = Begin())
+            {
+                foreach (var d in SmtpAuthColumns)
+                    if (!columns.Contains(d[0])) using (var c = Command("ALTER TABLE smtp_transaction ADD COLUMN " + d[0] + " " + d[1] + ";", tx)) c.ExecuteNonQuery();
+                foreach (var d in SmtpAuthFragmentColumns)
+                    if (!fragmentColumns.Contains(d[0])) using (var c = Command("ALTER TABLE smtp_auth_fragment ADD COLUMN " + d[0] + " " + d[1] + ";", tx)) c.ExecuteNonQuery();
+                foreach (var d in SmtpAuthIndexes) using (var c = Command(d[1], tx)) c.ExecuteNonQuery();
+                using (var c = Command("INSERT INTO metadata(key,value) VALUES('schema_version','6') ON CONFLICT(key) DO UPDATE SET value=excluded.value;", tx)) c.ExecuteNonQuery();
+                tx.Commit();
+            }
         }
 
         static readonly System.Text.RegularExpressions.Regex AdminShareRx =
@@ -283,9 +357,22 @@ CREATE INDEX IF NOT EXISTS ix_step_session ON session_step(session_id, time_ms);
         {
             var c = _db.CreateCommand();
             c.CommandText = sql;
-            c.Transaction = tx;
+            c.Transaction = tx ?? _reportSnapshot;
             c.CommandTimeout = 0;
             return c;
+        }
+
+        internal void BeginReportSnapshot()
+        {
+            if (_reportSnapshot != null) throw new InvalidOperationException("A report snapshot is already active.");
+            _reportSnapshot = _db.BeginTransaction(deferred: true);
+        }
+
+        internal void EndReportSnapshot()
+        {
+            var snapshot = _reportSnapshot;
+            _reportSnapshot = null;
+            if (snapshot != null) snapshot.Dispose();
         }
 
         internal SqliteCommand Command(string sql, IDictionary<string, object> parameters, SqliteTransaction tx = null)
@@ -474,6 +561,14 @@ ON CONFLICT(run_id,server,kind,reason) DO UPDATE SET lines=lines+excluded.lines;
                 p.IisStatus = Delete("DELETE FROM iis_status WHERE time_ms < @t;", "@t", detailCutoffMs, tx);
                 p.Transcripts = Delete("UPDATE smtp_transaction SET transcript=NULL WHERE transcript IS NOT NULL AND time_ms < @t;", "@t", detailCutoffMs, tx);
                 p.Smtp = Delete("DELETE FROM smtp_transaction WHERE time_ms < @t;", "@t", retentionCutoffMs, tx);
+                // The evidence of a retained transaction outlives its transcript: a fragment goes only when nothing retained uses it,
+                // neither the transactions of its session nor a back-end session proxied from it.
+                p.AuthFragments = Delete(@"DELETE FROM smtp_auth_fragment WHERE last_ms < @t
+ AND NOT EXISTS (SELECT 1 FROM smtp_transaction t WHERE t.auth_fragment_id = smtp_auth_fragment.id)
+ AND NOT EXISTS (SELECT 1 FROM smtp_transaction t WHERE t.auth_evidence_id = smtp_auth_fragment.id)
+ AND NOT EXISTS (SELECT 1 FROM smtp_transaction t WHERE t.server = smtp_auth_fragment.server AND t.direction = smtp_auth_fragment.direction AND t.role = smtp_auth_fragment.role AND t.session_id = smtp_auth_fragment.session_id)
+ AND NOT EXISTS (SELECT 1 FROM smtp_auth_fragment b JOIN smtp_transaction bt ON bt.auth_fragment_id = b.id
+                 WHERE b.proxy_sid = smtp_auth_fragment.session_id AND b.first_ms BETWEEN smtp_auth_fragment.first_ms - 3600000 AND smtp_auth_fragment.last_ms + 3600000);", "@t", retentionCutoffMs, tx);
                 p.Messages = Delete("DELETE FROM message_event WHERE time_ms < @t;", "@t", retentionCutoffMs, tx);
                 p.Runs = Delete("DELETE FROM noise WHERE run_id IN (SELECT id FROM run WHERE started_ms < @t);", "@t", retentionCutoffMs, tx);
                 p.Runs = Delete("DELETE FROM run WHERE started_ms < @t;", "@t", retentionCutoffMs, tx);

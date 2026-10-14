@@ -97,9 +97,47 @@ namespace ExchangeLogReport
 
         // ------------------------------------------------------------------ sessions
 
+        sealed class SessionInput
+        {
+            public object[] Row;
+            public List<string> Data = new List<string>();
+            public List<Step> Steps;
+            public long Bytes;
+        }
+
+        static IEnumerable<SessionInput> SessionInputs(Store store, string sql, Dictionary<string, object> parameters)
+        {
+            SessionInput current = null;
+            foreach (var r in Rows(store, sql, parameters))
+            {
+                if (current == null || L(current.Row[0]) != L(r[0]))
+                {
+                    if (current != null) yield return current;
+                    current = new SessionInput { Row = r.Take(29).ToArray() };
+                    current.Bytes = ReportMemory.Bytes(current.Row);
+                }
+                string data = S(r[29]);
+                if (data != null) { current.Data.Add(data); current.Bytes += ReportMemory.Bytes(data) * 8; }
+            }
+            if (current != null) yield return current;
+        }
+
+        static IEnumerable<List<SessionInput>> SessionBatches(IEnumerable<SessionInput> inputs, long maxBytes)
+        {
+            var batch = new List<SessionInput>();
+            long bytes = 0;
+            foreach (var input in inputs)
+            {
+                if (batch.Count > 0 && input.Bytes > maxBytes - bytes) { yield return batch; batch = new List<SessionInput>(); bytes = 0; }
+                batch.Add(input); bytes += input.Bytes;
+                if (batch.Count == 128 || bytes >= maxBytes) { yield return batch; batch = new List<SessionInput>(); bytes = 0; }
+            }
+            if (batch.Count > 0) yield return batch;
+        }
+
         static Dataset BuildSessions(Store store, ReportRequest q, Func<long, object> local)
         {
-            var set = new Dataset("sessions", "ClientSessions");
+            var set = new Dataset("sessions", "ClientSessions", q.Scratch);
             foreach (var n in new[] { "Start:time", "End:time", "Duration:text", "Outcome:text", "User:text", "Protocol:text", "Client:text", "Client IP:text",
                 "Front ends:text", "Back ends:text", "Requests:num", "Failures:num", "Slow:num", "Average (ms):num", "Max (ms):num", "Operations:text",
                 "Last error:text", "Software:text", "Client mode:text", "Device ID:text", "Mailbox:text", "Connections:num", "First error:text", "User agent:text",
@@ -108,44 +146,66 @@ namespace ExchangeLogReport
             set.Columns[set.Columns.Count - 1].Grid = false;
             set.Columns[set.Columns.Count - 1].Csv = q.IncludeSessionDetails;
             var f = new Sql(); f.P["@t0"] = q.StartMs; f.P["@t1"] = q.EndMs;
-            string where = " FROM client_session WHERE end_ms >= @t0 AND start_ms < @t1" + f.Users(q.Users, "user", "mailbox")
-                + ServerFilter(q.Servers, f.P, "','||COALESCE(front_ends,'')||','||COALESCE(back_ends,'')||','");
-            var steps = new Dictionary<long, List<Step>>();
-            foreach (var r in Rows(store, "SELECT session_id, data FROM session_step WHERE session_id IN (SELECT id" + where + ") ORDER BY session_id, time_ms;", f.P))
+            string where = " FROM client_session c LEFT JOIN session_step s ON s.session_id=c.id WHERE c.end_ms >= @t0 AND c.start_ms < @t1" + f.Users(q.Users, "c.user", "c.mailbox")
+                + ServerFilter(q.Servers, f.P, "','||COALESCE(c.front_ends,'')||','||COALESCE(c.back_ends,'')||','");
+            var sessions = SessionInputs(store, "SELECT c.id,c.start_ms,c.end_ms,c.user,c.protocol,c.mailbox,c.client_ip,c.user_agent,c.device_id,c.device_type,c.software,c.client_mode,c.front_ends,c.back_ends," +
+                "c.requests,c.successes,c.failures,c.slow,c.first_success_ms,c.last_success_ms,c.first_failure_ms,c.last_failure_ms,c.total_ms,c.max_ms,c.actions,c.first_error,c.last_error,c.backend,c.connections,s.data" +
+                where + " ORDER BY c.start_ms,c.id,s.time_ms,s.rowid;", f.P);
+            foreach (var batch in SessionBatches(sessions, q.WorkingBudgetBytes / 2))
             {
-                long id = L(r[0]);
-                List<Step> list;
-                if (!steps.TryGetValue(id, out list)) { list = new List<Step>(); steps[id] = list; }
-                ParseSteps(S(r[1]), list);
-            }
-            var files = LoadFiles(store, steps.Values.SelectMany(x => x).SelectMany(x => x.Links).Select(x => (long)x[1]));
-            foreach (var r in Rows(store, "SELECT id,start_ms,end_ms,user,protocol,mailbox,client_ip,user_agent,device_id,device_type,software,client_mode,front_ends,back_ends," +
-                "requests,successes,failures,slow,first_success_ms,last_success_ms,first_failure_ms,last_failure_ms,total_ms,max_ms,actions,first_error,last_error,backend,connections" +
-                where + " ORDER BY start_ms;", f.P))
-            {
-                long id = L(r[0]), start = L(r[1]), end = L(r[2]), requests = L(r[14]), successes = L(r[15]), failures = L(r[16]), slow = L(r[17]);
-                long backEndErrors = 0;
-                string backend = S(r[27]);
-                if (backend != null) { int bar = backend.IndexOf('|'); long.TryParse(bar > 0 ? backend.Substring(0, bar) : backend, NumberStyles.Integer, CultureInfo.InvariantCulture, out backEndErrors); }
-                string protocol = S(r[4]), agent = S(r[7]);
-                List<Step> raw;
-                steps.TryGetValue(id, out raw);
-                var tl = Timeline(raw, local, protocol, files);
-                long shownFailures = failures + backEndErrors;
-                string outcome;
-                if (tl.Rows.Count > 0)
+                long inputBytes = batch.Sum(x => x.Bytes);
+                var parsed = OrderedWork(batch, q, input => input.Bytes, input =>
                 {
-                    shownFailures = Math.Max(tl.Failed, failures);
-                    outcome = SessionOutcome(tl.Failed, tl.Successes, slow, tl.FirstSuccess, tl.LastSuccess, tl.FirstFailure, tl.LastFailure, q.RecoveryWindowMs);
+                    input.Steps = new List<Step>();
+                    foreach (var data in input.Data) ParseSteps(data, input.Steps);
+                    input.Data.Clear();
+                    return input;
+                }, inputBytes).ToList();
+                var files = LoadFiles(store, parsed.SelectMany(x => x.Steps).SelectMany(x => x.Links).Select(x => (long)x[1]));
+                foreach (var output in OrderedWork(parsed, q, input => input.Bytes, input => new { Row = SessionRow(input, q, local, files), Utc = L(input.Row[1]) }, inputBytes))
+                {
+                    var row = output.Row;
+                    set.Rows.Add(row, output.Utc, 0);
+                    string outcome = S(row[3]);
+                    if (outcome != "OK" && outcome != "OK (slow)") set.SessionsWithFailures++;
+                    if (SessionSeverity(outcome) < 9)
+                    {
+                        set.FailedSessionCount++;
+                        var summary = (object[])row.Clone();
+                        summary[25] = null;
+                        KeepTopRow(set.FailureSample, summary, (a, b) =>
+                        {
+                            int c = SessionSeverity(S(a[3])).CompareTo(SessionSeverity(S(b[3])));
+                            return c != 0 ? c : L(b[11]).CompareTo(L(a[11]));
+                        });
+                    }
                 }
-                else outcome = SessionOutcome(failures + backEndErrors, successes, slow, L(r[18]), L(r[19]), L(r[20]), L(r[21]), q.RecoveryWindowMs);
-                set.Rows.Add(new object[] {
-                    local(start), local(end), TimeUtil.Duration((end - start) / 1000.0), outcome, S(r[3]), protocol, ClientFamily(protocol, agent, S(r[9])),
-                    (S(r[6]) ?? "").Replace(",", ", "), (S(r[12]) ?? "").Replace(",", ", "), (S(r[13]) ?? "").Replace(",", ", "),
-                    requests, shownFailures, slow, requests > 0 ? (object)(L(r[22]) / requests) : null, L(r[23]), Top(S(r[24]), 4),
-                    S(r[26]), S(r[10]), S(r[11]) == "0" ? null : S(r[11]), S(r[8]), S(r[5]), L(r[28]) > 0 ? (object)L(r[28]) : null, S(r[25]), agent, id, tl.Rows });
             }
             return set;
+        }
+
+        static object[] SessionRow(SessionInput input, ReportRequest q, Func<long, object> local, Dictionary<long, string[]> files)
+        {
+            var r = input.Row;
+            long id = L(r[0]), start = L(r[1]), end = L(r[2]), requests = L(r[14]), successes = L(r[15]), failures = L(r[16]), slow = L(r[17]);
+            long backEndErrors = 0;
+            string backend = S(r[27]);
+            if (backend != null) { int bar = backend.IndexOf('|'); long.TryParse(bar > 0 ? backend.Substring(0, bar) : backend, NumberStyles.Integer, CultureInfo.InvariantCulture, out backEndErrors); }
+            string protocol = S(r[4]), agent = S(r[7]);
+            var tl = Timeline(input.Steps, local, protocol, files);
+            long shownFailures = failures + backEndErrors;
+            string outcome;
+            if (tl.Rows.Count > 0)
+            {
+                shownFailures = Math.Max(tl.Failed, failures);
+                outcome = SessionOutcome(tl.Failed, tl.Successes, slow, tl.FirstSuccess, tl.LastSuccess, tl.FirstFailure, tl.LastFailure, q.RecoveryWindowMs);
+            }
+            else outcome = SessionOutcome(failures + backEndErrors, successes, slow, L(r[18]), L(r[19]), L(r[20]), L(r[21]), q.RecoveryWindowMs);
+            return new object[] {
+                local(start), local(end), TimeUtil.Duration((end - start) / 1000.0), outcome, S(r[3]), protocol, ClientFamily(protocol, agent, S(r[9])),
+                (S(r[6]) ?? "").Replace(",", ", "), (S(r[12]) ?? "").Replace(",", ", "), (S(r[13]) ?? "").Replace(",", ", "),
+                requests, shownFailures, slow, requests > 0 ? (object)(L(r[22]) / requests) : null, L(r[23]), Top(S(r[24]), 4),
+                S(r[26]), S(r[10]), S(r[11]) == "0" ? null : S(r[11]), S(r[8]), S(r[5]), L(r[28]) > 0 ? (object)L(r[28]) : null, S(r[25]), agent, id, tl.Rows };
         }
 
         static void ParseSteps(string json, List<Step> list)
@@ -171,7 +231,8 @@ namespace ExchangeLogReport
                     }
                 }
             }
-            catch (JsonException) { }
+            catch (Exception error) when (error is JsonException || error is FormatException || error is InvalidOperationException || error is OverflowException)
+            { throw new System.IO.InvalidDataException("Malformed client session timeline JSON.", error); }
         }
 
         sealed class TimelineResult
@@ -191,7 +252,7 @@ namespace ExchangeLogReport
             var result = new TimelineResult();
             if (raw == null || raw.Count == 0) return result;
             bool imap = string.Equals(protocol, "Imap4", StringComparison.OrdinalIgnoreCase), pop = string.Equals(protocol, "Pop3", StringComparison.OrdinalIgnoreCase);
-            raw.Sort((a, b) => a.T != b.T ? a.T.CompareTo(b.T) : string.CompareOrdinal(a.Source ?? "", b.Source ?? ""));
+            raw = raw.OrderBy(x => x.T).ThenBy(x => x.Source ?? "", StringComparer.Ordinal).ToList();
             var byRequest = new Dictionary<string, Step>(StringComparer.OrdinalIgnoreCase);
             var frontEnd = new List<Step>();
             foreach (var s in raw)
@@ -283,7 +344,7 @@ namespace ExchangeLogReport
 
         static Dataset BuildClients(Store store, ReportRequest q, string d0, string d1, Func<long, object> local)
         {
-            var set = new Dataset("clients", "Clients");
+            var set = new Dataset("clients", "Clients", q.Scratch);
             foreach (var n in new[] { "User:text", "Protocol:text", "Client:text", "Device type:text", "Device ID:text", "Client IPs:text", "Servers:text",
                 "Requests:num", "Failures:num", "Active days:num", "First seen:time", "Last seen:time", "User agent:text" })
             { var x = n.Split(':'); set.Add(x[0], x[1]); }

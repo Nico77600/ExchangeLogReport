@@ -3,7 +3,7 @@
 <#
     Exchange Log Report - automated tests (Pester 5 or later).
     Author  : Nicolas Fabert
-    Version : 2.0.0
+    Version : 2.1.0
 
     Run:  Invoke-Pester -Path .\tests\ExchangeLogReport.Tests.ps1 -Output Detailed
 
@@ -291,12 +291,62 @@ Describe 'Configuration' {
         $s.Storage.RetentionDays | Should -Be 60
         $s.Storage.DetailRetentionDays | Should -Be 14
         $s.Logging.RetentionDays | Should -Be 14
+        $s.Report.MemoryBudgetMB | Should -Be 512
+        $s.Report.Parallelism | Should -Be 0
         $s.Servers[0].HttpProxyPath | Should -Be '\\EXCH01\c$\Program Files\Microsoft\Exchange Server\V15\Logging\HttpProxy'
     }
     It 'reports every invalid value at once' {
         $path = Join-Path $TestDrive 'bad.psd1'
         (Get-Content $script:ConfigPath -Raw).Replace('DetailRetentionDays = 14', 'DetailRetentionDays = 90').Replace("DefaultType           = 'Usage'", "DefaultType           = 'Full'") | Set-Content -LiteralPath $path
         { Import-ExlConfiguration -Path $path -Root $script:Root } | Should -Throw -ExpectedMessage '*DetailRetentionDays*DefaultType*'
+    }
+    It 'validates report memory and workers independently of collection settings' {
+        $path = Join-Path $TestDrive 'bad-report-budget.psd1'
+        (Get-Content $script:ConfigPath -Raw).Replace('MemoryBudgetMB        = 512', 'MemoryBudgetMB        = 32').
+            Replace('Parallelism           = 0', 'Parallelism           = 17') | Set-Content -LiteralPath $path
+        { Import-ExlConfiguration -Path $path -Root $script:Root } | Should -Throw '*Report.MemoryBudgetMB*Report.Parallelism*'
+    }
+    It 'keeps old configurations compatible when report budget settings are absent' {
+        $path = Join-Path $TestDrive 'old-report-budget.psd1'
+        $text = Get-Content $script:ConfigPath -Raw
+        $text = [regex]::Replace($text, '(?m)^\s*MemoryBudgetMB\s*=.*\r?\n', '')
+        $text = [regex]::Replace($text, '(?m)^\s*Parallelism           =.*\r?\n', '')
+        [IO.File]::WriteAllText($path, $text)
+        $s = Import-ExlConfiguration -Path $path -Root $script:Root
+        $s.Report.MemoryBudgetMB | Should -Be 512
+        $s.Report.Parallelism | Should -Be 0
+    }
+}
+
+Describe 'Time zone compatibility' {
+    It 'preserves the Paris winter/summer offsets and refuses an unknown zone' {
+        $zone = Get-ExlTimeZone 'Europe/Paris'
+        $zone.GetUtcOffset([DateTimeOffset]'2026-01-15T12:00:00Z').TotalHours | Should -Be 1
+        $zone.GetUtcOffset([DateTimeOffset]'2026-07-15T12:00:00Z').TotalHours | Should -Be 2
+        (Get-ExlTimeZone 'Romance Standard Time').GetUtcOffset([DateTimeOffset]'2026-07-15T12:00:00Z').TotalHours | Should -Be 2
+        { Get-ExlTimeZone 'Unknown/NotAZone' } | Should -Throw "*Unknown time zone 'Unknown/NotAZone'*"
+    }
+    It 'resolves the delivered default with Windows NLS and no IANA conversion' -Skip:(-not $IsWindows) {
+        $saved = $env:DOTNET_SYSTEM_GLOBALIZATION_USENLS
+        try {
+            $env:DOTNET_SYSTEM_GLOBALIZATION_USENLS = '1'
+            $module = Join-Path $script:Root 'ExchangeLogReport.psd1'
+            $config = Join-Path $script:Root 'config\ExchangeLogReport.config.psd1'
+            $code = @"
+`$ErrorActionPreference='Stop'
+try { [void][TimeZoneInfo]::FindSystemTimeZoneById('Europe/Paris'); throw 'NLS reproduction did not disable IANA lookup.' }
+catch [TimeZoneNotFoundException] { }
+Import-Module '$module'
+`$s=Import-ExlConfiguration -Path '$config' -Root '$script:Root'
+if (`$s.Zone.Id -ne 'Romance Standard Time') { throw 'Native Paris timezone was not resolved.' }
+if (`$s.Zone.GetUtcOffset([DateTimeOffset]'2026-01-15T12:00:00Z').TotalHours -ne 1) { throw 'Wrong winter offset.' }
+if (`$s.Zone.GetUtcOffset([DateTimeOffset]'2026-07-15T12:00:00Z').TotalHours -ne 2) { throw 'Wrong summer offset.' }
+'NLS default configuration accepted'
+"@
+            $output = & pwsh -NoProfile -Command $code 2>&1 | Out-String
+            $LASTEXITCODE | Should -Be 0 -Because $output
+            $output | Should -Match 'NLS default configuration accepted'
+        } finally { $env:DOTNET_SYSTEM_GLOBALIZATION_USENLS = $saved }
     }
 }
 
@@ -431,6 +481,7 @@ Get-VersionText 'Version 15.2 (Build 2562.17)'
     }
     Context 'Exchange IIS sites' {
         BeforeAll {
+            Mock -ModuleName ExchangeLogReport Get-ExlApplicationLogMap { [pscustomobject]@{ Entries = @(); Failed = @(); Problems = @() } }
             # Virtual directories as created by Exchange setup, plus a custom OWA/ECP site and a site that is not Exchange.
             $fe = 'C:\Program Files\Microsoft\Exchange Server\V15\FrontEnd\HttpProxy'
             $be = 'C:\Program Files\Microsoft\Exchange Server\V15\ClientAccess'
@@ -598,6 +649,315 @@ $custom      <site name="Intranet" id="4">
             Test-ExlStaleSource -Source $tracking -Plan $old -Settings $settings | Should -BeNullOrEmpty
             Test-ExlStaleSource -Source $smtp -Plan $old -Settings $settings | Should -BeNullOrEmpty
         } $script:Paths
+    }
+}
+
+Describe 'Application log paths' {
+    BeforeAll {
+        $script:AppDir = Join-Path $TestDrive 'application-logs'
+        $script:AppExchange = Join-Path $script:AppDir 'Exchange'
+        $script:AppSiteRoot = Join-Path $script:AppDir 'wwwroot'
+        $script:AppEws = Join-Path $script:AppExchange 'FrontEnd\HttpProxy\Ews'
+        $script:AppMapi = Join-Path $script:AppExchange 'ClientAccess\mapi\emsmdb'
+        $script:AppNspi = Join-Path $script:AppExchange 'ClientAccess\mapi\nspi'
+        $script:AppMoved = Join-Path $script:AppDir 'moved-mapi'
+        $script:AppNspiMoved = Join-Path $script:AppDir 'moved-nspi'
+        $script:AppProxyMoved = Join-Path $script:AppDir 'moved-proxy'
+        $script:AppXml = Join-Path $script:AppDir 'applicationHost.config'
+        foreach ($folder in $script:AppSiteRoot, $script:AppEws, $script:AppMapi, $script:AppNspi) { [void][IO.Directory]::CreateDirectory($folder) }
+        $script:NewAppServer = {
+            param([hashtable]$Configured = @{}, [hashtable]$Extra = @{})
+            $found = @{ ExchangePath = $script:AppExchange }
+            foreach ($key in $Extra.Keys) { $found[$key] = $Extra[$key] }
+            & (Get-Module ExchangeLogReport) { param($s, $c, $d) Resolve-ExlServerPaths -Name 'APPTEST' -Configured $c -Discovered $d -Sources $s.Sources } $script:Settings $Configured $found
+        }
+        $script:ReadAppMap = {
+            param($Server, [switch]$Remote)
+            & (Get-Module ExchangeLogReport) {
+                param($s, $f, $local)
+                $iis = Get-ExlIisSiteMap -Server $s.Name -File $f -Local:$local
+                Get-ExlApplicationLogMap -Server $s -IisMap $iis -Local:$local
+            } $Server $script:AppXml (-not $Remote)
+        }
+        $script:WriteAppConfig = {
+            param([string]$Folder, [string]$Settings = '')
+            [IO.File]::WriteAllText((Join-Path $Folder 'web.config'), "<configuration><appSettings>$Settings</appSettings></configuration>")
+        }
+    }
+    BeforeEach {
+        & $script:WriteAppConfig $script:AppSiteRoot
+        & $script:WriteAppConfig (Join-Path $script:AppExchange 'ClientAccess')
+        & $script:WriteAppConfig $script:AppEws
+        & $script:WriteAppConfig $script:AppMapi
+        & $script:WriteAppConfig $script:AppNspi
+        $parent = Join-Path $script:AppExchange 'ClientAccess\mapi\web.config'
+        if (Test-Path -LiteralPath $parent) { Remove-Item -LiteralPath $parent }
+        [IO.File]::WriteAllText($script:AppXml, @"
+<configuration><system.applicationHost><sites>
+  <site name="Default Web Site" id="1">
+    <application path="/"><virtualDirectory path="/" physicalPath="$script:AppSiteRoot" /></application>
+    <application path="/EWS"><virtualDirectory path="/" physicalPath="$script:AppEws" /></application>
+  </site>
+  <site name="Exchange Back End" id="2">
+    <application path="/"><virtualDirectory path="/" physicalPath="$script:AppExchange\ClientAccess" /></application>
+    <application path="/mapi/emsmdb"><virtualDirectory path="/" physicalPath="$script:AppMapi" /></application>
+    <application path="/mapi/nspi"><virtualDirectory path="/" physicalPath="$script:AppNspi" /></application>
+  </site>
+</sites></system.applicationHost></configuration>
+"@)
+    }
+    It 'uses the normal folders when no protocol-specific override is present and ignores other log formats' {
+        & $script:WriteAppConfig $script:AppMapi '<add key="LogPath" value="D:\OtherMAPI" /><add key="RequestDetailsLogger.EWSProtocolLogFolder" value="D:\Ews" />'
+        & $script:WriteAppConfig $script:AppNspi '<add key="LogFilePath" value="D:\AddressBook" />'
+        $map = & $script:ReadAppMap (& $script:NewAppServer)
+        $map.Problems | Should -BeNullOrEmpty
+        $map.Entries | Should -HaveCount 3
+        @($map.Entries | Where-Object Customized).Count | Should -Be 0
+        ($map.Entries | Where-Object Kind -eq 'MapiBackEnd').Folder | Should -Be @("$script:AppExchange\Logging\MapiHttp\Mailbox", "$script:AppExchange\Logging\MapiHttp\Mailbox")
+    }
+    It 'follows distinct MAPI mailbox and address-book HTTP folders and a customized HttpProxy folder' {
+        & $script:WriteAppConfig $script:AppMapi "<add key=`"RequestDetailsLogger.MapiHttpMailboxLogFolder`" value=`"$script:AppMoved`" />"
+        & $script:WriteAppConfig $script:AppNspi "<add key=`"RequestDetailsLogger.MapiHttpMailboxLogFolder`" value=`"$script:AppNspiMoved`" />"
+        & $script:WriteAppConfig $script:AppEws "<add key=`"RequestDetailsLogger.HttpProxyProtocolLogFolder`" value=`"$script:AppProxyMoved`" />"
+        $server = & $script:NewAppServer
+        $map = & $script:ReadAppMap $server
+        $notes = & (Get-Module ExchangeLogReport) { param($s, $m) Update-ExlApplicationLogPaths -Server $s -Map $m } $server $map
+        $server.MapiHttpPath | Should -Be $script:AppMoved
+        @($notes | Where-Object Drift).Count | Should -Be 3
+        $sources = @(Get-ExlSources $server $script:Settings)
+        @($sources | Where-Object Kind -eq 'MapiBackEnd').Folder | Should -Be @($script:AppMoved, $script:AppNspiMoved)
+        @($sources | Where-Object Kind -eq 'HttpProxy').Folder | Should -Contain $script:AppProxyMoved
+    }
+    It 'reads inherited settings, clear and remove, and external configSource and file settings' {
+        & $script:WriteAppConfig (Join-Path $script:AppExchange 'ClientAccess') "<add key=`"RequestDetailsLogger.MapiHttpMailboxLogFolder`" value=`"$script:AppMoved`" />"
+        & $script:WriteAppConfig $script:AppNspi '<remove key="RequestDetailsLogger.MapiHttpMailboxLogFolder" />'
+        $map = & $script:ReadAppMap (& $script:NewAppServer)
+        ($map.Entries | Where-Object Application -eq '/mapi/emsmdb').Folder | Should -Be $script:AppMoved
+        ($map.Entries | Where-Object Application -eq '/mapi/nspi').Customized | Should -BeFalse
+        [IO.File]::WriteAllText((Join-Path $script:AppMapi 'settings.config'), "<appSettings><clear /><add key=`"RequestDetailsLogger.MapiHttpMailboxLogFolder`" value=`"$script:AppNspiMoved`" /></appSettings>")
+        [IO.File]::WriteAllText((Join-Path $script:AppMapi 'web.config'), '<configuration><appSettings configSource="settings.config" /></configuration>')
+        [IO.File]::WriteAllText((Join-Path $script:AppEws 'settings.config'), "<appSettings><add key=`"RequestDetailsLogger.HttpProxyProtocolLogFolder`" value=`"$script:AppProxyMoved`" /></appSettings>")
+        [IO.File]::WriteAllText((Join-Path $script:AppEws 'web.config'), '<configuration><appSettings file="settings.config" /></configuration>')
+        $map = & $script:ReadAppMap (& $script:NewAppServer)
+        ($map.Entries | Where-Object Application -eq '/mapi/emsmdb').Folder | Should -Be $script:AppNspiMoved
+        ($map.Entries | Where-Object Application -eq '/EWS').Folder | Should -Be $script:AppProxyMoved
+        $map.Problems | Should -BeNullOrEmpty
+    }
+    It 'deduplicates shared folders and overlapping HttpProxy folders without ignoring a customized MAPI source' {
+        $server = & $script:NewAppServer
+        $shared = "$script:AppExchange\Logging\MapiHttp\Mailbox"
+        & $script:WriteAppConfig $script:AppMapi "<add key=`"RequestDetailsLogger.MapiHttpMailboxLogFolder`" value=`"$shared`" />"
+        & $script:WriteAppConfig $script:AppNspi "<add key=`"RequestDetailsLogger.MapiHttpMailboxLogFolder`" value=`"$shared`" />"
+        & $script:WriteAppConfig $script:AppEws "<add key=`"RequestDetailsLogger.HttpProxyProtocolLogFolder`" value=`"$script:AppExchange\Logging\HttpProxy\Ews`" />"
+        [void]@(& (Get-Module ExchangeLogReport) { param($s, $m) Update-ExlApplicationLogPaths -Server $s -Map $m } $server (& $script:ReadAppMap $server))
+        $sources = @(Get-ExlSources $server $script:Settings)
+        @($sources | Where-Object Kind -eq 'MapiBackEnd').Count | Should -Be 1
+        @($sources | Where-Object Kind -eq 'MapiBackEnd')[0].Optional | Should -BeFalse
+        @($sources | Where-Object Kind -eq 'HttpProxy').Count | Should -Be 1
+        $server.ApplicationLogSources += [pscustomobject]@{ Kind = 'HttpProxy'; Protocol = 'Owa'; Folder = "$script:AppExchange\Logging"; Customized = $true }
+        $sources = @(Get-ExlSources $server $script:Settings)
+        @($sources | Where-Object Kind -eq 'HttpProxy').Count | Should -Be 1
+        @($sources | Where-Object Kind -eq 'HttpProxy')[0].Folder | Should -Be "$script:AppExchange\Logging"
+    }
+    It 'preserves forced paths and logging roots over web.config settings' {
+        & $script:WriteAppConfig $script:AppMapi "<add key=`"RequestDetailsLogger.MapiHttpMailboxLogFolder`" value=`"$script:AppMoved`" />"
+        & $script:WriteAppConfig $script:AppEws "<add key=`"RequestDetailsLogger.HttpProxyProtocolLogFolder`" value=`"$script:AppProxyMoved`" />"
+        foreach ($configured in @(@{ MapiHttpPath = 'D:\ForcedMAPI'; HttpProxyPath = 'D:\ForcedProxy' }, @{ LoggingPath = 'D:\ForcedLogs' })) {
+            $server = & $script:NewAppServer $configured
+            $oldMapi = $server.MapiHttpPath
+            $oldProxy = $server.HttpProxyPath
+            $notes = @(& (Get-Module ExchangeLogReport) { param($s, $m) Update-ExlApplicationLogPaths -Server $s -Map $m } $server (& $script:ReadAppMap $server))
+            $server.MapiHttpPath | Should -Be $oldMapi
+            @($notes | Where-Object Drift).Count | Should -Be 0
+            $sources = @(Get-ExlSources $server $script:Settings)
+            @($sources | Where-Object Kind -eq 'MapiBackEnd').Folder | Should -Be @($oldMapi)
+            @($sources | Where-Object Kind -eq 'HttpProxy').Folder | Should -Be @($oldProxy)
+        }
+    }
+    It 'reports unreadable, invalid and unresolved settings and keeps previously discovered application paths' {
+        & $script:WriteAppConfig $script:AppMapi "<add key=`"RequestDetailsLogger.MapiHttpMailboxLogFolder`" value=`"$script:AppMoved`" />"
+        $server = & $script:NewAppServer
+        [void]@(& (Get-Module ExchangeLogReport) { param($s, $m) Update-ExlApplicationLogPaths -Server $s -Map $m } $server (& $script:ReadAppMap $server))
+        [IO.File]::WriteAllText((Join-Path $script:AppMapi 'web.config'), '<configuration><appSettings>')
+        & $script:WriteAppConfig $script:AppEws '<add key="RequestDetailsLogger.HttpProxyProtocolLogFolder" value="%UnknownRemoteVariable%\Logs" />'
+        $map = & $script:ReadAppMap $server
+        $map.Failed | Should -HaveCount 2
+        ($map.Problems -join ' ') | Should -Match 'could not be read'
+        $notes = @(& (Get-Module ExchangeLogReport) { param($s, $m) Update-ExlApplicationLogPaths -Server $s -Map $m } $server $map)
+        @($notes | Where-Object Status -eq 'Warn').Count | Should -BeGreaterOrEqual 2
+        $server.MapiHttpPath | Should -Be $script:AppMoved
+        $server.ApplicationLogSources | Where-Object Application -eq '/mapi/emsmdb' | Should -HaveCount 1
+    }
+    It 'returns to the default folder when a customization is removed and checks it during collection' {
+        & $script:WriteAppConfig $script:AppMapi "<add key=`"RequestDetailsLogger.MapiHttpMailboxLogFolder`" value=`"$script:AppMoved`" />"
+        $server = & $script:NewAppServer
+        $notes = @(Test-ExlIisSites -Server $server -Local -File $script:AppXml)
+        $server.MapiHttpPath | Should -Be $script:AppMoved
+        & $script:WriteAppConfig $script:AppMapi
+        $notes = @(Test-ExlIisSites -Server $server -Local -File $script:AppXml)
+        $server.MapiHttpPath | Should -Be "$script:AppExchange\Logging\MapiHttp\Mailbox"
+        ($notes | Where-Object { $_.Drift -and $_.Text -match 'Application logs' }).Text | Should -Match 'read from the new folder'
+    }
+    It 'warns about missing external settings and rejects DTDs without resolving external entities' {
+        [IO.File]::WriteAllText((Join-Path $script:AppMapi 'web.config'), '<configuration><appSettings configSource="absent.config" /></configuration>')
+        [IO.File]::WriteAllText((Join-Path $script:AppNspi 'web.config'), '<!DOCTYPE configuration [<!ENTITY x SYSTEM "file:///no-such-file">]><configuration><appSettings /></configuration>')
+        $map = & $script:ReadAppMap (& $script:NewAppServer)
+        $map.Failed | Should -HaveCount 2
+        $map.Problems | Should -HaveCount 2
+    }
+    It 'reports encrypted and unsupported external settings as application warnings instead of aborting collection' {
+        [IO.File]::WriteAllText((Join-Path $script:AppMapi 'not-appsettings.config'), '<other />')
+        foreach ($body in @(
+                '<appSettings configProtectionProvider="DataProtectionConfigurationProvider"><EncryptedData /></appSettings>',
+                '<appSettings configSource="D:\absolute.config" />',
+                '<appSettings file="D:\absolute.config" />',
+                '<appSettings configSource="not-appsettings.config" />',
+                '<appSettings file="not-appsettings.config" />')) {
+            [IO.File]::WriteAllText((Join-Path $script:AppMapi 'web.config'), "<configuration>$body</configuration>")
+            $map = & $script:ReadAppMap (& $script:NewAppServer)
+            $map.Failed | Should -HaveCount 1
+            $map.Entries | Should -HaveCount 2
+            $map.Problems | Should -HaveCount 1
+        }
+    }
+    It 'retains a legacy discovered MAPI folder when its web.config cannot be read' {
+        $server = & $script:NewAppServer @{} @{ MapiHttpPath = $script:AppMoved }
+        [IO.File]::WriteAllText((Join-Path $script:AppMapi 'web.config'), '<configuration>')
+        $map = & $script:ReadAppMap $server
+        [void]@(& (Get-Module ExchangeLogReport) { param($s, $m) Update-ExlApplicationLogPaths -Server $s -Map $m } $server $map)
+        $server.MapiHttpPath | Should -Be $script:AppMoved
+        @($server.ApplicationLogSources | Where-Object Application -eq '/mapi/emsmdb').Folder | Should -Be @($script:AppMoved)
+    }
+    It 'reports removed applications and drops their old custom folders' {
+        & $script:WriteAppConfig $script:AppMapi "<add key=`"RequestDetailsLogger.MapiHttpMailboxLogFolder`" value=`"$script:AppMoved`" />"
+        & $script:WriteAppConfig $script:AppNspi "<add key=`"RequestDetailsLogger.MapiHttpMailboxLogFolder`" value=`"$script:AppNspiMoved`" />"
+        $server = & $script:NewAppServer
+        [void]@(Test-ExlIisSites -Server $server -Local -File $script:AppXml)
+        $xml = [xml]::new()
+        $xml.Load($script:AppXml)
+        foreach ($app in @($xml.SelectNodes('//application[starts-with(@path, "/mapi/")]'))) { [void]$app.ParentNode.RemoveChild($app) }
+        $xml.Save($script:AppXml)
+        $notes = @(Test-ExlIisSites -Server $server -Local -File $script:AppXml)
+        @($notes | Where-Object { $_.Drift -and $_.Text -match 'no longer supplies' }).Count | Should -Be 2
+        @($server.ApplicationLogSources | Where-Object Kind -eq 'MapiBackEnd').Count | Should -Be 0
+        $server.MapiHttpPath | Should -Be "$script:AppExchange\Logging\MapiHttp\Mailbox"
+    }
+    It 'converges the proxy installation root even when one application configuration is unreadable' {
+        $other = Join-Path $script:AppExchange 'FrontEnd\HttpProxy\Autodiscover'
+        [void][IO.Directory]::CreateDirectory($other)
+        & $script:WriteAppConfig $other
+        [IO.File]::WriteAllText((Join-Path $script:AppEws 'web.config'), '<configuration>')
+        $xml = [xml]::new()
+        $xml.Load($script:AppXml)
+        $app = $xml.CreateElement('application')
+        $app.SetAttribute('path', '/Autodiscover')
+        $vdir = $xml.CreateElement('virtualDirectory')
+        $vdir.SetAttribute('path', '/')
+        $vdir.SetAttribute('physicalPath', $other)
+        [void]$app.AppendChild($vdir)
+        [void]$xml.SelectSingleNode('//site[@name="Default Web Site"]').AppendChild($app)
+        $xml.Save($script:AppXml)
+        $server = & $script:NewAppServer @{} @{ HttpProxyPath = 'D:\OldInstallation\Logging\HttpProxy' }
+        $map = & $script:ReadAppMap $server
+        [void]@(& (Get-Module ExchangeLogReport) { param($s, $m) Update-ExlApplicationLogPaths -Server $s -Map $m } $server $map)
+        $server.HttpProxyPath | Should -Be "$script:AppExchange\Logging\HttpProxy"
+        $map.Failed | Should -HaveCount 1
+    }
+    It 'reads scoped parent web.config locations without applying them to unrelated applications' {
+        [IO.File]::WriteAllText((Join-Path $script:AppExchange 'ClientAccess\web.config'), @"
+<configuration><location path="mapi/emsmdb"><appSettings>
+<add key="RequestDetailsLogger.MapiHttpMailboxLogFolder" value="$script:AppMoved" />
+</appSettings></location></configuration>
+"@)
+        $map = & $script:ReadAppMap (& $script:NewAppServer)
+        ($map.Entries | Where-Object Application -eq '/mapi/emsmdb').Folder | Should -Be $script:AppMoved
+        ($map.Entries | Where-Object Application -eq '/mapi/nspi').Customized | Should -BeFalse
+    }
+    It 'expands the Exchange installation path and follows applications relocated outside the installation folder' {
+        & $script:WriteAppConfig $script:AppMapi '<add key="RequestDetailsLogger.MapiHttpMailboxLogFolder" value="%ExchangeInstallPath%\Logging\MovedMapi" />'
+        $other = Join-Path $script:AppDir 'relocated-application'
+        [void][IO.Directory]::CreateDirectory($other)
+        & $script:WriteAppConfig $other "<add key=`"RequestDetailsLogger.HttpProxyProtocolLogFolder`" value=`"$script:AppProxyMoved`" />"
+        [IO.File]::WriteAllText($script:AppXml, [IO.File]::ReadAllText($script:AppXml).Replace(
+                "<application path=`"/EWS`"><virtualDirectory path=`"/`" physicalPath=`"$script:AppEws`" />",
+                "<application path=`"/EWS`" applicationPool=`"MSExchangeServicesAppPool`"><virtualDirectory path=`"/`" physicalPath=`"$other`" />"))
+        $server = & $script:NewAppServer @{ ExchangePath = $script:AppExchange }
+        $map = & $script:ReadAppMap $server
+        $map.Problems | Should -BeNullOrEmpty
+        ($map.Entries | Where-Object Application -eq '/mapi/emsmdb').Folder | Should -Be "$script:AppExchange\Logging\MovedMapi"
+        ($map.Entries | Where-Object Application -eq '/EWS').Folder | Should -Be $script:AppProxyMoved
+        [void]@(& (Get-Module ExchangeLogReport) { param($s, $m) Update-ExlApplicationLogPaths -Server $s -Map $m } $server $map)
+        $server.MapiHttpPath | Should -Be "$script:AppExchange\Logging\MovedMapi"
+    }
+    It 'does not open web.config for disabled application log sources' {
+        Mock -ModuleName ExchangeLogReport Read-ExlConfigurationXml { throw 'A disabled source must not read its configuration.' }
+        $server = & $script:NewAppServer
+        $map = & (Get-Module ExchangeLogReport) {
+            param($s, $f)
+            Get-ExlApplicationLogMap -Server $s -IisMap (Get-ExlIisSiteMap -Server $s.Name -File $f -Local) -Local -Sources @{ HttpProxy = $false; MapiBackEnd = $false }
+        } $server $script:AppXml
+        $map.Entries | Should -BeNullOrEmpty
+        $map.Problems | Should -BeNullOrEmpty
+    }
+    It 'persists application source paths in Discover and reloads them for an offline report' {
+        & $script:WriteAppConfig $script:AppMapi "<add key=`"RequestDetailsLogger.MapiHttpMailboxLogFolder`" value=`"$script:AppMoved`" />"
+        $config = New-TestConfig (Join-Path $script:AppDir 'discovery-runtime')
+        $settings = Import-ExlConfiguration -Path $config -Root $script:Root
+        $settings.Servers = @(& $script:NewAppServer)
+        $script:DiscoveryAppMap = & (Get-Module ExchangeLogReport) {
+            param($f) Get-ExlIisSiteMap -Server 'APPTEST' -File $f -Local
+        } $script:AppXml
+        Mock -ModuleName ExchangeLogReport Get-ExlExchangeSettings {
+            [pscustomobject]@{ Method = 'test'; Via = 'APPTEST'; Account = 'test'; ExchangeCount = 1
+                Servers = @([pscustomobject]@{ Name = 'APPTEST'; Version = '15.2'; Site = 'LAB'; DataPath = "$script:AppExchange\Mailbox"
+                        ImapLogPath = $null; PopLogPath = $null; FrontEndReceivePath = $null; FrontEndSendPath = $null
+                        HubReceivePath = $null; HubSendPath = $null; MailboxReceivePath = $null; MailboxSendPath = $null
+                        MessageTrackingPath = $null; MessageTrackingEnabled = $true; ImapProtocolLog = $false; PopProtocolLog = $false; LoggingOff = @(); Warnings = @() }) }
+        }
+        Mock -ModuleName ExchangeLogReport Get-ExlIisSiteMap { $script:DiscoveryAppMap }
+        Mock -ModuleName ExchangeLogReport ConvertTo-ExlRemotePath { return $Path }
+        $result = Invoke-ExlDiscovery -Settings $settings 6>$null
+        @($result.Warnings | Where-Object { $_ -match 'log settings could not be read|IIS settings not readable' }) | Should -BeNullOrEmpty
+        $raw = Import-PowerShellDataFile -LiteralPath $result.File
+        $raw.Servers['APPTEST'].MapiHttpPath | Should -Be $script:AppMoved
+        $raw.Servers['APPTEST'].ApplicationLogSources | Should -HaveCount 3
+        Mock -ModuleName ExchangeLogReport Read-ExlConfigurationXml { throw 'An offline import must not open web.config.' }
+        $loaded = & (Get-Module ExchangeLogReport) {
+            param($src, $found) Resolve-ExlServerPaths -Name 'APPTEST' -Discovered $found -Sources $src
+        } $settings.Sources $raw.Servers['APPTEST']
+        $loaded.MapiHttpPath | Should -Be $script:AppMoved
+        $loaded.ApplicationLogSources | Should -HaveCount 3
+    }
+    It 'collects a moved MAPI file once, correlates the back-end detail and resumes incrementally' {
+        $config = New-TestConfig (Join-Path $script:AppDir 'collection-runtime')
+        $settings = Import-ExlConfiguration -Path $config -Root $script:Root
+        $old = $settings.Servers[0]
+        $server = & (Get-Module ExchangeLogReport) {
+            param($s, $old)
+            Resolve-ExlServerPaths -Name 'EXCH01' -Discovered @{
+                ExchangePath = $old.ExchangePath; IisFrontEndPath = $old.IisFrontEndPath; IisBackEndPath = $old.IisBackEndPath
+            } -Sources $s.Sources
+        } $settings $old
+        $settings.Servers = @($server)
+        $moved = Join-Path $script:AppDir 'collected-mapi'
+        [void][IO.Directory]::CreateDirectory($moved)
+        Get-ChildItem -LiteralPath $old.MapiHttpPath -File | Move-Item -Destination $moved
+        $entries = @(
+            [pscustomobject]@{ Kind = 'MapiBackEnd'; Protocol = 'Mapi'; Site = 'Exchange Back End'; Application = '/mapi/emsmdb'
+                Folder = $moved; DefaultFolder = $old.MapiHttpPath; ConfigFile = 'test'; Setting = 'RequestDetailsLogger.MapiHttpMailboxLogFolder'; Customized = $true }
+            [pscustomobject]@{ Kind = 'MapiBackEnd'; Protocol = 'Mapi'; Site = 'Exchange Back End'; Application = '/mapi/nspi'
+                Folder = $moved; DefaultFolder = $old.MapiHttpPath; ConfigFile = 'test'; Setting = 'RequestDetailsLogger.MapiHttpMailboxLogFolder'; Customized = $true }
+        )
+        [void]@(& (Get-Module ExchangeLogReport) {
+            param($s, $e) Update-ExlApplicationLogPaths -Server $s -Map ([pscustomobject]@{ Entries = $e; Failed = @(); Problems = @() })
+        } $server $entries)
+        $first = Invoke-TestCollection $settings
+        $first.Errors | Should -Be 0
+        @(Query $settings "SELECT path FROM source_file WHERE kind='MapiBackEnd';").Count | Should -Be 1
+        [long](Query $settings "SELECT SUM(kept) FROM source_file WHERE kind='MapiBackEnd';")[0][0] | Should -BeGreaterThan 0
+        (Query $settings "SELECT software FROM client_session WHERE user='contoso\dave';")[0][0] | Should -Be 'OUTLOOK.EXE 16.0.17928.20114'
+        $again = Invoke-TestCollection $settings
+        $again.Files | Should -Be 0
     }
 }
 
@@ -1133,6 +1493,514 @@ Describe 'Reports' {
     }
 }
 
+Describe 'Bounded-memory reports' {
+    BeforeAll {
+        $script:MemoryConfig = New-TestConfig (Join-Path $TestDrive 'memory-report')
+        $script:MemorySettings = Import-ExlConfiguration -Path $script:MemoryConfig -Root $script:Root
+        [void](Invoke-TestCollection $script:MemorySettings)
+        $script:MemorySettings.Report.MaxHtmlRows = 2
+        $script:MemoryPeriod = [pscustomobject]@{ StartMs = $script:Base.AddHours(-1).ToUnixTimeMilliseconds(); EndMs = $script:Base.AddHours(2).ToUnixTimeMilliseconds() }
+        $t = $script:Base.ToUnixTimeMilliseconds()
+        $store = Open-ExlStore -Settings $script:MemorySettings
+        try {
+            $store.Exec(@"
+WITH RECURSIVE n(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM n WHERE x<260)
+INSERT INTO client_session(skey,day,start_ms,end_ms,user,protocol,front_ends,back_ends,
+ requests,successes,failures,slow,first_success_ms,last_success_ms,first_failure_ms,last_failure_ms,
+ total_ms,max_ms,bytes_in,bytes_out,last_error)
+SELECT 'bounded-'||x,'$(T 0 -W3C)', $t+x*1000,$t+x*1000,'contoso\bounded-'||x,'Mapi','EXCH01','EXCH01',
+ 1,0,1,0,0,0,$t+x*1000,$t+x*1000,1,1,0,0,'Failure '||x FROM n;
+INSERT INTO session_step(session_id,time_ms,data)
+SELECT id,start_ms,json_array(json_array(start_ms,0,'EXCH01','EXCH01','Execute',500,1,1,1,1,
+ 'Timeline '||skey,NULL,'FE',json('false'),0,NULL,NULL)) FROM client_session WHERE skey LIKE 'bounded-%';
+WITH RECURSIVE n(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM n WHERE x<300)
+INSERT INTO smtp_transaction(time_ms,end_ms,server,direction,role,connector,session_id,remote_ep,helo,
+ mail_from,rcpt_count,rcpts,message_id,status,response,transcript)
+SELECT $t+x*1000,$t+x*1000,'EXCH01','Receive','FrontEnd','bounded-client','bounded-client-'||x,
+ '203.0.113.33:12345','bounded-client','sender@example.test',1,'recipient@example.test','<bounded-'||x||'>',
+ CASE WHEN x<=210 THEN 'Rejected' ELSE 'Accepted' END,'Response '||x,'Transcript '||x FROM n;
+WITH RECURSIVE n(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM n WHERE x<300)
+INSERT INTO smtp_transaction(time_ms,end_ms,server,direction,role,connector,session_id,remote_ep,
+ mail_from,rcpt_count,rcpts,status,response,transcript)
+SELECT $t+x*1000,$t+x*1000,'EXCH01','Send','Hub','bounded-target','bounded-target-'||x,
+ '203.0.113.44:25','sender@example.test',1,'recipient@example.test',
+ CASE WHEN x<=210 THEN 'Deferred' ELSE 'Sent' END,'Response '||x,'t S: 220 bounded.example.test' FROM n;
+"@)
+        } finally { $store.Dispose() }
+        function MemoryReport($Settings = $script:MemorySettings) {
+            $store = Open-ExlStore -Settings $Settings -ReadOnly
+            try { New-ExlReport -Store $store -Settings $Settings -Period $script:MemoryPeriod -ReportType Detailed }
+            finally { $store.Dispose() }
+        }
+        function HtmlRows([string]$Path) {
+            $sets = @{}
+            $html = [IO.File]::ReadAllText($Path)
+            foreach ($match in [regex]::Matches($html, '<script type="application/x-exl-chunk">([^<]+)</script>')) {
+                $bytes = [Convert]::FromBase64String($match.Groups[1].Value)
+                $ms = [IO.MemoryStream]::new($bytes, $false)
+                $gz = [IO.Compression.GZipStream]::new($ms, [IO.Compression.CompressionMode]::Decompress)
+                $reader = [IO.StreamReader]::new($gz)
+                try { $chunk = $reader.ReadToEnd() | ConvertFrom-Json -Depth 50 }
+                finally { $reader.Dispose(); $gz.Dispose(); $ms.Dispose() }
+                if (-not $sets.ContainsKey($chunk.set)) { $sets[$chunk.set] = [Collections.Generic.List[object]]::new() }
+                foreach ($row in $chunk.rows) { $sets[$chunk.set].Add($row) }
+            }
+            return $sets
+        }
+        $script:MemoryReport = MemoryReport
+    }
+    It 'keeps all CSV rows and timelines across session batches while limiting only HTML' {
+        $sessions = @(Import-Csv (Join-Path $script:MemoryReport.Folder 'ExchangeLogs-ClientSessions.csv') -Delimiter ';')
+        $bounded = @($sessions | Where-Object User -Like 'contoso\bounded-*')
+        $bounded.Count | Should -Be 260
+        foreach ($row in $bounded) { $row.Timeline | Should -Match ([regex]::Escape("Timeline $($row.User.Split('\')[-1])")) }
+        $html = HtmlRows $script:MemoryReport.HtmlPath
+        $html.sessions.Count | Should -Be 2
+        $html.messages.Count | Should -Be 2
+        $highlight = $script:MemoryReport.Highlights | Where-Object Title -EQ 'Client sessions that failed'
+        $highlight.Total | Should -BeGreaterOrEqual 260
+        $highlight.Rows.Count | Should -Be 10
+        @(Get-ChildItem $script:MemoryReport.Folder -Filter '.report-*.tmp*' -Force).Count | Should -Be 0
+    }
+    It 'samples SMTP details before loading transcripts without truncating SMTP CSV' {
+        $html = HtmlRows $script:MemoryReport.HtmlPath
+        $client = $html.smtpclients | Where-Object { $_[1] -eq 'bounded-client' }
+        $detail = $client[16]
+        $detail.Count | Should -Be 200
+        @($detail | Where-Object { $_[3] -eq 'Rejected' }).Count | Should -Be 150
+        @($detail | Where-Object { $_[3] -eq 'Accepted' }).Count | Should -Be 50
+        $detail[0][8] | Should -Be 'Transcript 61'
+        $detail[-1][8] | Should -Be 'Transcript 300'
+        $csv = @(Import-Csv (Join-Path $script:MemoryReport.Folder 'ExchangeLogs-SmtpSessions.csv') -Delimiter ';')
+        @($csv | Where-Object Connector -EQ 'bounded-client').Count | Should -Be 300
+        @($csv | Where-Object Connector -EQ 'bounded-target').Count | Should -Be 300
+    }
+    It 'preserves Edge destination sampling and banner enrichment' {
+        $s = Import-ExlConfiguration -Path $script:MemoryConfig -Root $script:Root
+        foreach ($server in $s.Servers) { $server.Role = 'Edge' }
+        $report = MemoryReport $s
+        $html = HtmlRows $report.HtmlPath
+        $target = $html.smtpdestinations | Where-Object { $_[2] -eq 'bounded-target' }
+        $target[1] | Should -Be 'bounded.example.test'
+        $detail = $target[15]
+        $detail.Count | Should -Be 200
+        @($detail | Where-Object { $_[3] -eq 'Deferred' }).Count | Should -Be 150
+        @($detail | Where-Object { $_[3] -eq 'Sent' }).Count | Should -Be 50
+        $detail[0][6] | Should -Be 'Response 61'
+        $detail[-1][6] | Should -Be 'Response 300'
+    }
+    It 'uses disk-backed temporary sorts for a read-only report' {
+        $store = Open-ExlStore -Settings $script:MemorySettings -ReadOnly
+        try { $store.Query('PRAGMA temp_store;', $null).Rows[0][0] | Should -Be 1 }
+        finally { $store.Dispose() }
+    }
+    It 'supports CSV-only and HTML-only exports without losing dataset counts' {
+        $formats = $script:MemorySettings.Report.Formats
+        $output = $script:MemorySettings.Report.OutputPath
+        try {
+            $script:MemorySettings.Report.Formats = @('Csv')
+            $script:MemorySettings.Report.OutputPath = Join-Path $output 'csv-only'
+            $csv = MemoryReport
+            $csv.HtmlPath | Should -BeNullOrEmpty
+            ($csv.Files | Where-Object Dataset -EQ 'sessions').Rows | Should -Be $script:MemoryReport.Counts['sessions']
+            $script:MemorySettings.Report.Formats = @('Html')
+            $script:MemorySettings.Report.OutputPath = Join-Path $output 'html-only'
+            $html = MemoryReport
+            $html.Files.Count | Should -Be 1
+            $html.Counts['sessions'] | Should -Be $csv.Counts['sessions']
+            $html.Counts['smtp'] | Should -Be $csv.Counts['smtp']
+            @($html.Steps | Where-Object { $_ -like '*SELECT time_ms,end_ms,server,direction*' }).Count | Should -Be 0
+            @(Get-ChildItem $html.Folder -Filter '*.csv').Count | Should -Be 0
+        } finally {
+            $script:MemorySettings.Report.Formats = $formats
+            $script:MemorySettings.Report.OutputPath = $output
+        }
+    }
+    It 'splits HTML chunks by estimated memory as well as row count' {
+        $store = Open-ExlStore -Settings $script:MemorySettings
+        try {
+            $store.Exec("UPDATE session_step SET data=json_set(data,'$[0][10]','Sized '||hex(zeroblob(32000))) WHERE session_id IN (SELECT id FROM client_session WHERE skey LIKE 'bounded-%');")
+        } finally { $store.Dispose() }
+        $limit = $script:MemorySettings.Report.MaxHtmlRows
+        $script:MemorySettings.Report.MaxHtmlRows = 200000
+        try { $report = MemoryReport }
+        finally { $script:MemorySettings.Report.MaxHtmlRows = $limit }
+        $html = [IO.File]::ReadAllText($report.HtmlPath)
+        $sessionChunks = 0
+        foreach ($match in [regex]::Matches($html, '<script type="application/x-exl-chunk">([^<]+)</script>')) {
+            $ms = [IO.MemoryStream]::new([Convert]::FromBase64String($match.Groups[1].Value), $false)
+            $gz = [IO.Compression.GZipStream]::new($ms, [IO.Compression.CompressionMode]::Decompress)
+            $reader = [IO.StreamReader]::new($gz)
+            try {
+                $chunk = $reader.ReadToEnd() | ConvertFrom-Json -Depth 50
+                if ($chunk.set -eq 'sessions') { $sessionChunks++ }
+            } finally { $reader.Dispose(); $gz.Dispose(); $ms.Dispose() }
+        }
+        $sessionChunks | Should -BeGreaterThan 1
+        $rows = HtmlRows $report.HtmlPath
+        $rows.sessions.Count | Should -Be $report.Counts['sessions']
+    }
+    It 'spills within a shared small budget and preserves parallel versus sequential contents' {
+        $budget = $script:MemorySettings.Report.MemoryBudgetMB
+        $workers = $script:MemorySettings.Report.Parallelism
+        $output = $script:MemorySettings.Report.OutputPath
+        try {
+            $script:MemorySettings.Report.MemoryBudgetMB = 64
+            $script:MemorySettings.Report.Parallelism = 1
+            $script:MemorySettings.Report.OutputPath = Join-Path $output 'budget-64-serial'
+            $serial = MemoryReport
+            $serial.Parallelism | Should -Be 1
+            $serial.SpilledRows | Should -BeGreaterThan 0
+            $serial.PeakBufferBytes | Should -BeLessOrEqual (40MB)
+            $serial.DatabaseCacheMB | Should -Be 16
+            $script:MemorySettings.Report.MemoryBudgetMB = 256
+            $script:MemorySettings.Report.Parallelism = 2
+            $script:MemorySettings.Report.OutputPath = Join-Path $output 'budget-256-parallel'
+            $parallel = MemoryReport
+            $parallel.Parallelism | Should -Be 2
+            $parallel.SpilledRows | Should -Be 0
+            foreach ($file in $serial.Files | Where-Object Dataset -NE 'html') {
+                $other = $parallel.Files | Where-Object Dataset -EQ $file.Dataset
+                (Get-FileHash $file.Path).Hash | Should -Be (Get-FileHash $other.Path).Hash
+            }
+            $serialHtml = HtmlRows $serial.HtmlPath
+            $parallelHtml = HtmlRows $parallel.HtmlPath
+            foreach ($name in $serialHtml.Keys) {
+                (ConvertTo-Json -InputObject @($serialHtml[$name]) -Depth 50 -Compress) |
+                    Should -Be (ConvertTo-Json -InputObject @($parallelHtml[$name]) -Depth 50 -Compress)
+            }
+        } finally {
+            $script:MemorySettings.Report.MemoryBudgetMB = $budget
+            $script:MemorySettings.Report.Parallelism = $workers
+            $script:MemorySettings.Report.OutputPath = $output
+        }
+    }
+    It 'restores the caller SQLite cache after report generation' {
+        $store = Open-ExlStore -Settings $script:MemorySettings -ReadOnly
+        try {
+            $store.Exec('PRAGMA cache_size=-65536;')
+            [void](New-ExlReport -Store $store -Settings $script:MemorySettings -Period $script:MemoryPeriod -ReportType Detailed)
+            $store.Query('PRAGMA cache_size;', $null).Rows[0][0] | Should -Be -65536
+        } finally { $store.Dispose() }
+    }
+    It 'materializes spilled messages chronologically with complete subjects and routes' {
+        $s = Import-ExlConfiguration -Path (New-TestConfig (Join-Path $TestDrive 'spilled-messages')) -Root $script:Root
+        [void](Invoke-TestCollection $s)
+        $s.Report.MemoryBudgetMB = 64
+        $s.Report.Parallelism = 2
+        $s.Report.MaxHtmlRows = 2
+        $t = $script:Base.ToUnixTimeMilliseconds()
+        $store = Open-ExlStore -Settings $s
+        try {
+            $store.Exec(@"
+WITH RECURSIVE n(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM n WHERE x<1000)
+INSERT INTO message_event(time_ms,server,event_id,message_id,sender,recipients,subject,log_id)
+SELECT $t+x*1000,'EXCH01','DELIVER','<sort-'||(1001-x)||'@test>','sender@example.test',
+ 'recipient@example.test',hex(zeroblob(8192)),'sort-'||x FROM n;
+"@)
+        } finally { $store.Dispose() }
+        $report = MemoryReport $s
+        $report.SpilledRows | Should -BeGreaterThan 0
+        $messages = @(Import-Csv (Join-Path $report.Folder 'ExchangeLogs-Messages.csv') -Delimiter ';' |
+            Where-Object 'Message ID' -Like '<sort-*')
+        $messages.Count | Should -Be 1000
+        $messages[0].'Message ID' | Should -Be '<sort-1000@test>'
+        $messages[-1].'Message ID' | Should -Be '<sort-1@test>'
+        foreach ($message in $messages) {
+            $message.Subject.Length | Should -Be 16384
+            $message.Route | Should -Match 'DELIVER'
+        }
+        @(Get-ChildItem $report.Folder -Filter '.report-*.tmp*' -Force).Count | Should -Be 0
+    }
+    It 'logs report stages on the caller thread while CPU workers run' {
+        $dir = Join-Path $TestDrive 'report-stages'
+        $log = Start-ExlLog -Directory $dir
+        try { [void](MemoryReport) }
+        finally { Stop-ExlLog }
+        $text = [IO.File]::ReadAllText($log)
+        $text | Should -Match 'Report stage: Client sessions'
+        $text | Should -Match 'Report stage: CSV exports'
+        $text | Should -Match 'Report stage: HTML compression'
+    }
+    It 'propagates a CPU worker failure and cleans up without leaving background work' {
+        $s = Import-ExlConfiguration -Path (New-TestConfig (Join-Path $TestDrive 'worker-failure')) -Root $script:Root
+        [void](Invoke-TestCollection $s)
+        $s.Report.Parallelism = 2
+        $store = Open-ExlStore -Settings $s
+        try { $store.Exec("UPDATE session_step SET data='{}';") }
+        finally { $store.Dispose() }
+        { MemoryReport $s } | Should -Throw
+        @(Get-ChildItem $s.Report.OutputPath -Recurse -Filter '.report-*.tmp*' -Force).Count | Should -Be 0
+    }
+    It 'keeps case-insensitive SMTP correlation and the full selected message journey' {
+        $s = Import-ExlConfiguration -Path (New-TestConfig (Join-Path $TestDrive 'case-report')) -Root $script:Root
+        [void](Invoke-TestCollection $s)
+        $t = $script:Base.ToUnixTimeMilliseconds()
+        $early = $t - 7200000
+        $store = Open-ExlStore -Settings $s
+        try {
+            $store.Exec(@"
+INSERT INTO message_event(time_ms,server,event_id,message_id,sender,recipients,log_id) VALUES
+ ($t,'EXCH01','RECEIVE','<Case-ID@Test>','sender@example.test','recipient@example.test','case-1'),
+ ($t+1000,'EXCH01','DELIVER','<case-id@test>','sender@example.test','recipient@example.test','case-2'),
+ ($early,'EXCH02','SEND','<Case-ID@Test>','sender@example.test','recipient@example.test','case-3');
+INSERT INTO smtp_transaction(time_ms,server,direction,session_id,message_id,status,transcript) VALUES
+ ($t,'EXCH01','Receive','case-1','<Case-ID@Test>','Accepted','Upper case transcript'),
+ ($t+1000,'EXCH01','Send','case-2','<case-id@test>','Sent','Lower case transcript');
+"@)
+        } finally { $store.Dispose() }
+        $report = MemoryReport $s
+        $messages = @(Import-Csv (Join-Path $report.Folder 'ExchangeLogs-Messages.csv') -Delimiter ';') |
+            Where-Object 'Message ID' -In @('<Case-ID@Test>', '<case-id@test>')
+        @($messages).Count | Should -Be 2
+        foreach ($message in $messages) { $message.'SMTP sessions' | Should -Be '2' }
+        ($messages | Where-Object 'Message ID' -CEQ '<Case-ID@Test>').Route | Should -Match 'EXCH02.*SEND'
+        $rows = HtmlRows $report.HtmlPath
+        $shown = $rows.messages | Where-Object { $_[15] -ceq '<Case-ID@Test>' }
+        $shown[17].Count | Should -Be 2
+    }
+    It 'removes temporary report data and surfaces an export failure' {
+        $bad = Join-Path $TestDrive 'invalid-report-template.html'
+        [IO.File]::WriteAllText($bad, 'No report markers.')
+        $q = [ExchangeLogReport.ReportRequest]::new()
+        $q.StartMs = $script:MemoryPeriod.StartMs; $q.EndMs = $script:MemoryPeriod.EndMs
+        $q.ConfiguredServers = [string[]]@($script:MemorySettings.Servers.Name)
+        $q.OutputFolder = Join-Path $script:MemorySettings.Report.OutputPath 'failed-export'
+        $q.TemplatePath = $bad
+        $q.Detailed = $true
+        $q.Parallelism = 2
+        $q.MemoryBudgetMB = 64
+        $store = Open-ExlStore -Settings $script:MemorySettings -ReadOnly
+        try {
+            { [ExchangeLogReport.ReportBuilder]::Build($store, $q) } | Should -Throw '*template must contain*'
+        } finally { $store.Dispose() }
+        @(Get-ChildItem $script:MemorySettings.Report.OutputPath -Recurse -Filter '.report-*.tmp*' -Force).Count | Should -Be 0
+    }
+}
+
+Describe 'Report review corrections' {
+    BeforeAll {
+        if (-not ('ReportReviewFixtures' -as [type])) { Add-Type -LiteralPath (Join-Path $PSScriptRoot 'ReportReviewFixtures.cs') }
+        function ReviewSettings([string]$Name) {
+            $s = Import-ExlConfiguration -Path (New-TestConfig (Join-Path $TestDrive $Name)) -Root $script:Root
+            [void](Invoke-TestCollection $s)
+            $s.Report.Formats = @('Html')
+            $s.Report.MaxHtmlRows = 1
+            return $s
+        }
+        function ReviewRequest($Settings, [string]$Name = 'review') {
+            $q = [ExchangeLogReport.ReportRequest]::new()
+            $q.StartMs = $script:Base.AddHours(-1).ToUnixTimeMilliseconds()
+            $q.EndMs = $script:Base.AddHours(2).ToUnixTimeMilliseconds()
+            $q.Zone = $Settings.Zone
+            $q.ConfiguredServers = [string[]]@($Settings.Servers.Name)
+            $q.TemplatePath = $Settings.Report.TemplatePath
+            $q.OutputFolder = Join-Path $Settings.Report.OutputPath $Name
+            $q.Detailed = $true
+            $q.WriteCsv = $false
+            $q.MaxHtmlRows = 1
+            return $q
+        }
+        function ReviewRows([string]$Path) {
+            $sets = @{}
+            foreach ($match in [regex]::Matches([IO.File]::ReadAllText($Path), '<script type="application/x-exl-chunk">([^<]+)</script>')) {
+                $ms = [IO.MemoryStream]::new([Convert]::FromBase64String($match.Groups[1].Value), $false)
+                $gz = [IO.Compression.GZipStream]::new($ms, [IO.Compression.CompressionMode]::Decompress)
+                $reader = [IO.StreamReader]::new($gz)
+                try { $chunk = $reader.ReadToEnd() | ConvertFrom-Json -Depth 50 }
+                finally { $reader.Dispose(); $gz.Dispose(); $ms.Dispose() }
+                if (-not $sets.ContainsKey($chunk.set)) { $sets[$chunk.set] = [Collections.Generic.List[object]]::new() }
+                foreach ($row in $chunk.rows) { $sets[$chunk.set].Add($row) }
+            }
+            return $sets
+        }
+    }
+    It 'normalizes drive and UNC paths for SQLite without doubling an extended prefix' {
+        $method = [ExchangeLogReport.Store].GetMethod('SqlitePath', [Reflection.BindingFlags]'Static,NonPublic')
+        $local = [IO.Path]::GetFullPath((Join-Path $TestDrive 'native.sqlite'))
+        $method.Invoke($null, @($local)) | Should -Be ('\\?\' + $local)
+        $method.Invoke($null, @('\\?\' + $local)) | Should -Be ('\\?\' + $local)
+        $method.Invoke($null, @('\\server.example.test\share\folder\db.sqlite')) |
+            Should -Be '\\?\UNC\server.example.test\share\folder\db.sqlite'
+        $method.Invoke($null, @('\\?\UNC\server.example.test\share\folder\db.sqlite')) |
+            Should -Be '\\?\UNC\server.example.test\share\folder\db.sqlite'
+    }
+    It 'collects and exports complete reports with database and scratch paths longer than MAX_PATH' {
+        $s = Import-ExlConfiguration -Path (New-TestConfig (Join-Path $TestDrive 'long-path-report')) -Root $script:Root
+        $folder = Join-Path $TestDrive 'long paths with spaces'
+        while ($folder.Length -lt 300) { $folder = Join-Path $folder 'nested folder with spaces' }
+        [void][IO.Directory]::CreateDirectory($folder)
+        $s.Storage.DatabasePath = Join-Path $folder 'source.sqlite'
+        $s.Storage.DatabasePath.Length | Should -BeGreaterThan 260
+        $s.Collection.Parallelism = 2
+        $collection = Invoke-TestCollection $s
+        $collection.Errors | Should -Be 0
+        $collection.Statistics | Should -Match '2 parse thread'
+        $s.Report.OutputPath = Join-Path $folder 'reports'
+        $q = ReviewRequest $s
+        $q.OutputFolder.Length | Should -BeGreaterThan 260
+        $q.WriteCsv = $true
+        $q.MaxHtmlRows = 200000
+        $store = Open-ExlStore -Settings $s -ReadOnly
+        try {
+            $hash = (Get-FileHash -LiteralPath $s.Storage.DatabasePath).Hash
+            $report = [ExchangeLogReport.ReportBuilder]::Build($store, $q)
+            (Get-FileHash -LiteralPath $s.Storage.DatabasePath).Hash | Should -Be $hash
+        } finally { $store.Dispose() }
+        $report.StagedRows | Should -BeGreaterThan 0
+        foreach ($file in $report.Files) { $file.Bytes | Should -BeGreaterThan 0 }
+        $messages = @(Import-Csv -LiteralPath (Join-Path $report.Folder 'ExchangeLogs-Messages.csv') -Delimiter ';')
+        $messages.Count | Should -Be 3
+        $messages.'Message ID' | Should -Contain '<msg-001@contoso.test>'
+        $rows = ReviewRows $report.HtmlPath
+        $rows.messages.Count | Should -Be 3
+        $rows.sessions.Count | Should -Be $report.Counts['sessions']
+        @(Get-ChildItem -LiteralPath $report.Folder -Force -Filter '.report-*.tmp*').Count | Should -Be 0
+    }
+    It 'returns independent samples and releases their registered buffers' {
+        [ReportReviewFixtures]::IndependentSamplesAndRelease([ExchangeLogReport.ReportRequest], $TestDrive) | Should -BeTrue
+    }
+    It 'sorts explicit UTC keys identically in memory and on disk' {
+        [ReportReviewFixtures]::SortUtc([ExchangeLogReport.ReportRequest], $TestDrive, $false) | Should -Be @(30L, 10L)
+        [ReportReviewFixtures]::SortUtc([ExchangeLogReport.ReportRequest], $TestDrive, $true) | Should -Be @(30L, 10L)
+    }
+    It 'preserves a consumer error while draining and exposing another worker failure' {
+        $messages = [ReportReviewFixtures]::WorkerAndConsumerFailures([ExchangeLogReport.ReportRequest], $TestDrive)
+        $messages | Should -Be @('primary consumer failure', 'secondary worker failure')
+    }
+    It 'does not decode unshown message transcripts or sort them into scratch' {
+        $s = ReviewSettings 'deferred-transcripts'
+        $store = Open-ExlStore -Settings $s
+        $t = $script:Base.ToUnixTimeMilliseconds()
+        try {
+            $store.Exec("DELETE FROM smtp_transaction; DELETE FROM message_event; DELETE FROM client_session; DELETE FROM session_step;")
+            $store.Exec(@"
+WITH RECURSIVE n(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM n WHERE x<100)
+INSERT INTO message_event(time_ms,server,event_id,message_id,sender,recipients,subject,log_id)
+SELECT $t+x*1000,'EXCH01','DELIVER','<defer-'||x||'@test>','sender@example.test','recipient@example.test','Subject','defer-'||x FROM n;
+WITH RECURSIVE n(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM n WHERE x<100)
+INSERT INTO smtp_transaction(time_ms,server,direction,role,session_id,message_id,status,transcript)
+SELECT $t+x*1000,'EXCH01','Send','Hub','defer-'||x,'<defer-'||x||'@test>','Sent','Trace '||x||':'||hex(zeroblob(65536)) FROM n;
+"@)
+        } finally { $store.Dispose() }
+        $q = ReviewRequest $s
+        $source = Open-ExlStore -Settings $s -ReadOnly
+        try { $report = [ExchangeLogReport.ReportBuilder]::Build($source, $q) }
+        finally { $source.Dispose() }
+        $report.Counts['messages'] | Should -Be 100
+        $report.TranscriptReads | Should -Be 1
+        $report.ScratchPeakBytes | Should -BeLessThan 1MB
+        $rows = ReviewRows $report.HtmlPath
+        $rows.messages[0][17][0][3] | Should -BeLike 'Trace 1:*'
+        $rows.messages[0][17][0][3].Length | Should -BeGreaterThan 100000
+        $q.OutputFolder = Join-Path $s.Report.OutputPath 'csv-only'
+        $q.WriteCsv = $true; $q.WriteHtml = $false
+        $source = Open-ExlStore -Settings $s -ReadOnly
+        try { $csv = [ExchangeLogReport.ReportBuilder]::Build($source, $q) }
+        finally { $source.Dispose() }
+        $csv.TranscriptReads | Should -Be 100
+        $csv.ScratchPeakBytes | Should -BeLessThan 1MB
+        @(Import-Csv (Join-Path $csv.Folder 'ExchangeLogs-SmtpSessions.csv') -Delimiter ';').Count | Should -Be 100
+    }
+    It 'keeps all source statements on one snapshot during a concurrent write' {
+        $s = ReviewSettings 'report-snapshot'
+        $q = ReviewRequest $s
+        $q.WriteCsv = $true
+        $writer = Open-ExlStore -Settings $s
+        $source = Open-ExlStore -Settings $s -ReadOnly
+        $t = $script:Base.ToUnixTimeMilliseconds()
+        $initial = $writer.Query('SELECT COUNT(*) FROM smtp_transaction;', $null).Rows[0][0]
+        $code = { param($stage)
+            if ($stage -eq 'CSV exports') {
+                $writer.Exec("INSERT INTO smtp_transaction(time_ms,server,direction,session_id,status) VALUES($t,'EXCH01','Receive','snapshot-new','Accepted');")
+            }
+        }.GetNewClosure()
+        $q.Progress = [Action[string]]$code
+        try { $report = [ExchangeLogReport.ReportBuilder]::Build($source, $q) }
+        finally { $source.Dispose(); $writer.Dispose() }
+        $report.Counts['smtp'] | Should -Be $initial
+        ($report.Files | Where-Object Dataset -EQ 'smtp').Rows | Should -Be $initial
+        (Query $s 'SELECT COUNT(*) FROM smtp_transaction;')[0][0] | Should -Be ($initial + 1)
+    }
+    It 'skips session reconstruction in a Detailed Edge report' {
+        $s = ReviewSettings 'edge-no-sessions'
+        $q = ReviewRequest $s
+        $q.Edge = $true; $q.EdgeServers = $q.ConfiguredServers
+        $store = Open-ExlStore -Settings $s
+        try { $store.Exec("UPDATE session_step SET data='{}';") }
+        finally { $store.Dispose() }
+        $source = Open-ExlStore -Settings $s -ReadOnly
+        try { $report = [ExchangeLogReport.ReportBuilder]::Build($source, $q) }
+        finally { $source.Dispose() }
+        $report.Counts.ContainsKey('sessions') | Should -BeFalse
+        @($report.Steps | Where-Object { $_ -like '*LEFT JOIN session_step*' }).Count | Should -Be 0
+    }
+    It 'refuses malformed timeline JSON without a success-shaped partial timeline' {
+        $s = ReviewSettings 'bad-session-json'
+        $store = Open-ExlStore -Settings $s
+        try { $store.Exec("UPDATE session_step SET data='[';") }
+        finally { $store.Dispose() }
+        $q = ReviewRequest $s
+        $source = Open-ExlStore -Settings $s -ReadOnly
+        try { { [ExchangeLogReport.ReportBuilder]::Build($source, $q) } | Should -Throw '*Malformed client session timeline JSON*' }
+        finally { $source.Dispose() }
+    }
+    It 'orders messages and route steps by UTC milliseconds across the repeated Paris hour' {
+        $s = ReviewSettings 'dst-order'
+        $first = ([DateTimeOffset]'2026-10-25T00:30:00.100Z').ToUnixTimeMilliseconds()
+        $second = ([DateTimeOffset]'2026-10-25T01:10:00.100Z').ToUnixTimeMilliseconds()
+        $store = Open-ExlStore -Settings $s
+        try {
+            $store.Exec("DELETE FROM smtp_transaction; DELETE FROM message_event; DELETE FROM client_session; DELETE FROM session_step;")
+            $store.Exec(@"
+INSERT INTO message_event(time_ms,server,event_id,message_id,sender,recipients,log_id) VALUES
+ ($first,'EXCH01','RECEIVE','<z-first@test>','sender@example.test','recipient@example.test','dst-first'),
+ ($first+100,'EXCH01','SUBMIT','<z-first@test>','sender@example.test','recipient@example.test','dst-submit'),
+ ($first+200,'EXCH01','DELIVER','<z-first@test>','sender@example.test','recipient@example.test','dst-deliver'),
+ ($second,'EXCH01','DELIVER','<a-second@test>','sender@example.test','recipient@example.test','dst-second');
+"@)
+        } finally { $store.Dispose() }
+        $q = ReviewRequest $s
+        $q.StartMs = $first - 1000; $q.EndMs = $second + 1000; $q.MaxHtmlRows = 10
+        $q.WriteCsv = $true
+        $source = Open-ExlStore -Settings $s -ReadOnly
+        try { $report = [ExchangeLogReport.ReportBuilder]::Build($source, $q) }
+        finally { $source.Dispose() }
+        $messages = @(Import-Csv (Join-Path $report.Folder 'ExchangeLogs-Messages.csv') -Delimiter ';')
+        $messages.'Message ID' | Should -Be @('<z-first@test>', '<a-second@test>')
+        $messages[0].Route | Should -Match 'RECEIVE(.|\n)*SUBMIT(.|\n)*DELIVER'
+        $rows = ReviewRows $report.HtmlPath
+        @($rows.messages[0][16] | ForEach-Object { $_[3] }) | Should -Be @('RECEIVE', 'SUBMIT', 'DELIVER')
+    }
+    It 'retains Unicode case-insensitive correlation without a custom collation in source queries' {
+        $s = ReviewSettings 'unicode-message-ids'
+        $q = ReviewRequest $s
+        $q.MaxHtmlRows = 100; $q.WriteCsv = $true
+        $t = $script:Base.ToUnixTimeMilliseconds()
+        $store = Open-ExlStore -Settings $s
+        try {
+            $store.Exec(@"
+INSERT INTO message_event(time_ms,server,event_id,message_id,sender,recipients,log_id) VALUES
+ ($t,'EXCH01','RECEIVE','<ID-É@Test>','sender@example.test','recipient@example.test','unicode-1'),
+ ($t+1000,'EXCH01','DELIVER','<id-é@test>','sender@example.test','recipient@example.test','unicode-2');
+INSERT INTO smtp_transaction(time_ms,server,direction,session_id,message_id,status,transcript) VALUES
+ ($t,'EXCH01','Receive','unicode-1','<ID-É@Test>','Accepted','First transcript'),
+ ($t+1000,'EXCH01','Send','unicode-2','<id-é@test>','Sent','Second transcript');
+"@)
+        } finally { $store.Dispose() }
+        $source = Open-ExlStore -Settings $s -ReadOnly
+        try { $report = [ExchangeLogReport.ReportBuilder]::Build($source, $q) }
+        finally { $source.Dispose() }
+        $messages = @(Import-Csv (Join-Path $report.Folder 'ExchangeLogs-Messages.csv') -Delimiter ';' |
+            Where-Object 'Message ID' -In @('<ID-É@Test>', '<id-é@test>'))
+        $messages.Count | Should -Be 2
+        foreach ($message in $messages) { $message.'SMTP sessions' | Should -Be '2' }
+        @($report.Steps | Where-Object { $_ -like '*COLLATE EXL_REPORT_ID*' }).Count | Should -Be 0
+        $rows = ReviewRows $report.HtmlPath
+        foreach ($row in @($rows.messages | Where-Object { $_[15] -in @('<ID-É@Test>', '<id-é@test>') })) { $row[17].Count | Should -Be 2 }
+    }
+}
+
 Describe 'Retention' {
     It 'deletes aggregates after RetentionDays and details after DetailRetentionDays' {
         $dir = Join-Path $TestDrive 'retention'
@@ -1147,6 +2015,1518 @@ Describe 'Retention' {
         } finally { $store.Dispose() }
         (Query $s 'SELECT COUNT(*) FROM access_event')[0][0] | Should -Be 0
         (Query $s 'SELECT COUNT(*) FROM smtp_transaction')[0][0] | Should -Be 5
+    }
+}
+
+Describe 'SMTP authenticated identity' {
+    # Synthetic fixtures only. The front-end/back-end dialogue follows the grammar read in a real Exchange protocol log (AUTH LOGIN, "data=<account>
+    # context=authenticated" written by the server, "Proxy session was successfully set up", X-EXPS EXCHANGEAUTH with the technical identity
+    # "[unrecognized]", XPROXY with the SID of the front-end session). No real mail transaction is part of that evidence: the transactions below
+    # are simulated, and the result of this Describe does not replace a run on a candidate server.
+    BeforeAll {
+        $script:Secrets = @{ User = 'sentinel-user'; Password = 'SENTINELPASSWORD123456'; Blob = 'SENTINELBLOBXXXXXXXXXXXXXXXX' }
+        function B64([string]$Text) { [Convert]::ToBase64String([Text.Encoding]::ASCII.GetBytes($Text)) }
+        function AuthSession([string]$Connector, [string]$Id, [double]$Minute, [string]$Local, [string]$Remote, $Steps, [int]$FirstSequence = 0) {
+            $n = $FirstSequence
+            $flat = { param($items) foreach ($item in $items) { if ($item -is [array]) { & $flat $item } else { $item } } }
+            foreach ($s in @(& $flat $Steps)) {
+                if ($s -eq 'GAP') { $n++; continue }
+                $evt = $null; $data = ''; $ctx = ''
+                if ($s -eq '+') { $evt = '+' }
+                elseif ($s.StartsWith('-')) { $evt = '-'; $ctx = $s.Substring(1) }
+                elseif ($s.StartsWith('C ')) { $evt = '<'; $data = $s.Substring(2) }
+                elseif ($s.StartsWith('S ')) { $evt = '>'; $data = $s.Substring(2) }
+                elseif ($s.StartsWith('E ')) { $evt = '*'; $split = $s.Substring(2).Split('|', 2); $data = $split[0]; $ctx = $split[1] }
+                else { throw "Unknown step '$s'" }
+                $cells = foreach ($x in $data, $ctx) { if ($x -match '[,"]') { '"' + $x.Replace('"', '""') + '"' } else { $x } }
+                $minute = $Minute + ($n - $FirstSequence) * 0.0002
+                # A front end ends its session after the mailbox server accepted the hand-over (the 235 of the front end is written after the XPROXY of the back end).
+                if ($evt -eq '-') { $minute += 0.6 }
+                "$(T $minute),$Connector,$Id,$n,$Local,$Remote,$evt,$($cells -join ',')"
+                $n++
+            }
+        }
+        function AuthHello([string]$Helo) { '+'; 'S 220 EXCH01.contoso.test Microsoft ESMTP MAIL Service ready'; "C EHLO $Helo"; 'S 250 EXCH01.contoso.test Hello' }
+        function AuthTx([string]$From, [string]$Id) {
+            "C MAIL FROM:<$From>"; 'S 250 2.1.0 Sender OK'; 'C RCPT TO:<bob@contoso.test>'; 'S 250 2.1.5 Recipient OK'; 'C DATA'; 'S 354 Start mail input; end with <CRLF>.<CRLF>'
+            "S 250 2.6.0 <$Id@contoso.test> [InternalId=9001, Hostname=EXCH01.contoso.test] Queued mail for delivery"
+        }
+        function AuthLogin([string]$Identity, [switch]$Proxied, [switch]$Fail) {
+            'C AUTH LOGIN'; 'S 334 VXNlcm5hbWU6'; "C $(B64 $script:Secrets.User)"; 'S 334 UGFzc3dvcmQ6'; "C $(B64 $script:Secrets.Password)"
+            if ($Fail) { 'S 535 5.7.3 Authentication unsuccessful'; return }
+            if ($Identity) { "E $Identity|authenticated" }
+            if ($Proxied) { "E |Proxy session was successfully set up. Session for $Identity will now be proxied" }
+            'S 235 2.7.0 Authentication successful'
+        }
+        function AuthPlain([string]$Identity) {
+            "C AUTH PLAIN $(B64 "`0$($script:Secrets.User)`0$($script:Secrets.Password)")"
+            if ($Identity) { "E $Identity|authenticated" }
+            'S 235 2.7.0 Authentication successful'
+        }
+        function AuthBack([string]$Sid, [string]$Ip, [int]$Port, [string]$Domain, [string]$Sender, [string]$Id, [switch]$Reject) {
+            AuthHello 'EXCH01.contoso.test'
+            "C X-EXPS EXCHANGEAUTH $($script:Secrets.Blob)"; 'E [unrecognized]|authenticated'; 'S 235 2.7.0 Authentication successful'
+            "C XPROXY SID=$Sid IP=$Ip PORT=$Port DOMAIN=$Domain CAPABILITIES=0"
+            if ($Reject) { 'S 550 5.7.0 XPROXY rejected' } else { 'S 250 2.0.0 XPROXY OK' }
+            AuthTx $Sender $Id
+            'C QUIT'; 'S 221 2.0.0 Service closing transmission channel'; '-Local'
+        }
+        function New-AuthLogs([string]$Root, [ValidateSet('All', 'FE', 'Hub')][string]$Part = 'All') {
+            $smtp = '#Fields: date-time,connector-id,session-id,sequence-number,local-endpoint,remote-endpoint,event,data,context'
+            $header = '#Software: Microsoft Exchange Server', '#Log-type: SMTP Receive Protocol Log', "#Date: $(T 0)", $smtp
+            $recv = 'TransportRoles\Logs\{0}\ProtocolLog\SmtpReceive\RECV2026100109-1.LOG'
+            $fe = 'EXCH01\Client Frontend EXCH01'; $feLocal = '10.0.0.1:587'
+            $cp = 'EXCH01\Client Proxy EXCH01'; $beLocal = '10.0.0.1:465'
+            if ($Part -ne 'Hub') {
+                $lines = @($header)
+                # Proxied submissions: the front end has the account, the back end only the technical identity.
+                $lines += AuthSession $fe '08DA0000000000A1' 40 $feLocal '10.2.0.1:50101' @((AuthHello 'thunderbird.contoso.test'), (AuthLogin 'proxy.user@contoso.test' -Proxied), '-Local')
+                $lines += AuthSession $fe '08DA0000000000A3' 41 $feLocal '10.2.0.3:50103' @((AuthHello 'amb.contoso.test'), (AuthLogin 'amb.one@contoso.test' -Proxied), '-Local')
+                $lines += AuthSession $fe '08DA0000000000A3' 41.5 $feLocal '10.2.0.3:50103' @((AuthHello 'amb.contoso.test'), (AuthLogin 'amb.two@contoso.test' -Proxied), '-Local')
+                $lines += AuthSession $fe '08DA0000000000A4' 42 $feLocal '10.2.0.4:50104' @((AuthHello 'machine.contoso.test'), (AuthLogin 'EXCH01$' -Proxied), '-Local')
+                # Direct sessions.
+                $lines += AuthSession $fe '08DA000000000D01' 43 $feLocal '10.2.1.1:50201' @((AuthHello 'relay.contoso.test'), (AuthPlain 'direct.user@contoso.test'), (AuthTx 'sender.a@vendor.example' 'msg-auth-d1'), 'C QUIT', 'S 221 bye', '-Local')
+                $lines += AuthSession $fe '08DA000000000D02' 43.2 $feLocal '10.2.1.1:50202' @((AuthHello 'relay.contoso.test'), (AuthLogin 'CONTOSO\Other.User'), (AuthTx 'sender.b@vendor.example' 'msg-auth-d1b'), 'C QUIT', 'S 221 bye', '-Local')
+                $lines += AuthSession $fe '08DA000000000D03' 43.4 $feLocal '10.2.1.1:50203' @((AuthHello 'relay.contoso.test'), (AuthTx 'sender.c@vendor.example' 'msg-auth-d1c'), 'C QUIT', 'S 221 bye', '-Local')
+                $lines += AuthSession $fe '08DA000000000D04' 44 $feLocal '10.2.1.2:50204' @((AuthHello 'noidentity.contoso.test'), (AuthLogin ''), (AuthTx 'sender.d@vendor.example' 'msg-auth-d2'), 'C QUIT', 'S 221 bye', '-Local')
+                $lines += AuthSession $fe '08DA000000000D05' 44.2 $feLocal '10.2.1.3:50205' @((AuthHello 'retry.contoso.test'), (AuthLogin '' -Fail), (AuthPlain 'retry.user@contoso.test'), (AuthTx 'sender.e@vendor.example' 'msg-auth-d3'), 'C QUIT', 'S 221 bye', '-Local')
+                $lines += AuthSession $fe '08DA000000000D06' 44.4 $feLocal '10.2.1.4:50206' @((AuthHello 'failed.contoso.test'), (AuthLogin '' -Fail), (AuthTx 'sender.f@vendor.example' 'msg-auth-d3b'), 'C QUIT', 'S 221 bye', '-Local')
+                $lines += AuthSession $fe '08DA000000000D07' 45 $feLocal '10.2.1.5:50207' @(
+                    (AuthHello 'snapshot.contoso.test'), (AuthLogin 'snap.one@contoso.test'), (AuthTx 'sender.g@vendor.example' 'msg-auth-s1'), 'C RSET', 'S 250 2.0.0 Resetting', (AuthTx 'sender.g@vendor.example' 'msg-auth-s2'),
+                    'C STARTTLS', 'S 220 2.0.0 SMTP server ready', 'E |TLS protocol SP_PROT_TLS1_2_SERVER negotiation succeeded using bulk encryption algorithm CALG_AES_256', 'C EHLO snapshot.contoso.test', 'S 250 EXCH01.contoso.test Hello',
+                    (AuthTx 'sender.g@vendor.example' 'msg-auth-s3'), (AuthLogin 'snap.two@contoso.test'), (AuthTx 'sender.g@vendor.example' 'msg-auth-s4'), 'C QUIT', 'S 221 bye', '-Local')
+                $lines += AuthSession $fe '08DA000000000D08' 45.5 $feLocal '10.2.1.6:50208' @((AuthHello 'machine.contoso.test'), 'C AUTH NTLM', 'E MACHINE01$|authenticated', 'S 235 2.7.0 Authentication successful', (AuthTx 'sender.h@vendor.example' 'msg-auth-d5'), 'C QUIT', 'S 221 bye', '-Local')
+                $lines += AuthSession $fe '08DA000000000D09' 46 $feLocal '10.2.1.7:50209' @((AuthHello 'gap.contoso.test'), (AuthLogin 'gap.user@contoso.test'), 'GAP', (AuthTx 'sender.i@vendor.example' 'msg-auth-d7'), 'C QUIT', 'S 221 bye', '-Local')
+                $long = @(AuthHello 'long.contoso.test'; AuthLogin 'long.user@contoso.test')
+                foreach ($i in 1..600) { $long += AuthTx 'bulk@vendor.example' ('msg-auth-long-{0:000}' -f $i) }
+                $lines += AuthSession $fe '08DA000000000D10' 47 $feLocal '10.2.1.9:50210' @($long, 'C QUIT', 'S 221 bye', '-Local')
+                Write-Log (Join-Path $Root ('EXCH01\Exchange\' + ($recv -f 'FrontEnd'))) $lines
+            }
+            if ($Part -ne 'FE') {
+                $lines = @($header)
+                $lines += AuthSession $cp '08DA00000000B001' 40.1 $beLocal '10.0.0.1:41701' @(AuthBack '08DA0000000000A1' '10.2.0.1' 50101 'thunderbird.contoso.test' 'newsletter@vendor.example' 'msg-auth-b1')
+                $lines += AuthSession $cp '08DA00000000B002' 40.3 $beLocal '10.0.0.1:41702' @(AuthBack '08DA0000000000FF' '10.2.0.9' 50109 'unknown.contoso.test' 'sender.j@vendor.example' 'msg-auth-b2')
+                $lines += AuthSession $cp '08DA00000000B003' 40.5 $beLocal '10.0.0.1:41703' @(AuthBack '08DA0000000000A1' '10.9.9.9' 50101 'thunderbird.contoso.test' 'sender.k@vendor.example' 'msg-auth-b3')
+                $lines += AuthSession $cp '08DA00000000B004' 41.55 $beLocal '10.0.0.1:41704' @(AuthBack '08DA0000000000A3' '10.2.0.3' 50103 'amb.contoso.test' 'sender.l@vendor.example' 'msg-auth-b4')
+                $lines += AuthSession $cp '08DA00000000B005' 42.1 $beLocal '10.0.0.1:41705' @(AuthBack '08DA0000000000A4' '10.2.0.4' 50104 'machine.contoso.test' 'sender.m@vendor.example' 'msg-auth-b5')
+                $lines += AuthSession $cp '08DA00000000B006' 42.3 $beLocal '10.0.0.1:41706' @(AuthBack '08DA0000000000A1' '10.2.0.1' 50101 'thunderbird.contoso.test' 'sender.n@vendor.example' 'msg-auth-b6' -Reject)
+                Write-Log (Join-Path $Root ('EXCH01\Exchange\' + ($recv -f 'Hub'))) $lines
+                $trkFields = '#Fields: date-time,client-ip,client-hostname,server-ip,server-hostname,source-context,connector-id,source,event-id,internal-message-id,message-id,network-message-id,recipient-address,recipient-status,total-bytes,recipient-count,related-recipient-address,reference,message-subject,sender-address,return-path,message-info,directionality,tenant-id,original-client-ip,original-server-ip,custom-data,transport-traffic-type,log-id,schema-version'
+                $trk = { param($min, $id, $connector, $sender) "$(T $min),10.2.0.1,thunderbird.contoso.test,10.0.0.2,,08DA000000000001;$(T $min);0,$connector,SMTP,RECEIVE,2001,<$id@contoso.test>,net-$id,bob@contoso.test,,2048,1,,,Authenticated submission,$sender,$sender,,Originating,,,,,Email,$([guid]::NewGuid()),15.02.2562.045" }
+                Write-Log (Join-Path $Root 'EXCH01\Exchange\TransportRoles\Logs\MessageTracking\MSGTRK2026100109-1.LOG') @(
+                    '#Software: Microsoft Exchange Server', '#Version: 15.02.2562.045', '#Log-type: Message Tracking Log', "#Date: $(T 0)", $trkFields
+                    (& $trk 40.1 'msg-auth-b1' 'EXCH01\Client Proxy EXCH01' 'newsletter@vendor.example')
+                    (& $trk 43 'msg-auth-d1' 'EXCH01\Client Frontend EXCH01' 'sender.a@vendor.example'))
+            }
+        }
+        function AuthTable($Settings, [string]$Like = '<msg-auth-%') {
+            $table = [ordered]@{}
+            foreach ($r in (Query $Settings "SELECT message_id, COALESCE(auth_user,''), COALESCE(auth_mechanism,''), COALESCE(auth_result,'-'), COALESCE(auth_attempt_result,'-'), COALESCE(auth_source,'-') FROM smtp_transaction WHERE message_id LIKE '$Like' ORDER BY message_id")) {
+                $table[[string]$r[0]] = (@($r[1], $r[2], $r[3], $r[4], $r[5]) -join '|')
+            }
+            return $table
+        }
+        function AuthJson($Settings) { ConvertTo-Json -InputObject (AuthTable $Settings) -Compress }
+        function HtmlSets([string]$Path) {
+            $sets = @{}
+            foreach ($match in [regex]::Matches([IO.File]::ReadAllText($Path), '<script type="application/x-exl-chunk">([^<]+)</script>')) {
+                $ms = [IO.MemoryStream]::new([Convert]::FromBase64String($match.Groups[1].Value), $false)
+                $gz = [IO.Compression.GZipStream]::new($ms, [IO.Compression.CompressionMode]::Decompress)
+                $reader = [IO.StreamReader]::new($gz)
+                try { $chunk = $reader.ReadToEnd() | ConvertFrom-Json -Depth 50 } finally { $reader.Dispose(); $gz.Dispose(); $ms.Dispose() }
+                if (-not $sets.ContainsKey($chunk.set)) { $sets[$chunk.set] = [Collections.Generic.List[object]]::new() }
+                foreach ($row in $chunk.rows) { $sets[$chunk.set].Add($row) }
+            }
+            return $sets
+        }
+        function AuthCsv($Report, [string]$Name) { Import-Csv -LiteralPath (Join-Path $Report.Folder "ExchangeLogs-$Name.csv") -Delimiter ';' }
+        function AuthReport($Settings) {
+            $store = Open-ExlStore -Settings $Settings -ReadOnly
+            try { New-ExlReport -Store $store -Settings $Settings -Period ([pscustomobject]@{ StartMs = $script:Base.AddHours(-1).ToUnixTimeMilliseconds(); EndMs = $script:Base.AddHours(2).ToUnixTimeMilliseconds() }) -ReportType Detailed }
+            finally { $store.Dispose() }
+        }
+
+        $script:AuthExpected = [ordered]@{
+            '<msg-auth-b1@contoso.test>'   = 'proxy.user@contoso.test|LOGIN|Succeeded|Succeeded|FrontEndProxy'
+            '<msg-auth-b2@contoso.test>'   = '||Unknown|Unknown|Missing'
+            '<msg-auth-b3@contoso.test>'   = '||Unknown|Unknown|Missing'
+            '<msg-auth-b4@contoso.test>'   = '||Unknown|Unknown|Ambiguous'
+            '<msg-auth-b5@contoso.test>'   = '||Unknown|Unknown|Missing'
+            '<msg-auth-b6@contoso.test>'   = '||Unknown|Unknown|Missing'
+            '<msg-auth-d1@contoso.test>'   = 'direct.user@contoso.test|PLAIN|Succeeded|Succeeded|Direct'
+            '<msg-auth-d1b@contoso.test>'  = 'contoso\other.user|LOGIN|Succeeded|Succeeded|Direct'
+            '<msg-auth-d1c@contoso.test>'  = '||Not attempted|Not attempted|NotApplicable'
+            '<msg-auth-d2@contoso.test>'   = '|LOGIN|Succeeded|Succeeded|Missing'
+            '<msg-auth-d3@contoso.test>'   = 'retry.user@contoso.test|PLAIN|Succeeded|Succeeded|Direct'
+            '<msg-auth-d3b@contoso.test>'  = '|LOGIN|Failed|Failed|NotApplicable'
+            '<msg-auth-d5@contoso.test>'   = '|NTLM|Succeeded|Succeeded|NotApplicable'
+            '<msg-auth-d7@contoso.test>'   = '||Unknown|Unknown|Missing'
+            '<msg-auth-s1@contoso.test>'   = 'snap.one@contoso.test|LOGIN|Succeeded|Succeeded|Direct'
+            '<msg-auth-s2@contoso.test>'   = 'snap.one@contoso.test|LOGIN|Succeeded|Succeeded|Direct'
+            '<msg-auth-s3@contoso.test>'   = '||Not attempted|Not attempted|NotApplicable'
+            '<msg-auth-s4@contoso.test>'   = 'snap.two@contoso.test|LOGIN|Succeeded|Succeeded|Direct'
+        }
+
+        $script:AuthDir = Join-Path $TestDrive 'smtp-auth'
+        $script:AuthConfig = New-TestConfig $script:AuthDir
+        New-AuthLogs (Join-Path $script:AuthDir 'logs-src') 'All'
+        $script:AuthSettings = Import-ExlConfiguration -Path $script:AuthConfig -Root $script:Root
+        $script:AuthRun = Invoke-TestCollection $script:AuthSettings
+        $script:AuthBaseline = AuthTable $script:AuthSettings
+    }
+    It 'shows the account proved by the front end for the proxied submission, apart from the sender' {
+        $script:AuthBaseline['<msg-auth-b1@contoso.test>'] | Should -Be $script:AuthExpected['<msg-auth-b1@contoso.test>']
+        (Query $script:AuthSettings "SELECT mail_from, auth_user FROM smtp_transaction WHERE message_id = '<msg-auth-b1@contoso.test>'")[0] -join '|' | Should -Be 'newsletter@vendor.example|proxy.user@contoso.test'
+        (Query $script:AuthSettings "SELECT COUNT(*) FROM smtp_auth_fragment WHERE role = 'FrontEnd' AND session_id = '08DA0000000000A1'")[0][0] | Should -Be 1
+        (Query $script:AuthSettings "SELECT COUNT(*) FROM smtp_transaction WHERE session_id = '08DA0000000000A1'")[0][0] | Should -Be 0
+    }
+    It 'reads the identity of direct sessions per authentication attempt and keeps failed and missing proofs apart' {
+        foreach ($id in 'd1', 'd1b', 'd1c', 'd2', 'd3', 'd3b', 'd5') {
+            $key = "<msg-auth-$id@contoso.test>"
+            $script:AuthBaseline[$key] | Should -Be $script:AuthExpected[$key] -Because $key
+        }
+    }
+    It 'evaluates the state of every MAIL: RSET keeps the account, STARTTLS resets it, a second login is a new proof' {
+        foreach ($id in 's1', 's2', 's3', 's4') {
+            $key = "<msg-auth-$id@contoso.test>"
+            $script:AuthBaseline[$key] | Should -Be $script:AuthExpected[$key] -Because $key
+        }
+    }
+    It 'never takes the technical identity, a machine account or an unproved front end for a user' {
+        foreach ($id in 'b2', 'b5', 'b6', 'd5') {
+            $key = "<msg-auth-$id@contoso.test>"
+            $script:AuthBaseline[$key] | Should -Be $script:AuthExpected[$key] -Because $key
+        }
+        (Query $script:AuthSettings "SELECT COUNT(*) FROM smtp_transaction WHERE auth_user LIKE '[[]%' OR auth_user LIKE '%$' OR auth_user LIKE '%unrecognized%' OR auth_user = 'machine01$'")[0][0] | Should -Be 0
+    }
+    It 'refuses ambiguous or spoofed front-end evidence instead of choosing the first, the last or the closest' {
+        $script:AuthBaseline['<msg-auth-b4@contoso.test>'] | Should -Be $script:AuthExpected['<msg-auth-b4@contoso.test>']
+        $script:AuthBaseline['<msg-auth-b3@contoso.test>'] | Should -Be $script:AuthExpected['<msg-auth-b3@contoso.test>']
+        $script:AuthBaseline['<msg-auth-b6@contoso.test>'] | Should -Be $script:AuthExpected['<msg-auth-b6@contoso.test>']
+    }
+    It 'does not prove an account across a gap of sequence numbers' {
+        $script:AuthBaseline['<msg-auth-d7@contoso.test>'] | Should -Be $script:AuthExpected['<msg-auth-d7@contoso.test>']
+    }
+    It 'splits a long session into compact chunks and maps every transaction to its own proof' {
+        (Query $script:AuthSettings "SELECT COUNT(*) FROM smtp_auth_fragment WHERE session_id = '08DA000000000D10'")[0][0] | Should -Be 3
+        (Query $script:AuthSettings "SELECT MAX(length(observations)) FROM smtp_auth_fragment")[0][0] | Should -BeLessThan 20000
+        (Query $script:AuthSettings "SELECT COUNT(*) FROM smtp_transaction WHERE message_id LIKE '<msg-auth-long-%' AND auth_user = 'long.user@contoso.test' AND auth_source = 'Direct' AND auth_mechanism = 'LOGIN'")[0][0] | Should -Be 600
+        (Query $script:AuthSettings "SELECT COUNT(DISTINCT auth_sequence) FROM smtp_transaction WHERE message_id LIKE '<msg-auth-long-%'")[0][0] | Should -Be 600
+    }
+    It 'removes the AUTH payloads, challenges and tokens before storing the evidence' {
+        $text = (Query $script:AuthSettings "SELECT group_concat(observations || coalesce(coverage, '') || coalesce(proxy_helo, '')) FROM smtp_auth_fragment")[0][0]
+        foreach ($secret in $script:Secrets.Values + (B64 $script:Secrets.User) + (B64 $script:Secrets.Password) + 'VXNlcm5hbWU6' + 'UGFzc3dvcmQ6') { $text | Should -Not -Match ([regex]::Escape($secret)) }
+        $text | Should -Not -Match 'unrecognized'
+    }
+    It 'gives the same proofs whatever the order of the files, the threads and the restarts' {
+        $one = AuthJson $script:AuthSettings
+        $one | Should -Be (ConvertTo-Json -InputObject $script:AuthBaseline -Compress)
+        # Nothing new to read: the collector restarts without touching the proofs.
+        (Invoke-TestCollection $script:AuthSettings).Lines | Should -Be 0
+        AuthJson $script:AuthSettings | Should -Be $one
+        $fragments = (Query $script:AuthSettings 'SELECT COUNT(*) FROM smtp_auth_fragment')[0][0]
+        foreach ($order in 'Hub,FE', 'FE,Hub') {
+            $dir = Join-Path $TestDrive ('smtp-auth-' + $order.Replace(',', '-'))
+            $s = Import-ExlConfiguration -Path (New-TestConfig $dir) -Root $script:Root
+            foreach ($part in $order.Split(',')) { New-AuthLogs (Join-Path $dir 'logs-src') $part; [void](Invoke-TestCollection $s) }
+            AuthJson $s | Should -Be $one -Because $order
+            (Query $s 'SELECT COUNT(*) FROM smtp_auth_fragment')[0][0] | Should -Be $fragments -Because $order
+        }
+        $dir = Join-Path $TestDrive 'smtp-auth-parallel'
+        $s = Import-ExlConfiguration -Path (New-TestConfig $dir @{ 'Parallelism            = 0' = 'Parallelism            = 6'; 'MaxFilesPerServer      = 4' = 'MaxFilesPerServer      = 1' }) -Root $script:Root
+        New-AuthLogs (Join-Path $dir 'logs-src') 'All'
+        $guard = 0
+        do { $r = Invoke-TestCollection $s; $guard++ } while ($r.Lines -gt 0 -and $guard -lt 60)
+        AuthJson $s | Should -Be $one -Because 'six threads, one file per run'
+    }
+    It 'keeps the old transactions as "not available" when a version 5 database is opened, without reading the logs again' {
+        $dir = Join-Path $TestDrive 'smtp-auth-v5'
+        $s = Import-ExlConfiguration -Path (New-TestConfig $dir) -Root $script:Root
+        New-AuthLogs (Join-Path $dir 'logs-src') 'All'
+        [void](Invoke-TestCollection $s)
+        $rows = (Query $s 'SELECT id, time_ms, server, role, session_id, message_id, status, mail_from FROM smtp_transaction ORDER BY id') | ForEach-Object { $_ -join '|' }
+        $offsets = (Query $s 'SELECT path, offset, size FROM source_file ORDER BY path') | ForEach-Object { $_ -join '|' }
+        $store = Open-ExlStore -Settings $s
+        try {
+            $store.Exec('DROP INDEX ix_smtp_auth_fragment; DROP INDEX ix_smtp_auth_evidence; DROP INDEX ix_smtp_auth_fragment_page; DROP INDEX ix_smtp_auth_scope; DROP TABLE smtp_auth_fragment;')
+            foreach ($column in 'auth_user', 'auth_mechanism', 'auth_result', 'auth_attempt_result', 'auth_source', 'auth_fragment_id', 'auth_sequence', 'auth_evidence_id') { $store.Exec("ALTER TABLE smtp_transaction DROP COLUMN $column;") }
+            $store.Exec("UPDATE metadata SET value = '5' WHERE key = 'schema_version';")
+        } finally { $store.Dispose() }
+        (Invoke-TestCollection $s).Lines | Should -Be 0
+        (Query $s "SELECT value FROM metadata WHERE key = 'schema_version'")[0][0] | Should -Be '6'
+        [ExchangeLogReport.Store]::SchemaVersion | Should -Be '6'
+        @((Query $s "SELECT name FROM pragma_table_info('smtp_transaction') WHERE name LIKE 'auth_%' ORDER BY name") | ForEach-Object { $_[0] }) |
+            Should -Be @('auth_attempt_result', 'auth_evidence_id', 'auth_fragment_id', 'auth_mechanism', 'auth_result', 'auth_sequence', 'auth_source', 'auth_user')
+        @((Query $s "SELECT name FROM sqlite_master WHERE type = 'index' AND name LIKE 'ix_%auth%' ORDER BY name") | ForEach-Object { $_[0] }) |
+            Should -Be @('ix_authfrag_candidate_scope', 'ix_authfrag_candidates', 'ix_authfrag_last', 'ix_authfrag_origin_page', 'ix_authfrag_proxy_page', 'ix_authfrag_proxy_replay', 'ix_authfrag_replay', 'ix_smtp_auth_evidence', 'ix_smtp_auth_fragment', 'ix_smtp_auth_fragment_page', 'ix_smtp_auth_scope')
+        @((Query $s "SELECT name FROM sqlite_master WHERE type = 'index' AND name = 'ux_authfrag_origin'") | ForEach-Object { $_[0] }) | Should -Be @('ux_authfrag_origin')
+        (Query $s 'SELECT COUNT(*) FROM smtp_auth_fragment')[0][0] | Should -Be 0
+        (Query $s 'SELECT COUNT(*) FROM smtp_transaction WHERE auth_source IS NOT NULL OR auth_user IS NOT NULL')[0][0] | Should -Be 0
+        (Query $s 'SELECT id, time_ms, server, role, session_id, message_id, status, mail_from FROM smtp_transaction ORDER BY id') | ForEach-Object { $_ -join '|' } | Should -Be $rows
+        (Query $s 'SELECT path, offset, size FROM source_file ORDER BY path') | ForEach-Object { $_ -join '|' } | Should -Be $offsets
+        $report = AuthReport $s
+        $row = @(AuthCsv $report 'SmtpSessions') | Where-Object 'Message ID' -EQ '<msg-auth-b1@contoso.test>'
+        @($row.'Authenticated user', $row.'Identity evidence', $row.'Authentication result') | Should -Be @('Not available', 'Legacy', 'Unknown')
+    }
+    It 'keeps the account along the transaction after the transcript expires and while a front-end proof is still used' {
+        $dir = Join-Path $TestDrive 'smtp-auth-retention'
+        $s = Import-ExlConfiguration -Path (New-TestConfig $dir) -Root $script:Root
+        New-AuthLogs (Join-Path $dir 'logs-src') 'All'
+        [void](Invoke-TestCollection $s)
+        $before = AuthJson $s
+        $day = 86400000
+        $store = Open-ExlStore -Settings $s
+        try {
+            $store.Exec("UPDATE smtp_transaction SET time_ms = time_ms - 20 * $day, end_ms = end_ms - 20 * $day; UPDATE smtp_auth_fragment SET first_ms = first_ms - 20 * $day, last_ms = last_ms - 20 * $day;")
+            $p = Invoke-ExlRetention -Store $store -Settings $s
+            $p.Transcripts | Should -BeGreaterThan 0
+            $p.AuthFragments | Should -Be 0
+        } finally { $store.Dispose() }
+        (Query $s 'SELECT COUNT(*) FROM smtp_transaction WHERE transcript IS NOT NULL')[0][0] | Should -Be 0
+        AuthJson $s | Should -Be $before
+        $store = Open-ExlStore -Settings $s
+        try {
+            $store.Exec("UPDATE smtp_auth_fragment SET first_ms = first_ms - 70 * $day, last_ms = last_ms - 70 * $day WHERE role = 'FrontEnd';")
+            [void](Invoke-ExlRetention -Store $store -Settings $s)
+        } finally { $store.Dispose() }
+        (Query $s "SELECT COUNT(*) FROM smtp_auth_fragment WHERE session_id = '08DA0000000000A1'")[0][0] | Should -Be 1
+        AuthJson $s | Should -Be $before
+        $store = Open-ExlStore -Settings $s
+        try {
+            $store.Exec("UPDATE smtp_transaction SET time_ms = time_ms - 70 * $day, end_ms = end_ms - 70 * $day; UPDATE smtp_auth_fragment SET first_ms = first_ms - 70 * $day, last_ms = last_ms - 70 * $day;")
+            $p = Invoke-ExlRetention -Store $store -Settings $s
+            $p.AuthFragments | Should -BeGreaterThan 0
+        } finally { $store.Dispose() }
+        (Query $s 'SELECT COUNT(*) FROM smtp_auth_fragment')[0][0] | Should -Be 0
+    }
+    It 'answers the evidence queries through their indexes' {
+        function Plan([string]$Sql) { (@((Query $script:AuthSettings "EXPLAIN QUERY PLAN $Sql") | ForEach-Object { $_[3] })) -join ' ' }
+        $origins = Plan "SELECT COALESCE(source_key,''), first_offset, COALESCE(origin_first_ms,first_ms), MIN(first_ms), MAX(last_ms), COUNT(*) FROM smtp_auth_fragment WHERE server='EXCH01' AND role='Hub' AND direction='Receive' AND session_id='x' AND (COALESCE(origin_first_ms,first_ms),COALESCE(source_key,''),first_offset)>(0,'',0) GROUP BY COALESCE(origin_first_ms,first_ms),COALESCE(source_key,''),first_offset ORDER BY 3,1,2 LIMIT 32"
+        $origins | Should -Match 'ix_authfrag_origin_page'
+        $origins | Should -Not -Match 'TEMP B-TREE|SCAN smtp_auth_fragment'
+        $parts = Plan "SELECT id FROM smtp_auth_fragment WHERE server='EXCH01' AND role='Hub' AND direction='Receive' AND session_id='x' AND COALESCE(source_key,'')='key' AND first_offset=0 AND COALESCE(origin_first_ms,first_ms)=0 AND id>0 ORDER BY id LIMIT 32"
+        $parts | Should -Match 'ix_authfrag_origin_page'
+        $parts | Should -Not -Match 'TEMP B-TREE|SCAN smtp_auth_fragment'
+        $candidates = Plan "SELECT server FROM smtp_auth_fragment WHERE session_id='x' AND role='FrontEnd' AND direction='Receive' AND first_ms<=1 AND last_ms>=0 AND server>'' GROUP BY server ORDER BY server LIMIT 32"
+        $candidates | Should -Match 'ix_authfrag_candidate_scope'
+        $candidates | Should -Not -Match 'TEMP B-TREE|SCAN smtp_auth_fragment'
+        $dependents = Plan "SELECT server,direction,role,session_id,id FROM smtp_auth_fragment WHERE proxy_sid='x' AND first_ms<=1 AND last_ms>=0 AND id>0 ORDER BY id LIMIT 128"
+        $dependents | Should -Match 'ix_authfrag_proxy_replay'
+        $dependents | Should -Not -Match 'TEMP B-TREE|SCAN smtp_auth_fragment'
+        Plan 'SELECT id, auth_sequence FROM smtp_transaction WHERE auth_fragment_id = 1' | Should -Match 'ix_smtp_auth_fragment'
+        Plan 'SELECT id FROM smtp_transaction WHERE auth_fragment_id = 1 AND auth_sequence > 3 ORDER BY auth_sequence, id LIMIT 32' | Should -Match 'ix_smtp_auth_fragment_page|ix_smtp_auth_fragment'
+        Plan "SELECT DISTINCT auth_fragment_id FROM smtp_transaction WHERE server = 'EXCH01' AND role = 'Hub' AND direction = 'Receive' AND session_id = 'x' AND auth_fragment_id IS NOT NULL" | Should -Match 'ix_smtp_auth_scope'
+        Plan 'SELECT id FROM smtp_transaction WHERE auth_evidence_id = 1' | Should -Match 'ix_smtp_auth_evidence'
+    }
+    It 'exposes the authenticated user, apart from the mechanism and the sender, in the SMTP client, session, message and popup views' {
+        $report = AuthReport $script:AuthSettings
+        $names = @((AuthCsv $report 'SmtpSessions')[0].PSObject.Properties.Name)
+        @($names[-5..-1]) | Should -Be @('Authentication mechanism', 'Authentication result', 'Last AUTH attempt', 'Authenticated user', 'Identity evidence')
+        $names | Should -Contain 'Authentication'
+        $sessions = @(AuthCsv $report 'SmtpSessions')
+        $b1 = $sessions | Where-Object 'Message ID' -EQ '<msg-auth-b1@contoso.test>'
+        @($b1.'Mail from', $b1.'Authenticated user', $b1.'Authentication mechanism', $b1.'Authentication result', $b1.'Last AUTH attempt', $b1.'Identity evidence') |
+            Should -Be @('newsletter@vendor.example', 'proxy.user@contoso.test', 'LOGIN', 'Succeeded', 'Succeeded', 'Front end proxy')
+        $b2 = $sessions | Where-Object 'Message ID' -EQ '<msg-auth-b2@contoso.test>'
+        @($b2.'Authenticated user', $b2.'Identity evidence') | Should -Be @('Not available', 'Missing')
+        (($sessions | Where-Object 'Message ID' -EQ '<msg-auth-d1c@contoso.test>').'Authentication mechanism') | Should -Be 'None'
+        (($sessions | Where-Object 'Message ID' -EQ '<msg-auth-b4@contoso.test>').'Identity evidence') | Should -Be 'Ambiguous'
+        (($sessions | Where-Object 'Message ID' -EQ '<msg-auth-d1@contoso.test>').'Identity evidence') | Should -Be 'Direct server log'
+        (($sessions | Where-Object 'Message ID' -EQ '<msg-auth-d1b@contoso.test>').'Authenticated user') | Should -Be 'contoso\other.user'
+        $client = @(AuthCsv $report 'SmtpClients') | Where-Object { $_.'Remote IP' -eq '10.2.1.1' -and $_.HELO -eq 'relay.contoso.test' }
+        $client.'Authenticated users' | Should -Be 'contoso\other.user, direct.user@contoso.test'
+        @($client.'Authentication mechanism', $client.'Authentication result', $client.'Identity evidence', $client.'Transactions without authenticated user') |
+            Should -Be @('LOGIN, None, PLAIN', 'Not attempted, Succeeded', 'Direct server log, Not applicable', '1')
+        $client.Authentication | Should -Not -Match 'direct.user'
+        $messages = @(AuthCsv $report 'Messages') | Where-Object 'Message ID' -EQ '<msg-auth-b1@contoso.test>'
+        $messages.Route | Should -Match 'Authenticated user proxy\.user@contoso\.test'
+        $messages.Route | Should -Match 'Identity evidence Front end proxy'
+        $messages.Route | Should -Match 'envelope sender newsletter@vendor\.example'
+        $html = HtmlSets $report.HtmlPath
+        $row = $html.smtpclients | Where-Object { $_[0] -eq '10.2.1.1' -and $_[1] -eq 'relay.contoso.test' }
+        @($row[17..22]) | Should -Be @('LOGIN, None, PLAIN', 'Not attempted, Succeeded', 'Not attempted, Succeeded', 'contoso\other.user, direct.user@contoso.test', 'Direct server log, Not applicable', 1)
+        $popup = @($row[16]) | Where-Object { $_[7] -eq '<msg-auth-d1@contoso.test>' }
+        $popup.Count | Should -Be 14
+        @($popup[9], $popup[10], $popup[11], $popup[12], $popup[13]) | Should -Be @('PLAIN', 'Succeeded', 'Succeeded', 'direct.user@contoso.test', 'Direct server log')
+        $template = Get-Content -LiteralPath (Join-Path $script:Root 'templates\Report.template.html') -Raw
+        $template | Should -Match 'Authentication mechanism", "Authentication result", "Last AUTH attempt", "Authenticated user", "Identity evidence"'
+        $template | Should -Match 'td2\.colSpan = headers\.length'
+    }
+    It 'never writes a password, a token or a challenge to the report, and cleans old transcripts when they are read' {
+        $dir = Join-Path $TestDrive 'smtp-auth-legacy'
+        $s = Import-ExlConfiguration -Path (New-TestConfig $dir) -Root $script:Root
+        New-AuthLogs (Join-Path $dir 'logs-src') 'All'
+        [void](Invoke-TestCollection $s)
+        $t = $script:Base.AddMinutes(50).ToUnixTimeMilliseconds()
+        $legacy = ("12:00:00.000 S: 220 legacy.example", "12:00:00.001 C: AUTH LOGIN", "12:00:00.002 S: 334 VXNlcm5hbWU6", "12:00:00.003 C: LEGACYUSERB64", "12:00:00.004 S: 334 UGFzc3dvcmQ6",
+            "12:00:00.005 C: LEGACYPASSB64", "12:00:00.006 S: 235 2.7.0 Authentication successful LEGACYSECRET", "12:00:00.007 C: MAIL FROM:<legacy@vendor.example>") -join "`n"
+        $store = Open-ExlStore -Settings $s
+        try {
+            $store.Exec("INSERT INTO smtp_transaction(time_ms,end_ms,server,direction,role,connector,session_id,remote_ep,helo,mail_from,rcpt_count,rcpts,message_id,status,response,transcript) VALUES($t,$t,'EXCH01','Receive','FrontEnd','legacy-connector','legacy-session','203.0.113.77:1234','legacy.example','legacy@vendor.example',1,'bob@contoso.test','<msg-legacy@contoso.test>','Accepted','250 queued','$legacy');")
+        } finally { $store.Dispose() }
+        $report = AuthReport $s
+        $everything = New-Object System.Text.StringBuilder
+        foreach ($file in Get-ChildItem -LiteralPath $report.Folder -Filter '*.csv') { [void]$everything.Append([IO.File]::ReadAllText($file.FullName)) }
+        $sets = HtmlSets $report.HtmlPath
+        foreach ($name in $sets.Keys) { [void]$everything.Append((ConvertTo-Json -InputObject @($sets[$name]) -Depth 50 -Compress)) }
+        $text = $everything.ToString()
+        foreach ($secret in $script:Secrets.Values + (B64 $script:Secrets.User) + (B64 $script:Secrets.Password) + 'VXNlcm5hbWU6' + 'UGFzc3dvcmQ6' + 'LEGACYUSERB64' + 'LEGACYPASSB64' + 'LEGACYSECRET') {
+            $text | Should -Not -Match ([regex]::Escape($secret)) -Because $secret
+        }
+        $transcript = (@(AuthCsv $report 'SmtpSessions') | Where-Object 'Message ID' -EQ '<msg-legacy@contoso.test>').Transcript
+        $transcript | Should -Match 'AUTH LOGIN'
+        $transcript | Should -Match '334 \[redacted\]'
+        $transcript | Should -Match '235 2\.7\.0 Authentication successful'
+        $own = (@(AuthCsv $report 'SmtpSessions') | Where-Object 'Message ID' -EQ '<msg-auth-b1@contoso.test>').Transcript
+        $own | Should -Match 'X-EXPS EXCHANGEAUTH \[redacted\]'
+        $own | Should -Match 'XPROXY SID=08DA0000000000A1'
+    }
+
+    Context 'same-host loopback handover' {
+        BeforeAll {
+            $dir = Join-Path $TestDrive 'smtp-auth-loopback'
+            $s = Import-ExlConfiguration -Path (New-TestConfig $dir) -Root $script:Root
+            $header = '#Software: Microsoft Exchange Server', '#Log-type: SMTP Receive Protocol Log', "#Date: $(T 0)",
+                '#Fields: date-time,connector-id,session-id,sequence-number,local-endpoint,remote-endpoint,event,data,context'
+            $paths = @{
+                FE = Join-Path $dir 'logs-src\EXCH01\Exchange\TransportRoles\Logs\FrontEnd\ProtocolLog\SmtpReceive\RECV2026100109-1.LOG'
+                Hub = Join-Path $dir 'logs-src\EXCH01\Exchange\TransportRoles\Logs\Hub\ProtocolLog\SmtpReceive\RECV2026100109-1.LOG'
+                Other = Join-Path $dir 'missing\EXCH02\TransportRoles\Logs\FrontEnd\ProtocolLog\SmtpReceive\RECV2026100109-1.LOG'
+                Mailbox = Join-Path $dir 'logs-src\EXCH01\Exchange\TransportRoles\Logs\Mailbox\ProtocolLog\SmtpReceive\RECV2026100109-1.LOG'
+            }
+            $lines = @{ FE = @($header); Hub = @($header); Other = @($header); Mailbox = @($header) }
+            $cases = [ordered]@{
+                ipv4 = @{}; ipv6 = @{ Local = '[::1]:587'; Remote = '[::1]:55000'; Ip = '::1' }
+                clientip = @{ Ip = '127.0.0.2' }; clientport = @{ Port = 55001 }
+                remote = @{ Remote = '10.3.0.1:55000'; Ip = '10.3.0.1' }
+                peer = @{ Peer = '10.0.0.2:44000' }; server = @{ Other = $true }
+                malformed = @{ Local = '[::1]junk:587' }; empty = @{ Local = '' }
+                wildcard = @{ Local = '0.0.0.0:587' }; hubwildcard = @{ HubLocal = '0.0.0.0:465'; Peer = '0.0.0.0:44000' }
+                portless = @{ Local = '127.0.0.1' }; mixed = @{ Local = '[::1]:587' }
+                role = @{ Mailbox = $true }; notechnical = @{ NoTechnical = $true }
+                refusedauth = @{ RefusedAuth = $true }; noproxyreply = @{ NoProxyReply = $true }
+                refusedproxy = @{ RefusedProxy = $true }; ambiguous = @{ Ambiguous = $true }
+            }
+            $feTimes = @(-80,-75,-70,-65,-60,-55,-50,-45,-40,-35,-30,-25,0,10,20,30,41,45,70,100,190,190,2759)
+            $hubTimes = @(100,110,120,121,125,130,135,140,141,145,149,150,157,158,159,160,180,190,192,194,196,198,200,202,204,2600,2601,2755,2758,2759)
+            function TimedLoopbackRows($Rows, [long[]]$Offsets, [DateTimeOffset]$Origin) {
+                for ($i = 0; $i -lt $Rows.Count; $i++) {
+                    $stamp = $Origin.AddMilliseconds($Offsets[$i]).UtcDateTime.ToString("yyyy-MM-dd'T'HH:mm:ss.fff'Z'", [Globalization.CultureInfo]::InvariantCulture)
+                    $stamp + $Rows[$i].Substring($Rows[$i].IndexOf(','))
+                }
+            }
+            $n = 0
+            foreach ($name in $cases.Keys) {
+                $n++; $c = $cases[$name]
+                $local = '127.0.0.1:587'; $remote = '127.0.0.1:55000'; $ip = '127.0.0.1'; $port = 55000
+                $hubLocal = '10.0.0.1:465'; $peer = '10.0.0.1:44000'
+                if ($c.ContainsKey('Local')) { $local = $c.Local }; if ($c.ContainsKey('Remote')) { $remote = $c.Remote }
+                if ($c.ContainsKey('Ip')) { $ip = $c.Ip }; if ($c.ContainsKey('Port')) { $port = $c.Port }
+                if ($c.ContainsKey('Peer')) { $peer = $c.Peer }; if ($c.ContainsKey('HubLocal')) { $hubLocal = $c.HubLocal }
+                $server = if ($c.Other) { 'EXCH02' } else { 'EXCH01' }
+                $sid = '08DA00000000FA{0:00}' -f $n; $beSid = '08DA00000000BA{0:00}' -f $n
+                $origin = $script:Base.AddMinutes(80 + $n)
+                $front = @(
+                    (AuthHello 'loop.contoso.test'), 'C STARTTLS', 'S 220 Ready', 'E |TLS protocol SP_PROT_TLS1_2_SERVER negotiation succeeded'
+                    'C EHLO loop.contoso.test', 'S 250 Hello', 'S 250 AUTH LOGIN', 'C NOOP', 'S 250 OK'
+                    'C AUTH LOGIN', 'S 334 VXNlcm5hbWU6', "C $(B64 $script:Secrets.User)", 'S 334 UGFzc3dvcmQ6'
+                    'E loop.user@contoso.test|authenticated', "C $(B64 $script:Secrets.Password)"
+                    'E |Inbound session annotation', 'E |Inbound proxy annotation'
+                    'E |Proxy session was successfully set up. Session for loop.user@contoso.test will now be proxied'
+                    'S 235 2.7.0 Authentication successful', '-Local'
+                )
+                $rows = @(AuthSession "$server\Client Frontend $server" $sid 80 $local $remote $front)
+                $rows.Count | Should -Be 23
+                $key = if ($c.Other) { 'Other' } else { 'FE' }
+                $lines[$key] += TimedLoopbackRows $rows $feTimes $origin
+                if ($c.Ambiguous) { $lines[$key] += TimedLoopbackRows $rows $feTimes ($origin.AddMilliseconds(1)) }
+                $authCommand = if ($c.NoTechnical) { 'C NOOP' } else { "C X-EXPS EXCHANGEAUTH $($script:Secrets.Blob)" }
+                $authReply = if ($c.RefusedAuth) { 'S 535 Authentication refused' } elseif ($c.NoTechnical) { 'S 250 OK' } else { 'S 235 2.7.0 Authentication successful' }
+                $proxyReply = if ($c.NoProxyReply) { 'E |No proxy reply' } elseif ($c.RefusedProxy) { 'S 550 Proxy refused' } else { 'S 250 XPROXY OK' }
+                $back = @(
+                    (AuthHello "$server.contoso.test"), 'C STARTTLS', 'S 220 Ready', 'E |TLS protocol SP_PROT_TLS1_2_SERVER negotiation succeeded'
+                    "C EHLO $server.contoso.test", 'S 250 Hello', 'S 250 X-EXPS EXCHANGEAUTH'
+                    $authCommand, 'S 334 challenge', 'E [unrecognized]|authenticated', $authReply
+                    "C XPROXY SID=$sid IP=$ip PORT=$port DOMAIN=loop.contoso.test CAPABILITIES=0"
+                    'E |Inbound proxy annotation', 'E |Inbound proxy annotation', $proxyReply
+                    'C MAIL FROM:<sender@vendor.example>', 'S 250 Sender OK', 'C RCPT TO:<bob@contoso.test>', 'S 250 Recipient OK'
+                    'C DATA', 'S 354 Start mail input', 'E |Inbound message annotation'
+                    "S 250 2.6.0 <loop-$name@contoso.test> [InternalId=9001, Hostname=EXCH01.contoso.test] Queued mail for delivery"
+                    'E |Inbound message annotation', 'C QUIT', 'S 221 bye', '-Local'
+                )
+                $rows = @(AuthSession 'EXCH01\Client Proxy EXCH01' $beSid 80 $hubLocal $peer $back)
+                $rows.Count | Should -Be 30
+                $key = if ($c.Mailbox) { 'Mailbox' } else { 'Hub' }
+                $lines[$key] += TimedLoopbackRows $rows $hubTimes $origin
+            }
+            foreach ($key in $paths.Keys) { Write-Log $paths[$key] $lines[$key] }
+            [void](Invoke-TestCollection $s)
+            $script:LoopbackTable = AuthTable $s '<loop-%'
+            $script:LoopbackCases = $cases
+        }
+        It 'correlates real-shaped IPv4 and IPv6 loopback clients through the same physical host at 192ms' {
+            foreach ($name in 'ipv4', 'ipv6') {
+                $script:LoopbackTable["<loop-$name@contoso.test>"] | Should -Be 'loop.user@contoso.test|LOGIN|Succeeded|Succeeded|FrontEndProxy' -Because $name
+            }
+        }
+        It 'rejects incompatible endpoints, source servers, roles and unowned or refused handshakes' {
+            foreach ($name in $script:LoopbackCases.Keys | Where-Object { $_ -notin 'ipv4', 'ipv6', 'ambiguous' }) {
+                $script:LoopbackTable.Contains("<loop-$name@contoso.test>") | Should -BeTrue -Because $name
+                $script:LoopbackTable["<loop-$name@contoso.test>"] | Should -Not -Match 'loop.user@contoso.test' -Because $name
+            }
+        }
+        It 'does not select either of two compatible front-end epochs sharing a SID' {
+            $script:LoopbackTable['<loop-ambiguous@contoso.test>'] | Should -Be '||Unknown|Unknown|Ambiguous'
+        }
+    }
+
+    # Review corrections: continuity of the front-end proof, barrier after the 235, long connections, mechanism of a failed attempt.
+    Context 'review corrections' {
+        BeforeAll {
+            $memoryTelemetrySource = @'
+public sealed class SmtpMemoryTelemetry {
+    public long AllocatedBase, AllocatedEndBeforeEndCollection, Collection0Base, Collection1Base, Collection2Base;
+    public long Collection0EndBeforeEndCollection, Collection1EndBeforeEndCollection, Collection2EndBeforeEndCollection;
+    public long StartTimestamp, EndTimestamp, PeakTimestamp, PeakObservedManagedBytes, PeakObservationCount;
+    public long Collection0AtPeak, Collection1AtPeak, Collection2AtPeak;
+    public long LastGcIndexAtPeak, LastGcGenerationAtPeak, LastGcHeapBytesAtPeak, LastGcFragmentedBytesAtPeak;
+    public long LastGcCommittedBytesAtPeak, AvailableMemoryBytesAtPeak, LastGcMemoryLoadBytesAtPeak;
+    public long LastGcGen0BeforeBytesAtPeak, LastGcGen0AfterBytesAtPeak;
+    public long LastGcGen1BeforeBytesAtPeak, LastGcGen1AfterBytesAtPeak;
+    public long LastGcGen2BeforeBytesAtPeak, LastGcGen2AfterBytesAtPeak;
+    public long ObserverAllocatedBytes, ObserverTicks;
+    public int StartLatencyMode, PeakLatencyMode;
+    public readonly string PeakInfoMeaning = "Last completed GC observed at a new sampled peak; not instantaneous live size or GC budget";
+    public void Start() {
+        AllocatedBase = GC.GetTotalAllocatedBytes(false);
+        Collection0Base = GC.CollectionCount(0); Collection1Base = GC.CollectionCount(1); Collection2Base = GC.CollectionCount(2);
+        StartLatencyMode = (int)System.Runtime.GCSettings.LatencyMode;
+        StartTimestamp = Stopwatch.GetTimestamp();
+    }
+    public void RecordPeak(long managed) {
+        long allocated = GC.GetAllocatedBytesForCurrentThread(), start = Stopwatch.GetTimestamp();
+        PeakObservedManagedBytes = managed; PeakTimestamp = start; PeakObservationCount++;
+        Collection0AtPeak = GC.CollectionCount(0); Collection1AtPeak = GC.CollectionCount(1); Collection2AtPeak = GC.CollectionCount(2);
+        PeakLatencyMode = (int)System.Runtime.GCSettings.LatencyMode;
+        // This snapshot describes the last completed GC, which can precede the sampled peak.
+        var info = GC.GetGCMemoryInfo();
+        LastGcIndexAtPeak = info.Index; LastGcGenerationAtPeak = info.Generation;
+        LastGcHeapBytesAtPeak = info.HeapSizeBytes; LastGcFragmentedBytesAtPeak = info.FragmentedBytes;
+        LastGcCommittedBytesAtPeak = info.TotalCommittedBytes; AvailableMemoryBytesAtPeak = info.TotalAvailableMemoryBytes;
+        LastGcMemoryLoadBytesAtPeak = info.MemoryLoadBytes;
+        LastGcGen0BeforeBytesAtPeak = info.GenerationInfo[0].SizeBeforeBytes; LastGcGen0AfterBytesAtPeak = info.GenerationInfo[0].SizeAfterBytes;
+        LastGcGen1BeforeBytesAtPeak = info.GenerationInfo[1].SizeBeforeBytes; LastGcGen1AfterBytesAtPeak = info.GenerationInfo[1].SizeAfterBytes;
+        LastGcGen2BeforeBytesAtPeak = info.GenerationInfo[2].SizeBeforeBytes; LastGcGen2AfterBytesAtPeak = info.GenerationInfo[2].SizeAfterBytes;
+        ObserverAllocatedBytes += GC.GetAllocatedBytesForCurrentThread() - allocated;
+        ObserverTicks += Stopwatch.GetTimestamp() - start;
+    }
+    public void Finish() {
+        EndTimestamp = Stopwatch.GetTimestamp();
+        AllocatedEndBeforeEndCollection = GC.GetTotalAllocatedBytes(false);
+        Collection0EndBeforeEndCollection = GC.CollectionCount(0); Collection1EndBeforeEndCollection = GC.CollectionCount(1); Collection2EndBeforeEndCollection = GC.CollectionCount(2);
+    }
+    public static System.Collections.Generic.Dictionary<string, object> Runtime() {
+        var env = new System.Collections.Generic.Dictionary<string, string>();
+        foreach (var prefix in new[] { "DOTNET_", "COMPlus_" })
+            foreach (var suffix in new[] { "gcServer", "gcConcurrent", "GCHeapHardLimit", "GCHeapHardLimitPercent", "GCConserveMemory", "GCRetainVM", "GCHeapCount", "GCHeapAffinitizeMask", "GCNoAffinitize" }) {
+                string name = prefix + suffix, value = Environment.GetEnvironmentVariable(name);
+                if (value != null) env[name] = value;
+            }
+        string processors = Environment.GetEnvironmentVariable("DOTNET_PROCESSOR_COUNT");
+        if (processors != null) env["DOTNET_PROCESSOR_COUNT"] = processors;
+        return new System.Collections.Generic.Dictionary<string, object> {
+            { "framework", System.Runtime.InteropServices.RuntimeInformation.FrameworkDescription },
+            { "processorCount", Environment.ProcessorCount }, { "serverGc", System.Runtime.GCSettings.IsServerGC },
+            { "latencyMode", System.Runtime.GCSettings.LatencyMode.ToString() }, { "stopwatchFrequency", Stopwatch.Frequency },
+            { "gcEnvironment", env }
+        };
+    }
+}
+'@
+            function Assert-MemoryTelemetry($telemetry, $peak, $samples) {
+                ($telemetry.AllocatedEndBeforeEndCollection - $telemetry.AllocatedBase) | Should -BeGreaterOrEqual 0
+                foreach ($generation in 0,1,2) {
+                    ($telemetry."Collection${generation}EndBeforeEndCollection" - $telemetry."Collection${generation}Base") | Should -BeGreaterOrEqual 0
+                }
+                $telemetry.PeakObservationCount | Should -BeGreaterThan 0
+                $telemetry.PeakObservationCount | Should -BeLessOrEqual $samples
+                $telemetry.PeakObservedManagedBytes | Should -Be $peak
+                $telemetry.PeakTimestamp | Should -BeGreaterOrEqual $telemetry.StartTimestamp
+                $telemetry.EndTimestamp | Should -BeGreaterOrEqual $telemetry.PeakTimestamp
+                $telemetry.AvailableMemoryBytesAtPeak | Should -BeGreaterThan 0
+                $telemetry.ObserverAllocatedBytes | Should -BeGreaterOrEqual 0
+                $telemetry.ObserverTicks | Should -BeGreaterOrEqual 0
+            }
+            $u64 = B64 $script:Secrets.User; $p64 = B64 $script:Secrets.Password
+            $alice = 'alice@contoso.test'
+            $fe = 'EXCH01\Client Frontend EXCH01'; $feLocal = '10.0.0.1:587'; $cp = 'EXCH01\Client Proxy EXCH01'; $beLocal = '10.0.0.1:465'
+            $pre = @('C AUTH LOGIN', 'S 334 VXNlcm5hbWU6', "C $u64", 'S 334 UGFzc3dvcmQ6', "C $p64")
+            $ok = 'S 235 2.7.0 Authentication successful'; $bad = 'S 535 5.7.3 Authentication unsuccessful'
+            $id = { param($u) "E $u|authenticated" }
+            $px = { param($u) "E |Proxy session was successfully set up. Session for $u will now be proxied" }
+            $plain = "C AUTH PLAIN $(B64 "`0$($script:Secrets.User)`0$($script:Secrets.Password)")"
+            $smtp = '#Fields: date-time,connector-id,session-id,sequence-number,local-endpoint,remote-endpoint,event,data,context'
+            $header = '#Software: Microsoft Exchange Server', '#Log-type: SMTP Receive Protocol Log', "#Date: $(T 0)", $smtp
+            $recv = 'EXCH01\Exchange\TransportRoles\Logs\{0}\ProtocolLog\SmtpReceive\RECV2026100109-1.LOG'
+
+            # Proxied cases: the steps of the front end between the greeting and the end of the session.
+            $proxied = [ordered]@{
+                p1  = @{ Steps = @($pre, (& $id $alice), (& $px $alice), $ok); Expect = "$alice|LOGIN|Succeeded|Succeeded|FrontEndProxy" }
+                p2  = @{ Steps = @($pre, $ok, (& $id $alice), (& $px $alice)); Expect = "$alice|LOGIN|Succeeded|Succeeded|FrontEndProxy" }
+                p3  = @{ Steps = @($pre, (& $id $alice), (& $px $alice), 'GAP', $ok); Expect = '||Unknown|Unknown|Missing' }
+                p4  = @{ Steps = @($pre, $ok, 'GAP', (& $id $alice), (& $px $alice)); Expect = '||Unknown|Unknown|Missing' }
+                p5  = @{ Steps = @($pre, (& $id $alice), 'GAP', (& $px $alice), $ok); Expect = '||Unknown|Unknown|Missing' }
+                p6  = @{ Steps = @('C AUTH LOGIN', 'GAP', 'S 334 VXNlcm5hbWU6', "C $u64", 'S 334 UGFzc3dvcmQ6', "C $p64", (& $id $alice), (& $px $alice), $ok); Expect = '||Unknown|Unknown|Missing' }
+                p7  = @{ Steps = @('GAP', $pre, (& $id $alice), (& $px $alice), $ok); Expect = "$alice|LOGIN|Succeeded|Succeeded|FrontEndProxy" }
+                p8  = @{ Steps = @($pre, $ok, 'C NOOP', 'S 250 2.0.0 OK', (& $id $alice), (& $px $alice)); Expect = '||Unknown|Unknown|Missing' }
+                p9  = @{ Steps = @($pre, $ok, (& $id $alice), (& $px 'bob@contoso.test')); Expect = '||Unknown|Unknown|Ambiguous' }
+                p10 = @{ Steps = @($pre, (& $id $alice), (& $px $alice), $ok, $pre, $bad); Expect = '||Unknown|Unknown|Missing' }
+                p11 = @{ Steps = @($pre, (& $id $alice), (& $px $alice), $ok, 'C STARTTLS', 'S 220 2.0.0 SMTP server ready', 'E |TLS protocol SP_PROT_TLS1_2_SERVER negotiation succeeded using bulk encryption algorithm CALG_AES_256'); Expect = '||Unknown|Unknown|Missing' }
+                p12 = @{ Steps = @($pre, $bad, $pre, (& $id $alice), (& $px $alice), $ok); Expect = "$alice|LOGIN|Succeeded|Succeeded|FrontEndProxy" }
+            }
+            # Direct cases (server log of the session that received the submission).
+            $tx = { param($n) AuthTx "s-$n@vendor.example" "msg-reg-$n" }
+            $direct = [ordered]@{
+                g1  = @{ Steps = @($pre, $bad, (& $tx 'g1')); Expect = @{ g1 = '|LOGIN|Failed|Failed|NotApplicable' } }
+                g2  = @{ Steps = @($plain, $bad, (& $tx 'g2')); Expect = @{ g2 = '|PLAIN|Failed|Failed|NotApplicable' } }
+                g3  = @{ Steps = @($plain, (& $id $alice), $ok, 'C AUTH LOGIN', 'S 503 5.5.1 Already authenticated', (& $tx 'g3')); Expect = @{ g3 = "$alice|PLAIN|Succeeded|Failed|Direct" } }
+                g4  = @{ Steps = @($plain, (& $id $alice), $ok, $plain, $bad, (& $tx 'g4')); Expect = @{ g4 = '||Unknown|Failed|Ambiguous' } }
+                g5  = @{ Steps = @($pre, $bad, (& $tx 'g5a'), $pre, (& $id $alice), $ok, (& $tx 'g5b')); Expect = @{ g5a = '|LOGIN|Failed|Failed|NotApplicable'; g5b = "$alice|LOGIN|Succeeded|Succeeded|Direct" } }
+                g6  = @{ Steps = @($plain, $ok, 'C NOOP', 'S 250 2.0.0 OK', (& $id $alice), (& $tx 'g6')); Expect = @{ g6 = '|PLAIN|Succeeded|Succeeded|Missing' } }
+                g7  = @{ Steps = @($plain, $ok, (& $id $alice), (& $tx 'g7')); Expect = @{ g7 = "$alice|PLAIN|Succeeded|Succeeded|Direct" } }
+                g8  = @{ Steps = @($plain, $ok, (& $id $alice), (& $id 'bob@contoso.test'), (& $tx 'g8')); Expect = @{ g8 = '||Unknown|Succeeded|Ambiguous' } }
+            }
+
+            $script:RegDir = Join-Path $TestDrive 'smtp-auth-regression'
+            $script:RegSettings = Import-ExlConfiguration -Path (New-TestConfig $script:RegDir) -Root $script:Root
+            $feLines = @($header); $hubLines = @($header)
+            $n = 0
+            foreach ($name in $proxied.Keys) {
+                $n++
+                $sid = '08DA0000000F{0:0000}' -f $n; $ip = "10.3.0.$n"; $port = 50000 + $n; $helo = "r$n.contoso.test"
+                $feLines += AuthSession $fe $sid (60 + $n * 0.5) $feLocal "${ip}:$port" @((AuthHello $helo), $proxied[$name].Steps, '-Local')
+                $hubLines += AuthSession $cp ('08DA0000000E{0:0000}' -f $n) (60.1 + $n * 0.5) $beLocal "10.0.0.1:$(42000 + $n)" @(AuthBack $sid $ip $port $helo "sender-$name@vendor.example" "msg-reg-$name")
+            }
+            foreach ($name in $direct.Keys) {
+                $n++
+                $feLines += AuthSession $fe ('08DA0000000D{0:0000}' -f $n) (60 + $n * 0.5) $feLocal "10.3.1.${n}:51000" @((AuthHello "d$n.contoso.test"), $direct[$name].Steps, 'C QUIT', 'S 221 bye', '-Local')
+            }
+            Write-Log (Join-Path (Join-Path $script:RegDir 'logs-src') ($recv -f 'FrontEnd')) $feLines
+            Write-Log (Join-Path (Join-Path $script:RegDir 'logs-src') ($recv -f 'Hub')) $hubLines
+            [void](Invoke-TestCollection $script:RegSettings)
+            $script:RegTable = AuthTable $script:RegSettings '<msg-reg-%'
+            $script:RegProxied = $proxied; $script:RegDirect = $direct
+        }
+        It 'keeps a front-end proof only when the attempt is covered without a gap, and keeps the valid and retried proofs' {
+            foreach ($name in $script:RegProxied.Keys) {
+                $script:RegTable["<msg-reg-$name@contoso.test>"] | Should -Be $script:RegProxied[$name].Expect -Because $name
+            }
+        }
+        It 'does not attribute an identity written after a command that is not part of the authentication, and never takes the first of two conflicting annotations' {
+            foreach ($name in 'g6', 'g7', 'g8') {
+                foreach ($message in $script:RegDirect[$name].Expect.Keys) { $script:RegTable["<msg-reg-$message@contoso.test>"] | Should -Be $script:RegDirect[$name].Expect[$message] -Because $name }
+            }
+            $script:RegTable['<msg-reg-p8@contoso.test>'] | Should -Be '||Unknown|Unknown|Missing'
+            $script:RegTable['<msg-reg-p9@contoso.test>'] | Should -Be '||Unknown|Unknown|Ambiguous'
+        }
+        It 'keeps the mechanism of the attempt after a failure and after a refusal following a success' {
+            foreach ($name in 'g1', 'g2', 'g3', 'g4', 'g5') {
+                foreach ($message in $script:RegDirect[$name].Expect.Keys) { $script:RegTable["<msg-reg-$message@contoso.test>"] | Should -Be $script:RegDirect[$name].Expect[$message] -Because $name }
+            }
+            $report = AuthReport $script:RegSettings
+            $csv = @(AuthCsv $report 'SmtpSessions')
+            ($csv | Where-Object 'Message ID' -EQ '<msg-reg-g1@contoso.test>').'Authentication mechanism' | Should -Be 'LOGIN'
+            ($csv | Where-Object 'Message ID' -EQ '<msg-reg-g1@contoso.test>').'Authenticated user' | Should -Be 'Not available'
+            (Get-ChildItem -LiteralPath $report.Folder -Filter '*.csv' | ForEach-Object { [IO.File]::ReadAllText($_.FullName) }) -join '' | Should -Not -Match 'SENTINEL'
+        }
+        It 'binds Alice at the original handshake across commit and restart, while later Bob and explicit 503 only affect new handshakes' {
+            foreach ($change in 'Bob', '503') {
+                foreach ($order in 'FE,Hub', 'Hub,FE') {
+                    $dir = Join-Path $TestDrive "smtp-auth-history-$change-$($order.Replace(',', '-'))"
+                    $s = Import-ExlConfiguration -Path (New-TestConfig $dir) -Root $script:Root
+                    $sid = '08DA000000001A01'; $oldSid = '08DA000000001B01'; $newSid = '08DA000000001B02'
+                    $fePath = Join-Path (Join-Path $dir 'logs-src') ($recv -f 'FrontEnd')
+                    $hubPath = Join-Path (Join-Path $dir 'logs-src') ($recv -f 'Hub')
+                    $a = @(AuthSession $fe $sid 100 $feLocal '10.3.8.1:54000' @((AuthHello 'historical.contoso.test'), (AuthLogin $alice -Proxied)))
+                    $a += AuthSession $fe $sid 100.2 $feLocal '10.3.8.1:54000' @(AuthTx 'sender@vendor.example' 'hist-direct-a') -FirstSequence $a.Count
+                    $back = @(AuthBack $sid '10.3.8.1' 54000 'historical.contoso.test' 'sender@vendor.example' 'hist-old-a' | Select-Object -SkipLast 3)
+                    $b = @(AuthSession $cp $oldSid 100.1 $beLocal '10.0.0.1:44001' $back)
+                    foreach ($part in $order.Split(',')) {
+                        $path = if ($part -eq 'FE') { $fePath } else { $hubPath }
+                        $lines = if ($part -eq 'FE') { $a } else { $b }
+                        Write-Log $path @($header + $lines)
+                        [IO.File]::SetLastWriteTimeUtc($path, [DateTime]::UtcNow.AddHours(-1))
+                        [void](Invoke-TestCollection $s)
+                    }
+                    (AuthTable $s '<hist-%')['<hist-old-a@contoso.test>'] | Should -Be "$alice|LOGIN|Succeeded|Succeeded|FrontEndProxy"
+                    $changeSteps = if ($change -eq 'Bob') {
+                        @($plain, (& $id 'bob@contoso.test'), (& $px 'bob@contoso.test'), $ok)
+                    } else { @($plain, 'S 503 5.5.1 Already authenticated') }
+                    $more = @(AuthSession $fe $sid 101 $feLocal '10.3.8.1:54000' $changeSteps -FirstSequence $a.Count)
+                    $more += AuthSession $fe $sid 101.2 $feLocal '10.3.8.1:54000' @((AuthTx 'sender@vendor.example' 'hist-direct-b'), '-Local') -FirstSequence ($a.Count + $more.Count)
+                    $fe2 = $fePath.Replace('-1.LOG', '-2.LOG')
+                    Write-Log $fe2 @($header + $more)
+                    $hub2 = $hubPath.Replace('-1.LOG', '-2.LOG')
+                    $late = @(AuthSession $cp $oldSid 101.3 $beLocal '10.0.0.1:44001' @((AuthTx 'sender@vendor.example' 'hist-old-b'), '-Local') -FirstSequence $b.Count)
+                    $late += AuthSession $cp $newSid 101.1 $beLocal '10.0.0.1:44002' @(AuthBack $sid '10.3.8.1' 54000 'historical.contoso.test' 'sender@vendor.example' 'hist-new')
+                    Write-Log $hub2 @($header + $late)
+                    [void](Invoke-TestCollection $s)
+                    $table = AuthTable $s '<hist-%'
+                    foreach ($message in 'hist-old-a', 'hist-old-b') { $table["<$message@contoso.test>"] | Should -Be "$alice|LOGIN|Succeeded|Succeeded|FrontEndProxy" -Because "$change $order $message" }
+                    $user = if ($change -eq 'Bob') { 'bob@contoso.test' } else { $alice }
+                    $mech = if ($change -eq 'Bob') { 'PLAIN' } else { 'LOGIN' }
+                    $attempt = if ($change -eq 'Bob') { 'Succeeded' } else { 'Failed' }
+                    $table['<hist-new@contoso.test>'] | Should -Be "$user|$mech|Succeeded|$attempt|FrontEndProxy"
+                    $table['<hist-direct-a@contoso.test>'] | Should -Be "$alice|LOGIN|Succeeded|Succeeded|Direct"
+                    $table['<hist-direct-b@contoso.test>'] | Should -Be "$user|$mech|Succeeded|$attempt|Direct"
+                    (Invoke-TestCollection $s).Lines | Should -Be 0
+                }
+            }
+        }
+        It 'retracts a contradictory historical interval after restart without changing an independent later Bob interval' {
+            $dir = Join-Path $TestDrive 'smtp-auth-historical-conflict'
+            $s = Import-ExlConfiguration -Path (New-TestConfig $dir) -Root $script:Root
+            $sid = '08DA000000002A01'
+            $fePath = Join-Path (Join-Path $dir 'logs-src') ($recv -f 'FrontEnd')
+            $a = @(AuthSession $fe $sid 110 $feLocal '10.3.8.2:54001' @((AuthHello 'conflict.contoso.test'), (AuthLogin $alice -Proxied)))
+            $a += AuthSession $fe $sid 110.2 $feLocal '10.3.8.2:54001' @('C NOOP', 'S 250 OK') -FirstSequence $a.Count
+            Write-Log $fePath @($header + $a)
+            [IO.File]::SetLastWriteTimeUtc($fePath, [DateTime]::UtcNow.AddHours(-1))
+            Write-Log (Join-Path (Join-Path $dir 'logs-src') ($recv -f 'Hub')) @($header + @(AuthSession $cp '08DA000000002B01' 110.1 $beLocal '10.0.0.1:44003' @(AuthBack $sid '10.3.8.2' 54001 'conflict.contoso.test' 'sender@vendor.example' 'conflict-old')))
+            [void](Invoke-TestCollection $s)
+            (AuthTable $s '<conflict-%')['<conflict-old@contoso.test>'] | Should -Be "$alice|LOGIN|Succeeded|Succeeded|FrontEndProxy"
+            $store = Open-ExlStore -Settings $s
+            try { $store.Exec("UPDATE smtp_auth_fragment SET observations=replace(observations,'alice@contoso.test','wrong@contoso.test'), conflicted=1, conflict_positions='9' WHERE session_id='$sid';") } finally { $store.Dispose() }
+            $more = @(AuthSession $fe $sid 111 $feLocal '10.3.8.2:54001' @($plain, (& $id 'bob@contoso.test'), (& $px 'bob@contoso.test'), $ok) -FirstSequence $a.Count)
+            $more += AuthSession $fe $sid 111.2 $feLocal '10.3.8.2:54001' @('C NOOP', 'S 250 OK', '-Local') -FirstSequence ($a.Count + $more.Count)
+            Write-Log ($fePath.Replace('-1.LOG', '-2.LOG')) @($header + $more)
+            Write-Log (Join-Path (Join-Path $dir 'logs-src') (($recv -f 'Hub').Replace('-1.LOG', '-2.LOG'))) @($header + @(AuthSession $cp '08DA000000002B02' 111.1 $beLocal '10.0.0.1:44004' @(AuthBack $sid '10.3.8.2' 54001 'conflict.contoso.test' 'sender@vendor.example' 'conflict-new')))
+            [void](Invoke-TestCollection $s)
+            $table = AuthTable $s '<conflict-%'
+            $table['<conflict-old@contoso.test>'] | Should -Be '||Unknown|Unknown|Ambiguous'
+            $table['<conflict-new@contoso.test>'] | Should -Be 'bob@contoso.test|PLAIN|Succeeded|Succeeded|FrontEndProxy'
+            (Invoke-TestCollection $s).Lines | Should -Be 0
+        }
+        It 'does not bind a future AUTH, an unobserved suffix, or a future valid EHLO to an earlier handshake' {
+            foreach ($variant in 'future', 'suffix', 'helo') {
+                $dir = Join-Path $TestDrive "smtp-auth-no-retroactive-$variant"
+                $s = Import-ExlConfiguration -Path (New-TestConfig $dir) -Root $script:Root
+                $sid = '08DA000000004A01'
+                $fePath = Join-Path (Join-Path $dir 'logs-src') ($recv -f 'FrontEnd')
+                $start = if ($variant -eq 'future') { 131 } else { 130 }
+                $a = @(AuthSession $fe $sid $start $feLocal '10.3.8.4:54003' @((AuthHello 'time.contoso.test'), (AuthLogin $alice -Proxied)))
+                if ($variant -ne 'suffix') { $a += AuthSession $fe $sid 131.2 $feLocal '10.3.8.4:54003' @('C NOOP', 'S 250 OK', '-Local') -FirstSequence $a.Count }
+                Write-Log $fePath @($header + $a)
+                [IO.File]::SetLastWriteTimeUtc($fePath, [DateTime]::UtcNow.AddHours(-1))
+                $back = @(AuthBack $sid '10.3.8.4' 54003 'time.contoso.test' 'sender@vendor.example' "time-$variant" | Select-Object -SkipLast 3)
+                if ($variant -eq 'helo') { $back[2] = 'C EHLO impostor.contoso.test'; $back += 'C EHLO EXCH01.contoso.test'; $back += 'S 250 OK' }
+                Write-Log (Join-Path (Join-Path $dir 'logs-src') ($recv -f 'Hub')) @($header + @(AuthSession $cp '08DA000000004B01' 130.1 $beLocal '10.0.0.1:44005' @($back, '-Local')))
+                [void](Invoke-TestCollection $s)
+                (AuthTable $s '<time-%')["<time-$variant@contoso.test>"] | Should -Be '||Unknown|Unknown|Missing' -Because $variant
+            }
+        }
+        It 'requires an owned 235, preserves the real-shaped asynchronous handoff, and fails closed after reply-queue overflow' {
+            $dir = Join-Path $TestDrive 'smtp-auth-response-owner'
+            $s = Import-ExlConfiguration -Path (New-TestConfig $dir) -Root $script:Root
+            $lines = @($header)
+            $n = 0
+            foreach ($reply in '220 not AUTH success', '250 not AUTH success', '235 AUTH success') {
+                $n++
+                $lines += AuthSession $fe "08DA000000005A0$n" (140 + $n) $feLocal "10.3.8.5:$(55000 + $n)" @((AuthHello 'owned.contoso.test'), $plain, (& $id $alice), "S $reply", (AuthTx 'sender@vendor.example' "owner-$n"), '-Local')
+            }
+            $lines += AuthSession $fe '08DA000000005A04' 144 $feLocal '10.3.8.5:55004' @((AuthHello 'owned.contoso.test'), (@('C NOOP') * 9), $plain, (& $id $alice), $ok, (AuthTx 'sender@vendor.example' 'owner-4'), '-Local')
+            $sid = '08DA000000005A05'
+            $a = @(AuthSession $fe $sid 145 $feLocal '10.3.8.5:55005' @((AuthHello 'owned.contoso.test'), $pre, (& $id $alice)))
+            $a += AuthSession $fe $sid 145.05 $feLocal '10.3.8.5:55005' @((& $px $alice)) -FirstSequence $a.Count
+            $a += AuthSession $fe $sid 145.07 $feLocal '10.3.8.5:55005' @($ok, '-Local') -FirstSequence $a.Count
+            $lines += $a
+            Write-Log (Join-Path (Join-Path $dir 'logs-src') ($recv -f 'FrontEnd')) $lines
+            $back = @(AuthSession $cp '08DA000000005B05' 145.01 $beLocal '10.0.0.1:44006' @((AuthHello 'EXCH01.contoso.test'), "C X-EXPS EXCHANGEAUTH $($script:Secrets.Blob)", 'E [unrecognized]|authenticated', $ok))
+            $back += AuthSession $cp '08DA000000005B05' 145.04 $beLocal '10.0.0.1:44006' @("C XPROXY SID=$sid IP=10.3.8.5 PORT=55005 DOMAIN=owned.contoso.test") -FirstSequence $back.Count
+            $back += AuthSession $cp '08DA000000005B05' 145.06 $beLocal '10.0.0.1:44006' @('S 250 XPROXY OK') -FirstSequence $back.Count
+            $back += AuthSession $cp '08DA000000005B05' 145.08 $beLocal '10.0.0.1:44006' @((AuthTx 'different-sender@vendor.example' 'owner-async'), '-Local') -FirstSequence $back.Count
+            Write-Log (Join-Path (Join-Path $dir 'logs-src') ($recv -f 'Hub')) @($header + $back)
+            [void](Invoke-TestCollection $s)
+            $table = AuthTable $s '<owner-%'
+            foreach ($i in 1, 2, 4) { $table["<owner-$i@contoso.test>"] | Should -Not -Match '^alice@' }
+            $table['<owner-3@contoso.test>'] | Should -Be "$alice|PLAIN|Succeeded|Succeeded|Direct"
+            $table['<owner-async@contoso.test>'] | Should -Be "$alice|LOGIN|Succeeded|Succeeded|FrontEndProxy"
+        }
+        It 'rolls back fragments, enrichment and file offsets atomically and restores the same FileWork before a fresh Collector retries' {
+            foreach ($batch in 1, 32, 500000) {
+                foreach ($stage in 'fragment', 'auth', 'offset') {
+                    $dir = Join-Path $TestDrive "smtp-auth-rollback-$batch-$stage"
+                    $s = Import-ExlConfiguration -Path (New-TestConfig $dir) -Root $script:Root
+                    $path = Join-Path (Join-Path $dir 'logs-src') ($recv -f 'FrontEnd')
+                    $steps = foreach ($i in 1..30) { AuthTx 'sender@vendor.example' "rollback-$i" }
+                    Write-Log $path @($header + @(AuthSession $fe '08DA000000006A01' 150 $feLocal '10.3.8.6:55006' @((AuthHello 'rollback.contoso.test'), (AuthPlain $alice), $steps, '-Local')))
+                    $store = Open-ExlStore -Settings $s
+                    try {
+                        $o = [ExchangeLogReport.CollectorOptions]::new()
+                        $o.RunId = $store.StartRun('Collect', 'rollback', 'synthetic', '1.0.0')
+                        $o.BatchRows = $batch; $o.BatchSeconds = 3600; $o.Parallelism = 6
+                        $o.MaxFilesPerServer = 1; $o.DetailCutoffMs = $o.NowMs
+                        $job = [ExchangeLogReport.SourceJob]::new()
+                        $job.Server = 'EXCH01'; $job.Kind = 'SmtpReceive'; $job.Role = 'FrontEnd'; $job.Folder = Split-Path $path
+                        $job.Filter = [IO.Path]::GetFileName($path)
+                        $collector = [ExchangeLogReport.Collector]::new($store, $o)
+                        $collector.Plan(@($job), [DateTime]::MinValue)
+                        $job.Files.Count | Should -Be 1
+                        $trigger = switch ($stage) {
+                            'fragment' { 'BEFORE INSERT ON smtp_auth_fragment' }
+                            'auth' { 'BEFORE UPDATE OF auth_user ON smtp_transaction' }
+                            'offset' { 'BEFORE UPDATE OF offset ON source_file' }
+                        }
+                        $store.Exec("CREATE TRIGGER fail_smtp $trigger BEGIN SELECT RAISE(ABORT,'synthetic rollback'); END;")
+                        $run = $collector.Start(@($job))
+                        while (-not $run.Wait(1000)) { }
+                        $run.Error | Should -Not -BeNullOrEmpty
+                        $store.Query('SELECT COUNT(*) FROM smtp_transaction', $null).Rows[0][0] | Should -Be 0
+                        $store.Query('SELECT COUNT(*) FROM smtp_auth_fragment', $null).Rows[0][0] | Should -Be 0
+                        $store.Query('SELECT COUNT(*) FROM source_file WHERE offset>0', $null).Rows[0][0] | Should -Be 0
+                        $state = $job.Files[0].State
+                        @($state.Id, $state.Offset, $state.Lines, $state.Kept, $state.Noise) | Should -Be @(0L, 0L, 0L, 0L, 0L)
+                        @(Get-ChildItem -LiteralPath (Split-Path $s.Storage.DatabasePath) -Force -Filter '.report-*').Count | Should -Be 0
+                        $store.Exec('DROP TRIGGER fail_smtp;')
+                        $job.FilesApplied = 0
+                        $retry = [ExchangeLogReport.Collector]::new($store, $o)
+                        $run = $retry.Start(@($job))
+                        while (-not $run.Wait(1000)) { }
+                        $run.Error | Should -BeNullOrEmpty
+                        $store.Query("SELECT COUNT(*),SUM(auth_user='$alice' AND auth_source='Direct' AND auth_mechanism='PLAIN') FROM smtp_transaction", $null).Rows[0] -join '|' | Should -Be '30|30'
+                        $state.Offset | Should -Be ([IO.FileInfo]::new($path).Length)
+                        $state.Id | Should -BeGreaterThan 0
+                        $again = [ExchangeLogReport.Collector]::new($store, $o)
+                        $again.Plan(@($job), [DateTime]::MinValue)
+                        $job.Files.Count | Should -Be 0
+                    } finally { $store.Dispose() }
+                }
+            }
+        }
+        It 'resets prepared row cursors and compares nullable Unicode text ordinally without retaining readers' {
+            $dir = Join-Path $TestDrive 'smtp-auth-prepared-rows'
+            $s = Import-ExlConfiguration -Path (New-TestConfig $dir) -Root $script:Root
+            $store = Open-ExlStore -Settings $s
+            $type = [ExchangeLogReport.Collector].Assembly.GetType('ExchangeLogReport.Prepared')
+            $prepared = [Activator]::CreateInstance($type, [object[]]@($store, 'SELECT @p0,@p1,@p2;', 3))
+            try {
+                foreach ($text in 'MixedCase', "ab`0cd", (('用户' * 2500) + '😀@test'), '') {
+                    $prepared.Set(0, $text); $prepared.Set(1, $null); $prepared.Set(2, [long]123)
+                    $rows = $prepared.ExecuteReader()
+                    try {
+                        $rows.Read() | Should -BeTrue
+                        $rows.GetString(0) | Should -Be $text
+                        $rows.TextEquals(0, $text) | Should -BeTrue
+                        $rows.TextEquals(0, ($text + 'x')) | Should -BeFalse
+                        $rows.IsDBNull(1) | Should -BeTrue
+                        $rows.TextEquals(1, [NullString]::Value) | Should -BeTrue
+                        $rows.TextEquals(1, '') | Should -BeFalse
+                        $rows.TextEquals(0, [NullString]::Value) | Should -BeFalse
+                        $rows.GetInt64(2) | Should -Be 123
+                    } finally { $rows.Dispose() }
+                    $again = $prepared.ExecuteReader()
+                    try {
+                        $again.Read() | Should -BeTrue
+                        $again.TextEquals(0, $text) | Should -BeTrue
+                        if ($text -ceq 'MixedCase') { $again.TextEquals(0, 'mixedcase') | Should -BeFalse }
+                        $again.Read() | Should -BeFalse
+                    } finally { $again.Dispose() }
+                }
+            } finally { $prepared.Dispose(); $store.Dispose() }
+        }
+        It 'keeps replay pages and MAIL lookup pages isolated across identity resets and repeated enrichment' {
+            $dir = Join-Path $TestDrive 'smtp-auth-reused-pages'
+            $s = Import-ExlConfiguration -Path (New-TestConfig $dir) -Root $script:Root
+            $steps = @((AuthHello 'reuse.contoso.test'), (AuthPlain $alice))
+            $tls = @('C STARTTLS', 'S 220 Ready', 'E |TLS protocol SP_PROT_TLS1_2_SERVER negotiation succeeded using bulk encryption algorithm CALG_AES_256', 'C EHLO reuse.contoso.test', 'S 250 Hello')
+            foreach ($phase in 'first', 'second', 'none') {
+                if ($phase -eq 'second') { $steps += $tls; $steps += @(AuthPlain 'bob@contoso.test') }
+                if ($phase -eq 'none') { $steps += $tls }
+                foreach ($i in 1..270) { $steps += @(AuthTx "$phase$i@vendor.example" "reuse-$phase-$i") }
+            }
+            $steps += '-Local'
+            Write-Log (Join-Path (Join-Path $dir 'logs-src') ($recv -f 'FrontEnd')) @($header + @(AuthSession $fe '08DA000000008A01' 158 $feLocal '10.3.8.8:55009' $steps))
+            [void](Invoke-TestCollection $s)
+            $store = Open-ExlStore -Settings $s
+            $resolver = $null; $writer = $null; $tx = $null
+            try {
+                $first = $store.Query("SELECT MIN(id) FROM smtp_transaction WHERE message_id LIKE '<reuse-first-%';", $null).Rows[0][0]
+                $columns = @($store.Query('PRAGMA table_info(smtp_transaction);', $null).Rows | ForEach-Object { $_[1] } | Where-Object { $_ -ne 'id' })
+                foreach ($copy in 1..280) {
+                    $values = foreach ($column in $columns) {
+                        switch ($column) {
+                            'time_ms' { "time_ms+$copy" }
+                            'end_ms' { "end_ms+$copy" }
+                            'message_id' { "'<reuse-copy-$copy@contoso.test>'" }
+                            default { "[$column]" }
+                        }
+                    }
+                    $store.Exec("INSERT INTO smtp_transaction($($columns -join ',')) SELECT $($values -join ',') FROM smtp_transaction WHERE id=$first;")
+                }
+                $store.Exec("UPDATE smtp_transaction SET auth_user='stale@test',auth_mechanism='stale',auth_result='stale',auth_attempt_result='stale',auth_source='stale',auth_evidence_id=NULL;")
+                $engine = [ExchangeLogReport.Collector].Assembly
+                $writer = [Activator]::CreateInstance($engine.GetType('ExchangeLogReport.Writer'), [object[]]@($store))
+                $resolver = [Activator]::CreateInstance($engine.GetType('ExchangeLogReport.AuthResolver'), [object[]]@($store, $writer, [long]600000))
+                $tx = $store.Begin(); $writer.Use($tx)
+                $resolver.Touch('EXCH01', 'Receive', 'FrontEnd', '08DA000000008A01'); $resolver.Flush($tx)
+                $resolver.Updated | Should -Be 1090
+                $resolver.Touch('EXCH01', 'Receive', 'FrontEnd', '08DA000000008A01'); $resolver.Flush($tx)
+                $resolver.Updated | Should -Be 1090
+                $tx.Commit(); $tx.Dispose(); $tx = $null
+                $store.Query("SELECT COUNT(*) FROM smtp_transaction WHERE (message_id LIKE '<reuse-first-%' OR message_id LIKE '<reuse-copy-%') AND auth_user='$alice' AND auth_mechanism='PLAIN' AND auth_result='Succeeded' AND auth_attempt_result='Succeeded' AND auth_source='Direct' AND auth_evidence_id>0;", $null).Rows[0][0] | Should -Be 550
+                $store.Query("SELECT COUNT(*) FROM smtp_transaction WHERE message_id LIKE '<reuse-second-%' AND auth_user='bob@contoso.test' AND auth_mechanism='PLAIN' AND auth_source='Direct' AND auth_evidence_id>0;", $null).Rows[0][0] | Should -Be 270
+                $store.Query("SELECT COUNT(*) FROM smtp_transaction WHERE message_id LIKE '<reuse-none-%' AND auth_user IS NULL AND auth_mechanism IS NULL AND auth_result='Not attempted' AND auth_attempt_result='Not attempted' AND auth_source='NotApplicable' AND auth_evidence_id IS NULL;", $null).Rows[0][0] | Should -Be 270
+            } finally {
+                if ($tx) { $tx.Dispose() }
+                if ($resolver) { $resolver.Dispose() }
+                if ($writer) { $writer.Dispose() }
+                $store.Dispose()
+            }
+            @(Get-ChildItem -LiteralPath (Split-Path $s.Storage.DatabasePath) -Filter '.report-*' -Force).Count | Should -Be 0
+        }
+        It 'replays legacy six-cell format-1 aliases beside format-2 parts without changing retained transaction IDs or offsets' {
+                $dir = Join-Path $TestDrive 'smtp-auth-format-aliases'
+                $s = Import-ExlConfiguration -Path (New-TestConfig $dir) -Root $script:Root
+                New-AuthLogs (Join-Path $dir 'logs-src')
+                [void](Invoke-TestCollection $s)
+                $before = AuthJson $s
+                $ids = (Query $s 'SELECT id,auth_sequence FROM smtp_transaction ORDER BY id') | ForEach-Object { $_ -join '|' }
+                $offsets = (Query $s 'SELECT id,offset,lines,kept,noise FROM source_file ORDER BY id') | ForEach-Object { $_ -join '|' }
+                $store = Open-ExlStore -Settings $s
+                try {
+                    $store.Exec(@"
+INSERT INTO smtp_auth_fragment(source_file_id,source_key,first_offset,part,first_ms,last_ms,server,direction,role,connector,session_id,local_ep,remote_ep,helo,first_sequence,last_sequence,complete_start,complete_end,coverage,proxy_sid,proxy_ip,proxy_port,proxy_helo,observations,conflicted)
+SELECT source_file_id,source_key,first_offset,-1-part,origin_first_ms,last_ms,server,direction,role,connector,session_id,local_ep,remote_ep,helo,first_sequence,last_sequence,complete_start,complete_end,coverage,proxy_sid,proxy_ip,proxy_port,proxy_helo,
+(SELECT json_group_array(json_array(json_extract(value,'$[0]'),json_extract(value,'$[1]'),json_extract(value,'$[2]'),json_extract(value,'$[3]'),json_extract(value,'$[4]'),json_extract(value,'$[5]'))) FROM json_each(f.observations)),conflicted
+FROM smtp_auth_fragment f WHERE evidence_format=2;
+UPDATE smtp_transaction SET auth_fragment_id=(
+ SELECT l.id FROM smtp_auth_fragment old JOIN smtp_auth_fragment l
+ ON l.server=old.server AND l.direction=old.direction AND l.role=old.role AND l.source_key=old.source_key
+ AND l.session_id=old.session_id AND l.first_offset=old.first_offset AND l.first_ms=old.origin_first_ms
+ AND l.part=-1-old.part AND l.evidence_format IS NULL
+ WHERE old.id=smtp_transaction.auth_fragment_id
+) WHERE auth_fragment_id IS NOT NULL;
+"@)
+                } finally { $store.Dispose() }
+                $references = (Query $s 'SELECT id,auth_fragment_id FROM smtp_transaction ORDER BY id') | ForEach-Object { $_ -join '|' }
+                foreach ($pass in 1, 2) {
+                    $store = Open-ExlStore -Settings $s
+                    try {
+                        $engine = [ExchangeLogReport.Collector].Assembly
+                        $writer = [Activator]::CreateInstance($engine.GetType('ExchangeLogReport.Writer'), [object[]]@($store))
+                        $resolver = [Activator]::CreateInstance($engine.GetType('ExchangeLogReport.AuthResolver'), [object[]]@($store, $writer, [long]600000))
+                        $scopes = $store.Query('SELECT DISTINCT server,direction,role,session_id FROM smtp_auth_fragment', $null).Rows
+                        $tx = $store.Begin()
+                        try {
+                            $writer.Use($tx)
+                            foreach ($scope in $scopes) { $resolver.Touch($scope[0], $scope[1], $scope[2], $scope[3]) }
+                            $resolver.Flush($tx)
+                            $tx.Commit()
+                        } finally { $resolver.Dispose(); $writer.Dispose(); $tx.Dispose() }
+                    } finally { $store.Dispose() }
+                    AuthJson $s | Should -Be $before
+                    (Query $s 'SELECT id,auth_sequence FROM smtp_transaction ORDER BY id') | ForEach-Object { $_ -join '|' } | Should -Be $ids
+                    (Query $s 'SELECT id,auth_fragment_id FROM smtp_transaction ORDER BY id') | ForEach-Object { $_ -join '|' } | Should -Be $references
+                    (Query $s 'SELECT id,offset,lines,kept,noise FROM source_file ORDER BY id') | ForEach-Object { $_ -join '|' } | Should -Be $offsets
+                    (Invoke-TestCollection $s).Lines | Should -Be 0
+                }
+            }
+        It 'continues after coverage and encoded-byte early seals and maps MAIL to the part that actually contains it' {
+                $dir = Join-Path $TestDrive 'smtp-auth-early-seals'
+                $s = Import-ExlConfiguration -Path (New-TestConfig $dir) -Root $script:Root
+                $gaps = foreach ($i in 1..150) { 'C NOOP'; 'S 250 OK'; 'GAP' }
+                $wide = ('用户' * 240) + '@test'
+                $annotations = foreach ($i in 1..300) { & $id $wide }
+                $mails = foreach ($i in 1..300) { "C MAIL FROM:<wide$i@vendor.example>"; 'S 250 OK' }
+                $lines = @($header)
+                $lines += AuthSession $fe '08DA000000007A01' 155 $feLocal '10.3.8.7:55007' @((AuthHello 'coverage.contoso.test'), (AuthPlain $alice), $gaps, (AuthTx 'sender@vendor.example' 'gap-before'), (AuthPlain 'recovered@contoso.test'), (AuthTx 'sender@vendor.example' 'gap-after'), '-Local')
+                $lines += AuthSession $fe '08DA000000007A02' 156 $feLocal '10.3.8.7:55008' @((AuthHello 'bytes.contoso.test'), (AuthPlain $wide), $annotations, $mails, (AuthTx 'sender@vendor.example' 'byte-after'), '-Local')
+                Write-Log (Join-Path (Join-Path $dir 'logs-src') ($recv -f 'FrontEnd')) $lines
+                [void](Invoke-TestCollection $s)
+                $table = AuthTable $s '<gap-%'
+                $table['<gap-before@contoso.test>'] | Should -Be '||Unknown|Unknown|Missing'
+                $table['<gap-after@contoso.test>'] | Should -Be 'recovered@contoso.test|PLAIN|Succeeded|Succeeded|Direct'
+                (Query $s "SELECT COUNT(*),SUM(auth_user='$wide' AND auth_source='Direct') FROM smtp_transaction WHERE session_id='08DA000000007A02'")[0] -join '|' | Should -Be '301|301'
+                (Query $s "SELECT MAX(json_array_length(observations)),MAX(length(CAST(observations AS BLOB))),MAX(1+length(coverage)-length(replace(coverage,',',''))) FROM smtp_auth_fragment WHERE session_id IN ('08DA000000007A01','08DA000000007A02')")[0][0] | Should -BeLessOrEqual 256
+                (Query $s "SELECT MAX(length(CAST(observations AS BLOB))) FROM smtp_auth_fragment WHERE session_id='08DA000000007A02'")[0][0] | Should -BeLessOrEqual 128KB
+                (Query $s "SELECT MAX(1+length(coverage)-length(replace(coverage,',',''))) FROM smtp_auth_fragment WHERE session_id='08DA000000007A01'")[0][0] | Should -BeLessOrEqual 64
+                (Query $s "SELECT COUNT(*) FROM smtp_transaction t JOIN smtp_auth_fragment f ON f.id=t.auth_fragment_id WHERE t.session_id IN ('08DA000000007A01','08DA000000007A02') AND NOT EXISTS(SELECT 1 FROM json_each(f.observations) WHERE json_extract(value,'$[0]')='M' AND json_extract(value,'$[2]')=t.auth_sequence)")[0][0] | Should -Be 0
+                (Query $s "SELECT COUNT(*) FROM smtp_auth_fragment WHERE session_id='08DA000000007A02' AND json_array_length(observations)<250 AND length(CAST(observations AS BLOB))>100000")[0][0] | Should -BeGreaterThan 0
+            }
+        It 'carries a connection of more than 8192 observations in bounded parts, without losing one transaction' {
+            $dir = Join-Path $TestDrive 'smtp-auth-long'
+            $s = Import-ExlConfiguration -Path (New-TestConfig $dir) -Root $script:Root
+            $count = 8300
+            $mails = foreach ($i in 1..$count) { "C MAIL FROM:<u$i@vendor.example>"; 'S 250 2.1.0 Sender OK' }
+            $lines = @($header) + (AuthSession $fe '08DA000000000E01' 60 $feLocal '10.3.2.1:52000' @((AuthHello 'huge.contoso.test'), (AuthPlain 'long.user@contoso.test'), $mails, 'C QUIT', 'S 221 bye', '-Local'))
+            Write-Log (Join-Path (Join-Path $dir 'logs-src') ($recv -f 'FrontEnd')) $lines
+            [void](Invoke-TestCollection $s)
+            (Query $s "SELECT COUNT(*), SUM(auth_user = 'long.user@contoso.test' AND auth_source = 'Direct' AND auth_result = 'Succeeded') FROM smtp_transaction WHERE session_id = '08DA000000000E01'")[0] -join '|' | Should -Be "$count|$count"
+            $frag = (Query $s "SELECT COUNT(*), MIN(part), MAX(json_array_length(observations)), SUM(complete_end), MAX(LENGTH(observations)) FROM smtp_auth_fragment WHERE session_id = '08DA000000000E01'")[0]
+            $frag[0] | Should -BeGreaterOrEqual ([math]::Ceiling($count / 256))
+            $frag[1] | Should -Be (-$frag[0])
+            $frag[2] | Should -BeLessOrEqual 256
+            $frag[3] | Should -Be 1
+            $frag[4] | Should -BeLessThan 30000
+        }
+        It 'does not keep a connection in memory: the evidence of a long connection is written in parts and the spool is removed afterwards' {
+            $dir = Join-Path $TestDrive 'smtp-auth-spool'
+            $s = Import-ExlConfiguration -Path (New-TestConfig $dir) -Root $script:Root
+            $mails = foreach ($i in 1..3000) { "C MAIL FROM:<k$i@vendor.example>"; 'S 250 2.1.0 Sender OK' }
+            $lines = @($header) + (AuthSession $fe '08DA000000000E03' 60 $feLocal '10.3.2.3:52002' @((AuthHello 'spool.contoso.test'), (AuthPlain 'spool.user@contoso.test'), $mails, 'C QUIT', 'S 221 bye', '-Local'))
+            Write-Log (Join-Path (Join-Path $dir 'logs-src') ($recv -f 'FrontEnd')) $lines
+            [void](Invoke-TestCollection $s)
+            @(Get-ChildItem -LiteralPath (Join-Path $dir 'data') -Force | Where-Object Name -Like '.report-*') | Should -BeNullOrEmpty
+            (Query $s "SELECT COUNT(*) FROM smtp_transaction WHERE session_id = '08DA000000000E03' AND auth_source = 'Direct'")[0][0] | Should -Be 3000
+        }
+        It 'does not limit the lifetime of a connection: 65600 transactions of one session are all attributed, without any "Overflow" reason' {
+            $dir = Join-Path $TestDrive 'smtp-auth-overflow'
+            $s = Import-ExlConfiguration -Path (New-TestConfig $dir) -Root $script:Root
+            $count = 65600
+            $mails = foreach ($i in 1..$count) { "C MAIL FROM:<o$i@vendor.example>"; 'S 250 2.1.0 Sender OK' }
+            $lines = @($header) + (AuthSession $fe '08DA000000000E02' 60 $feLocal '10.3.2.2:52001' @((AuthHello 'over.contoso.test'), (AuthPlain 'over.user@contoso.test'), $mails, 'C QUIT', 'S 221 bye', '-Local'))
+            Write-Log (Join-Path (Join-Path $dir 'logs-src') ($recv -f 'FrontEnd')) $lines
+            [void](Invoke-TestCollection $s)
+            $rows = Query $s "SELECT auth_source, COUNT(*), COUNT(DISTINCT auth_sequence), MIN(auth_user), MAX(auth_user), MIN(auth_result) FROM smtp_transaction WHERE session_id = '08DA000000000E02' GROUP BY auth_source"
+            @($rows).Count | Should -Be 1
+            @($rows[0]) -join '|' | Should -Be "Direct|$count|$count|over.user@contoso.test|over.user@contoso.test|Succeeded"
+            (Query $s "SELECT COUNT(*), MAX(json_array_length(observations)), SUM(complete_end) FROM smtp_auth_fragment WHERE session_id = '08DA000000000E02'")[0][1] | Should -BeLessOrEqual 256
+            (Query $s "SELECT COUNT(*) FROM smtp_auth_fragment WHERE session_id = '08DA000000000E02'")[0][0] | Should -BeGreaterOrEqual ([math]::Ceiling($count / 256))
+            (Query $s "SELECT COUNT(*) FROM smtp_transaction WHERE auth_source = 'Overflow'")[0][0] | Should -Be 0
+            # A development-only size-limit reason is unavailable evidence, never a new result.
+            $store = Open-ExlStore -Settings $script:RegSettings
+            try { $store.Exec("UPDATE smtp_transaction SET auth_source = 'Overflow', auth_user = NULL, auth_result = 'Unknown' WHERE message_id = '<msg-reg-g7@contoso.test>';") } finally { $store.Dispose() }
+            $row = @(AuthCsv (AuthReport $script:RegSettings) 'SmtpSessions') | Where-Object 'Message ID' -EQ '<msg-reg-g7@contoso.test>'
+            @($row.'Authenticated user', $row.'Identity evidence') | Should -Be @('Not available', 'Missing')
+        }
+        It 'keeps the identity exact at the sealing boundaries of a part (255, 256 and 257 transactions)' {
+            $dir = Join-Path $TestDrive 'smtp-auth-edges'
+            $s = Import-ExlConfiguration -Path (New-TestConfig $dir) -Root $script:Root
+            $steps = @()
+            $n = 0
+            foreach ($size in 255, 256, 257, 512) {
+                $n++
+                $mails = foreach ($i in 1..$size) { "C MAIL FROM:<e$i@vendor.example>"; 'S 250 2.1.0 Sender OK' }
+                $steps += , @("08DA00000000F00$n", (70 + $n * 5), "10.3.9.${n}:53000", $size, $mails)
+            }
+            $lines = @($header)
+            foreach ($x in $steps) { $lines += AuthSession $fe $x[0] $x[1] $feLocal $x[2] @((AuthHello 'edge.contoso.test'), (AuthPlain 'edge.user@contoso.test'), $x[4], 'C QUIT', 'S 221 bye', '-Local') }
+            Write-Log (Join-Path (Join-Path $dir 'logs-src') ($recv -f 'FrontEnd')) $lines
+            [void](Invoke-TestCollection $s)
+            foreach ($x in $steps) {
+                $sid = $x[0]; $size = $x[3]
+                (Query $s "SELECT COUNT(*), COUNT(DISTINCT auth_sequence), SUM(auth_user = 'edge.user@contoso.test' AND auth_source = 'Direct') FROM smtp_transaction WHERE session_id = '$sid'")[0] -join '|' | Should -Be "$size|$size|$size" -Because $sid
+                (Query $s "SELECT MAX(json_array_length(observations)), SUM(complete_end) FROM smtp_auth_fragment WHERE session_id = '$sid'")[0] -join '|' | Should -Match '^(\d+)\|1$' -Because $sid
+            }
+        }
+        Context 'offline proxy load' {
+            BeforeAll {
+                $loadProbe = Join-Path $TestDrive 'smtp-auth-proxy-load.ps1'
+                @'
+param($Root, $Config, $WarmConfig, $Count, $Mode, $LateSource, $LateTarget)
+$ErrorActionPreference = 'Stop'
+Import-Module (Join-Path $Root 'ExchangeLogReport.psd1') -Force
+Initialize-ExlEngine -Root $Root
+Add-Type -TypeDefinition @"
+using System;
+using System.Diagnostics;
+using System.Threading;
+/* SMTP_MEMORY_TELEMETRY_TYPE */
+public sealed class ProxyLoadSample : IDisposable {
+    readonly Thread thread; volatile bool stop;
+    public long ManagedBase, ManagedPeak, ManagedEnd, PrivateBase, PrivatePeak, Samples;
+    public readonly SmtpMemoryTelemetry Telemetry = new SmtpMemoryTelemetry();
+    public ProxyLoadSample() {
+        ManagedBase = GC.GetTotalMemory(true); ManagedPeak = ManagedBase;
+        using (var p = Process.GetCurrentProcess()) { p.Refresh(); PrivateBase = p.PrivateMemorySize64; }
+        PrivatePeak = PrivateBase;
+        Telemetry.Start();
+        thread = new Thread(() => {
+            using (var p = Process.GetCurrentProcess()) {
+                while (!stop) {
+                    long managed = GC.GetTotalMemory(false);
+                    bool newPeak = managed > ManagedPeak;
+                    ManagedPeak = Math.Max(ManagedPeak, managed);
+                    if (newPeak) Telemetry.RecordPeak(managed);
+                    p.Refresh(); PrivatePeak = Math.Max(PrivatePeak, p.PrivateMemorySize64);
+                    Samples++; Thread.Sleep(20);
+                }
+            }
+        });
+        thread.IsBackground = true; thread.Start();
+    }
+    public void Dispose() { stop = true; thread.Join(); Telemetry.Finish(); ManagedEnd = GC.GetTotalMemory(true); }
+}
+"@
+function Collect($s) {
+    $store = Open-ExlStore -Settings $s
+    try {
+        $run = $store.StartRun('Collect', 'proxy-load', 'synthetic', '1.0.0')
+        & (Get-Module ExchangeLogReport) { param($s,$st,$r)
+            Invoke-ExlCollection -Store $st -Settings $s -RunId $r -Servers @($s.Servers[0]) 6>$null
+        } $s $store $run
+    } finally { $store.Dispose() }
+}
+function ReadRow($s, $sql) {
+    $store = Open-ExlStore -Settings $s -ReadOnly
+    try { return ,@($store.Query($sql, $null).Rows[0]) } finally { $store.Dispose() }
+}
+function Replay($s, $groups) {
+    $store = Open-ExlStore -Settings $s
+    $phases = @()
+    try {
+        $engine = [ExchangeLogReport.Collector].Assembly
+        $writer = [Activator]::CreateInstance($engine.GetType('ExchangeLogReport.Writer'), [object[]]@($store))
+        try {
+            foreach ($generation in 1,2) {
+                $resolver = [Activator]::CreateInstance($engine.GetType('ExchangeLogReport.AuthResolver'), [object[]]@($store,$writer,[long]600000))
+                try {
+                    $passes = if ($groups) { 2 } else { 1 }
+                    for ($pass = 1; $pass -le $passes; $pass++) {
+                        $sample = [ProxyLoadSample]::new()
+                        $watch = [Diagnostics.Stopwatch]::StartNew()
+                        $tx = $store.Begin()
+                        try {
+                            $writer.Use($tx)
+                            $priorUpdated = $resolver.Updated; $priorReplayed = $resolver.Replayed
+                            if ($groups) {
+                                for ($i=1; $i -le $Count; $i++) { $resolver.Touch('EXCH01','Receive','FrontEnd',('A{0:X15}' -f $i)) }
+                            } else { $resolver.Touch('EXCH01','Receive','Hub','08DA000000009B01') }
+                            $queued = $resolver.Count
+                            $resolver.Flush($tx)
+                            $tx.Commit()
+                        } finally { $tx.Dispose(); $sample.Dispose() }
+                        $phases += @{
+                            generation=$generation; pass=$pass; queued=$queued; pendingAfter=$resolver.Count;
+                            updated=($resolver.Updated-$priorUpdated); replayed=($resolver.Replayed-$priorReplayed);
+                            elapsedSeconds=$watch.Elapsed.TotalSeconds; memory=$sample
+                        }
+                    }
+                } finally { $resolver.Dispose() }
+                if (-not $groups) { break }
+            }
+        } finally { $writer.Dispose() }
+    } finally { $store.Dispose() }
+    return $phases
+}
+[ExchangeLogReport.Store]::CacheKilobytes = 8192
+[void](Collect (Import-ExlConfiguration -Path $WarmConfig -Root $Root))
+$s = Import-ExlConfiguration -Path $Config -Root $Root
+$s.Collection.Parallelism = 1; $s.Storage.DetailRetentionDays = 0
+$watch = [Diagnostics.Stopwatch]::StartNew()
+$sample = [ProxyLoadSample]::new()
+try { $initial = Collect $s } finally { $sample.Dispose() }
+$initialSeconds = $watch.Elapsed.TotalSeconds
+$before = ReadRow $s "SELECT COUNT(*),SUM(auth_source='Missing') FROM smtp_transaction WHERE role='Hub';"
+$late = $null
+if ($Mode -eq 'groups') {
+    [void][IO.Directory]::CreateDirectory((Split-Path $LateTarget))
+    [IO.File]::Move($LateSource,$LateTarget)
+    $lateSample = [ProxyLoadSample]::new(); $lw = [Diagnostics.Stopwatch]::StartNew()
+    try { $lateResult = Collect $s } finally { $lateSample.Dispose() }
+    $late = @{elapsedSeconds=$lw.Elapsed.TotalSeconds; memory=$lateSample; errors=$lateResult.Errors; lines=$lateResult.Lines}
+}
+$rowsSql = if ($Mode -eq 'groups') {
+    "WITH RECURSIVE expected(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM expected WHERE n<$Count)
+     SELECT COUNT(*),COUNT(DISTINCT t.session_id),SUM(t.auth_user='scale-'||e.n||'@contoso.test' AND t.auth_mechanism='LOGIN' AND t.auth_source='FrontEndProxy' AND t.auth_result='Succeeded' AND t.auth_attempt_result='Succeeded' AND t.auth_user<>t.mail_from)
+     FROM expected e LEFT JOIN smtp_transaction t ON t.session_id=printf('B%015X',e.n) AND t.role='Hub';"
+} else {
+    "SELECT COUNT(*),COUNT(DISTINCT auth_sequence),SUM(auth_user='load.user@contoso.test' AND auth_mechanism='LOGIN' AND auth_source='FrontEndProxy' AND auth_result='Succeeded' AND auth_attempt_result='Succeeded' AND auth_user<>mail_from),COUNT(DISTINCT auth_fragment_id||':'||auth_sequence)
+     FROM smtp_transaction WHERE role='Hub' AND session_id='08DA000000009B01';"
+}
+$rows = ReadRow $s $rowsSql
+$phases = @(Replay $s ($Mode -eq 'groups'))
+$after = ReadRow $s $rowsSql
+$parts = ReadRow $s "SELECT COUNT(*),MAX(json_array_length(observations)),MAX(length(CAST(observations AS BLOB))),SUM(conflicted),SUM(complete_end),COUNT(DISTINCT role||':'||session_id) FROM smtp_auth_fragment;"
+$totals = ReadRow $s "SELECT COUNT(*),SUM(role='FrontEnd'),SUM(auth_source IN ('Overflow','Ambiguous')) FROM smtp_transaction;"
+$references = ReadRow $s "SELECT COUNT(*) FROM smtp_transaction t LEFT JOIN smtp_auth_fragment f ON f.id=t.auth_fragment_id WHERE f.id IS NULL;"
+$offsets = ReadRow $s "SELECT COUNT(*),SUM(offset=size) FROM source_file;"
+$runtime = [SmtpMemoryTelemetry]::Runtime()
+$runtime['powerShellVersion'] = $PSVersionTable.PSVersion.ToString()
+$data = @{
+    mode=$Mode; count=[int]$Count; workers=1; rows=$rows; after=$after; before=$before;
+    parts=$parts; totals=$totals; missingReferences=$references; offsets=$offsets;
+    memory=$sample; elapsedSeconds=$initialSeconds; errors=$initial.Errors; lines=$initial.Lines;
+    late=$late; resolver=$phases; scopeBudgetPerReplay=2;
+    runtime=$runtime;
+    scratchRemaining=@(Get-ChildItem -LiteralPath (Split-Path $s.Storage.DatabasePath) -Force |
+        Where-Object { $_.Name -like '.report-*' -or $_.Name -like '.smtp-*' }).Count
+}
+'SMTP_PROXY_LOAD_JSON=' + ($data | ConvertTo-Json -Depth 8 -Compress)
+'@.Replace('/* SMTP_MEMORY_TELEMETRY_TYPE */', $memoryTelemetrySource) | Set-Content -LiteralPath $loadProbe -Encoding utf8
+                function Run-ProxyLoadProbe($config, $warm, $count, $mode, $lateSource = '', $lateTarget = '') {
+                    $out = Join-Path (Split-Path $config) 'probe.stdout.txt'
+                    $err = Join-Path (Split-Path $config) 'probe.stderr.txt'
+                    $args = @('-NoProfile','-File',"`"$loadProbe`"","`"$script:Root`"","`"$config`"","`"$warm`"",$count,$mode,"`"$lateSource`"","`"$lateTarget`"")
+                    $p = Start-Process (Join-Path $PSHOME 'pwsh.exe') -ArgumentList $args -PassThru -RedirectStandardOutput $out -RedirectStandardError $err
+                    $deadline = if ($env:EXL_PROXY_LOAD_DEADLINE) { [DateTimeOffset]::Parse($env:EXL_PROXY_LOAD_DEADLINE) } else { [DateTimeOffset]::UtcNow.AddMinutes(10) }
+                    $remaining = [int][math]::Min([int]::MaxValue,[math]::Max(1,($deadline-[DateTimeOffset]::UtcNow).TotalMilliseconds))
+                    if (-not $p.WaitForExit($remaining)) { $p.Kill($true); $p.WaitForExit(5000) | Out-Null; throw "Proxy load child PID $($p.Id) exceeded its deadline; evidence: $out, $err" }
+                    $p.ExitCode | Should -Be 0 -Because ([IO.File]::ReadAllText($err))
+                    $json = Get-Content -LiteralPath $out | Where-Object { $_.StartsWith('SMTP_PROXY_LOAD_JSON=') } | Select-Object -Last 1
+                    $json | Should -Not -BeNullOrEmpty
+                    $m = $json.Substring('SMTP_PROXY_LOAD_JSON='.Length) | ConvertFrom-Json
+                    $m | Add-Member -NotePropertyName childPid -NotePropertyValue $p.Id
+                    if ($env:EXL_PROXY_LOAD_ARTIFACTS) {
+                        $m | ConvertTo-Json -Depth 10 | Set-Content (Join-Path $env:EXL_PROXY_LOAD_ARTIFACTS "smtp-auth-proxy-$mode-$count.json")
+                    }
+                    Write-Host ("SMTP proxy load: " + ($m | ConvertTo-Json -Depth 10 -Compress))
+                    return $m
+                }
+                function New-ProxyLoadConfig($dir) {
+                    $config = New-TestConfig $dir
+                    Remove-Item -LiteralPath (Join-Path $dir 'logs-src') -Recurse -Force
+                    return $config
+                }
+            }
+            It 'measures 160000 real-shaped proxied MAILs against a 20000 reference in fresh processes' {
+                $measurements = @()
+                foreach ($count in 20000,160000) {
+                    $dir = Join-Path $TestDrive "proxy-load-$count"
+                    $config = New-ProxyLoadConfig $dir
+                    $warm = New-TestConfig (Join-Path $dir 'warm')
+                    $sid = '08DA000000009A01'; $hubSid = '08DA000000009B01'
+                    Write-Log (Join-Path (Join-Path $dir 'logs-src') ($recv -f 'FrontEnd')) @($header + @(AuthSession $fe $sid 120 $feLocal '10.3.9.1:55009' @((AuthHello 'load.contoso.test'),(AuthLogin 'load.user@contoso.test' -Proxied),'-Local')))
+                    $prefix = @(AuthSession $cp $hubSid 120.1 $beLocal '10.0.0.1:44009' @(AuthBack $sid '10.3.9.1' 55009 'load.contoso.test' 'sender@vendor.example' 'unused' | Select-Object -First 9))
+                    $seq = $prefix.Count; $clock = $script:Base.AddMinutes(120.2)
+                    for ($file=0; $file -lt 4; $file++) {
+                        $path = Join-Path (Join-Path $dir 'logs-src') (($recv -f 'Hub').Replace('-1.LOG', "-$($file+1).LOG"))
+                        [void][IO.Directory]::CreateDirectory((Split-Path $path))
+                        $w = [IO.StreamWriter]::new($path,$false,[Text.UTF8Encoding]::new($true))
+                        try {
+                            foreach ($line in $header) { $w.WriteLine($line) }
+                            if ($file -eq 0) { foreach ($line in $prefix) { $w.WriteLine($line) } }
+                            for ($i=0; $i -lt ($count/4); $i++) {
+                                $time=$clock.AddMilliseconds($seq).UtcDateTime.ToString("yyyy-MM-dd'T'HH:mm:ss.fff'Z'")
+                                $w.WriteLine("$time,$cp,$hubSid,$seq,$beLocal,10.0.0.1:44009,<,MAIL FROM:<sender@vendor.example>,"); $seq++
+                                $time=$clock.AddMilliseconds($seq).UtcDateTime.ToString("yyyy-MM-dd'T'HH:mm:ss.fff'Z'")
+                                $w.WriteLine("$time,$cp,$hubSid,$seq,$beLocal,10.0.0.1:44009,>,250 2.1.0 Sender OK,"); $seq++
+                            }
+                            if ($file -eq 3) { $w.WriteLine("$($clock.AddMilliseconds($seq).UtcDateTime.ToString("yyyy-MM-dd'T'HH:mm:ss.fff'Z'")),$cp,$hubSid,$seq,$beLocal,10.0.0.1:44009,-,,Local") }
+                        } finally { $w.Dispose() }
+                        [IO.File]::SetLastWriteTimeUtc($path,[DateTime]::UtcNow.AddHours(-1))
+                    }
+                    $m = Run-ProxyLoadProbe $config $warm $count 'mail'
+                    $measurements += $m
+                    $m.rows -join '|' | Should -Be "$count|$count|$count|$count"
+                    $m.after -join '|' | Should -Be ($m.rows -join '|')
+                    $m.totals -join '|' | Should -Be "$count|0|0"
+                    $m.parts[1] | Should -BeLessOrEqual 256
+                    $m.parts[2] | Should -BeLessOrEqual 128KB
+                    $m.parts[3] | Should -Be 0
+                    $m.parts[4] | Should -Be 2
+                    $m.parts[5] | Should -Be 2
+                    $m.missingReferences[0] | Should -Be 0
+                    $m.offsets -join '|' | Should -Be '5|5'
+                    $m.errors | Should -Be 0
+                    $m.scratchRemaining | Should -Be 0
+                    $m.memory.Samples | Should -BeGreaterThan 1
+                    ($m.memory.PrivatePeak-$m.memory.PrivateBase) | Should -BeLessOrEqual 64MB
+                    ($m.resolver[0].memory.ManagedPeak-$m.resolver[0].memory.ManagedBase) | Should -BeLessOrEqual 16MB
+                    $m.resolver[0].updated | Should -Be 0
+                    $m.resolver[0].pendingAfter | Should -Be 0
+                    Assert-MemoryTelemetry $m.resolver[0].memory.Telemetry $m.resolver[0].memory.ManagedPeak $m.resolver[0].memory.Samples
+                }
+                $small=$measurements[0]; $large=$measurements[1]
+                ($large.memory.ManagedEnd-$large.memory.ManagedBase)-($small.memory.ManagedEnd-$small.memory.ManagedBase) | Should -BeLessOrEqual 8MB
+                ($large.resolver[0].memory.ManagedEnd-$large.resolver[0].memory.ManagedBase)-($small.resolver[0].memory.ManagedEnd-$small.resolver[0].memory.ManagedBase) | Should -BeLessOrEqual 8MB
+            }
+            It 'keeps 4100 independent late FrontEnd proxy groups across committed resolver generations and fanout' {
+                $count=4100; $dir=Join-Path $TestDrive 'proxy-load-groups'
+                $config=New-ProxyLoadConfig $dir; $warm=New-TestConfig (Join-Path $dir 'warm')
+                $lateSource=Join-Path $dir 'late-frontend.LOG'
+                $hubPath=Join-Path (Join-Path $dir 'logs-src') ($recv -f 'Hub')
+                $lateTarget=Join-Path (Join-Path $dir 'logs-src') ($recv -f 'FrontEnd')
+                [void][IO.Directory]::CreateDirectory((Split-Path $hubPath))
+                $fw=[IO.StreamWriter]::new($lateSource,$false,[Text.UTF8Encoding]::new($true))
+                $hw=[IO.StreamWriter]::new($hubPath,$false,[Text.UTF8Encoding]::new($true))
+                try {
+                    foreach ($line in $header) { $fw.WriteLine($line); $hw.WriteLine($line) }
+                    for ($i=1; $i -le $count; $i++) {
+                        $sid='A{0:X15}' -f $i; $backend='B{0:X15}' -f $i; $port=20000+$i
+                        foreach ($line in (AuthSession $fe $sid 125 $feLocal "10.3.9.2:$port" @((AuthHello "scale-$i.contoso.test"),(AuthLogin "scale-$i@contoso.test" -Proxied),'-Local'))) { $fw.WriteLine($line) }
+                        foreach ($line in (AuthSession $cp $backend 125.1 $beLocal "10.0.0.1:$(30000+$i)" @(AuthBack $sid '10.3.9.2' $port "scale-$i.contoso.test" 'sender@vendor.example' "scale-$i"))) { $hw.WriteLine($line) }
+                    }
+                } finally { $fw.Dispose(); $hw.Dispose() }
+                $m=Run-ProxyLoadProbe $config $warm $count 'groups' $lateSource $lateTarget
+                $m.before -join '|' | Should -Be "$count|$count"
+                $m.rows -join '|' | Should -Be "$count|$count|$count"
+                $m.after -join '|' | Should -Be ($m.rows -join '|')
+                $m.totals -join '|' | Should -Be "$count|0|0"
+                $m.parts[5] | Should -Be ($count*2)
+                $m.parts[3] | Should -Be 0
+                $m.errors | Should -Be 0
+                $m.late.errors | Should -Be 0
+                $m.offsets -join '|' | Should -Be '2|2'
+                $m.missingReferences[0] | Should -Be 0
+                $m.resolver.Count | Should -Be 4
+                foreach ($phase in $m.resolver) {
+                    $phase.queued | Should -Be $count
+                    $phase.replayed | Should -BeGreaterOrEqual ($count*2)
+                    $phase.updated | Should -Be 0
+                    $phase.pendingAfter | Should -Be 0
+                }
+                $m.scratchRemaining | Should -Be 0
+            }
+        }
+        It 'measures actual managed and private memory for 20000, 80000 and 160000 MAILs across four files in fresh processes' {
+            $probe = Join-Path $TestDrive 'smtp-auth-memory.ps1'
+            @'
+param($Root, $Config, $WarmConfig, $Count, $Workers)
+$ErrorActionPreference = 'Stop'
+Import-Module (Join-Path $Root 'ExchangeLogReport.psd1') -Force
+Initialize-ExlEngine -Root $Root
+Add-Type -TypeDefinition @"
+using System;
+using System.Diagnostics;
+using System.Reflection;
+using System.Threading;
+/* SMTP_MEMORY_TELEMETRY_TYPE */
+public sealed class AuthMemorySampler : IDisposable {
+    readonly Thread thread;
+    volatile bool stop;
+    public long ManagedBase, PrivateBase, ManagedPeak, PrivatePeak, Samples;
+    public readonly SmtpMemoryTelemetry Telemetry = new SmtpMemoryTelemetry();
+    public AuthMemorySampler() {
+        ManagedBase = GC.GetTotalMemory(true);
+        using (var p = Process.GetCurrentProcess()) { p.Refresh(); PrivateBase = p.PrivateMemorySize64; }
+        ManagedPeak = ManagedBase; PrivatePeak = PrivateBase;
+        Telemetry.Start();
+        thread = new Thread(() => {
+            using (var p = Process.GetCurrentProcess()) {
+                while (!stop) {
+                    long managed = GC.GetTotalMemory(false);
+                    bool newPeak = managed > ManagedPeak;
+                    ManagedPeak = Math.Max(ManagedPeak, managed);
+                    if (newPeak) Telemetry.RecordPeak(managed);
+                    p.Refresh(); PrivatePeak = Math.Max(PrivatePeak, p.PrivateMemorySize64);
+                    Samples++; Thread.Sleep(20);
+                }
+            }
+        });
+        thread.IsBackground = true; thread.Start();
+    }
+    public void Dispose() { stop = true; thread.Join(); Telemetry.Finish(); }
+    public static SmtpMemoryTelemetry TrackerTelemetry;
+    public static long TrackerWorkItems, TrackerPasses;
+    public static long[][] TrackerSessions;
+    public static long[] Tracker(Assembly engine, string folder, int count) {
+        if (count <= 0 || 160000 % count != 0) throw new ArgumentOutOfRangeException(nameof(count));
+        var headType = engine.GetType("ExchangeLogReport.AuthFragment");
+        var type = engine.GetType("ExchangeLogReport.SmtpAuthTracker");
+        var line = type.GetMethod("Line"); var mail = type.GetMethod("Mail"); var finish = type.GetMethod("Finish");
+        object tracker = null, spool = null;
+        long parts = 0, live = 0;
+        var watch = Stopwatch.StartNew();
+        var sample = new AuthMemorySampler();
+        try {
+            try {
+                TrackerWorkItems = 0; TrackerPasses = 0;
+                TrackerSessions = new long[160000 / count][];
+                // Equal total work, with independent N-MAIL sessions fully measured and closed before the next one.
+                for (int pass = 0; pass < TrackerSessions.Length; pass++) {
+                    var head = Activator.CreateInstance(headType, true);
+                    foreach (var name in new[] { "Server", "Direction", "Role", "SessionId", "SourceKey" })
+                        headType.GetField(name).SetValue(head, name == "Direction" ? "Receive" : name == "Role" ? "FrontEnd" : "memory");
+                    headType.GetField("FirstMs").SetValue(head, 1000L);
+                    spool = Activator.CreateInstance(engine.GetType("ExchangeLogReport.SmtpSpool"), new object[] { folder });
+                    tracker = Activator.CreateInstance(type, new object[] { true, head, spool, 1L });
+                    var args = new object[] { "+", false, false, 1000L, 0L, 0L, "", "", null, null, false };
+                    line.Invoke(tracker, args);
+                    args[0] = "<"; args[1] = true; args[4] = 1L; args[6] = "AUTH PLAIN [redacted]";
+                    line.Invoke(tracker, args);
+                    args[0] = "*"; args[1] = false; args[4] = 2L; args[6] = "memory.user@contoso.test"; args[7] = "authenticated";
+                    line.Invoke(tracker, args);
+                    args[0] = ">"; args[2] = true; args[4] = 3L; args[6] = "235 Authentication successful"; args[7] = "";
+                    line.Invoke(tracker, args);
+                    var m = new object[] { 1000L, 4L, 4L, true };
+                    long before = TrackerWorkItems;
+                    for (int i = 0; i < count; i++) {
+                        long seq = 4L + i * 2L;
+                        args[0] = "<"; args[1] = true; args[2] = false; args[3] = 1000L + seq; args[4] = seq; args[5] = seq;
+                        args[6] = "MAIL FROM:<sender@vendor.example>";
+                        line.Invoke(tracker, args);
+                        m[0] = args[3]; m[1] = seq; m[2] = seq; mail.Invoke(tracker, m);
+                        args[0] = ">"; args[1] = false; args[2] = true; args[4] = seq + 1; args[5] = seq + 1; args[6] = "250 OK";
+                        line.Invoke(tracker, args);
+                        TrackerWorkItems++;
+                    }
+                    parts = (long)spool.GetType().GetField("Parts").GetValue(spool);
+                    live = (int)type.GetProperty("Live").GetValue(tracker);
+                    long endSeq = 4L + count * 2L;
+                    args[0] = "-"; args[1] = false; args[2] = false; args[3] = 1000L + endSeq; args[4] = endSeq; args[5] = endSeq; args[6] = ""; args[7] = "Local";
+                    line.Invoke(tracker, args);
+                    long closed = (long)finish.Invoke(tracker, new object[] { long.MinValue });
+                    TrackerSessions[pass] = new[] { TrackerWorkItems - before, parts, live, closed,
+                        (long)(int)type.GetProperty("Live").GetValue(tracker), (long)spool.GetType().GetField("Parts").GetValue(spool) };
+                    TrackerPasses++;
+                    if (pass + 1 < TrackerSessions.Length) {
+                        ((IDisposable)spool).Dispose();
+                        spool = null; tracker = null;
+                    }
+                }
+            } finally {
+                sample.Dispose();
+                TrackerTelemetry = sample.Telemetry;
+            }
+            long end = GC.GetTotalMemory(true);
+            GC.KeepAlive(tracker); GC.KeepAlive(spool); GC.KeepAlive(TrackerSessions);
+            return new[] { sample.ManagedBase, sample.ManagedPeak, end, sample.Samples, (long)watch.ElapsedMilliseconds, parts, live };
+        } finally { if (spool != null) ((IDisposable)spool).Dispose(); }
+    }
+}
+"@
+function Collect($settings) {
+    $store = Open-ExlStore -Settings $settings
+    try {
+        $run = $store.StartRun('Collect', 'memory', 'synthetic', '1.0.0')
+        return & (Get-Module ExchangeLogReport) { param($s,$st,$r)
+            Invoke-ExlCollection -Store $st -Settings $s -RunId $r -Servers @($s.Servers[0]) 6>$null
+        } $settings $store $run
+    } finally { $store.Dispose() }
+}
+$cache = [ExchangeLogReport.Store]::CacheKilobytes
+try {
+    [ExchangeLogReport.Store]::CacheKilobytes = 8192
+    $warm = Import-ExlConfiguration -Path $WarmConfig -Root $Root
+    [void](Collect $warm)
+    $s = Import-ExlConfiguration -Path $Config -Root $Root
+    $s.Collection.Parallelism = [int]$Workers
+    $s.Storage.DetailRetentionDays = 0
+    $watch = [Diagnostics.Stopwatch]::StartNew()
+    $sample = [AuthMemorySampler]::new()
+    try { $result = Collect $s }
+    finally { $sample.Dispose() }
+    $end = [GC]::GetTotalMemory($true)
+    $collectionSeconds = $watch.Elapsed.TotalSeconds
+    $tracker = [AuthMemorySampler]::Tracker([ExchangeLogReport.Collector].Assembly, (Split-Path $s.Storage.DatabasePath), [int]$Count)
+    $store = Open-ExlStore -Settings $s
+    try {
+        $engine = [ExchangeLogReport.Collector].Assembly
+        $writer = [Activator]::CreateInstance($engine.GetType('ExchangeLogReport.Writer'), [object[]]@($store))
+        $resolver = [Activator]::CreateInstance($engine.GetType('ExchangeLogReport.AuthResolver'), [object[]]@($store, $writer, [long]600000))
+        $tx = $store.Begin()
+        try {
+            $writer.Use($tx)
+            $resolver.Touch('EXCH01', 'Receive', 'FrontEnd', 'warm-absent-scope')
+            $resolver.Flush($tx)
+            $resolver.Touch('EXCH01', 'Receive', 'FrontEnd', '08DA000000003A01')
+            $resolverPasses = [int](160000 / [int]$Count)
+            $gcBefore = @([GC]::CollectionCount(0), [GC]::CollectionCount(1), [GC]::CollectionCount(2))
+            $rs = [AuthMemorySampler]::new()
+            $rw = [Diagnostics.Stopwatch]::StartNew()
+            try {
+                # Equal work lets every volume exercise the GC's transient allocation budget.
+                for ($pass = 0; $pass -lt $resolverPasses; $pass++) {
+                    if ($pass -gt 0) { $resolver.Touch('EXCH01', 'Receive', 'FrontEnd', '08DA000000003A01') }
+                    $resolver.Flush($tx)
+                }
+            } finally { $rs.Dispose() }
+            $resolverEnd = [GC]::GetTotalMemory($true)
+            $resolverMemory = @{
+                managedBase=$rs.ManagedBase; managedPeak=$rs.ManagedPeak; managedEnd=$resolverEnd;
+                privateBase=$rs.PrivateBase; privatePeak=$rs.PrivatePeak; samples=$rs.Samples;
+                elapsedSeconds=$rw.Elapsed.TotalSeconds; replayed=$resolver.Replayed; updated=$resolver.Updated;
+                passes=$resolverPasses; workItems=([int]$Count * $resolverPasses);
+                gcCollections=@(([GC]::CollectionCount(0)-$gcBefore[0]), ([GC]::CollectionCount(1)-$gcBefore[1]), ([GC]::CollectionCount(2)-$gcBefore[2]));
+                serverGc=[Runtime.GCSettings]::IsServerGC
+                telemetry=$rs.Telemetry
+            }
+            $tx.Commit()
+        } finally { $resolver.Dispose(); $writer.Dispose(); $tx.Dispose() }
+    } finally { $store.Dispose() }
+    $store = Open-ExlStore -Settings $s -ReadOnly
+    try {
+        $row = $store.Query("SELECT COUNT(*), COUNT(DISTINCT auth_sequence), SUM(auth_user='memory.user@contoso.test' AND auth_mechanism='PLAIN' AND auth_result='Succeeded' AND auth_source='Direct') FROM smtp_transaction WHERE session_id='08DA000000003A01';", $null).Rows[0]
+        $parts = $store.Query("SELECT COUNT(*), MAX(json_array_length(observations)), MAX(length(CAST(observations AS BLOB))), SUM(complete_end), SUM(conflicted) FROM smtp_auth_fragment WHERE session_id='08DA000000003A01';", $null).Rows[0]
+    } finally { $store.Dispose() }
+    $runtime = [SmtpMemoryTelemetry]::Runtime()
+    $runtime['powerShellVersion'] = $PSVersionTable.PSVersion.ToString()
+    $data = @{
+        count=[int]$Count; workers=[int]$Workers; rows=@($row); parts=@($parts);
+        managedBase=$sample.ManagedBase; managedPeak=$sample.ManagedPeak; managedEnd=$end;
+        privateBase=$sample.PrivateBase; privatePeak=$sample.PrivatePeak; samples=$sample.Samples;
+        elapsedSeconds=$collectionSeconds; errors=$result.Errors; tracker=$tracker; resolver=$resolverMemory;
+        trackerTelemetry=[AuthMemorySampler]::TrackerTelemetry; trackerWorkItems=[AuthMemorySampler]::TrackerWorkItems;
+        trackerPasses=[AuthMemorySampler]::TrackerPasses; trackerSessions=[AuthMemorySampler]::TrackerSessions;
+        runtime=$runtime; memoryTelemetry=$sample.Telemetry;
+        scratchRemaining=@(Get-ChildItem -LiteralPath (Split-Path $s.Storage.DatabasePath) -Force -Filter '.report-*').Count
+    }
+    'SMTP_MEMORY_JSON=' + ($data | ConvertTo-Json -Depth 8 -Compress)
+} finally { [ExchangeLogReport.Store]::CacheKilobytes = $cache }
+'@.Replace('/* SMTP_MEMORY_TELEMETRY_TYPE */', $memoryTelemetrySource) | Set-Content -LiteralPath $probe -Encoding utf8
+            $measurements = @()
+            foreach ($case in @(@{ Count = 20000; Workers = 1 }, @{ Count = 80000; Workers = 1 }, @{ Count = 160000; Workers = 1 }, @{ Count = 160000; Workers = 2 })) {
+                $count = $case.Count
+                $dir = Join-Path $TestDrive "smtp-auth-memory-$count-$($case.Workers)"
+                $config = New-TestConfig $dir
+                $warm = New-TestConfig (Join-Path $dir 'warm')
+                $seq = 0
+                $clock = $script:Base.AddMinutes(120).AddSeconds(1)
+                for ($file = 0; $file -lt 4; $file++) {
+                    $path = Join-Path (Join-Path $dir 'logs-src') (($recv -f 'FrontEnd').Replace('-1.LOG', "-$($file + 1).LOG"))
+                    [void][IO.Directory]::CreateDirectory((Split-Path $path))
+                    $w = [IO.StreamWriter]::new($path, $false, [Text.UTF8Encoding]::new($true))
+                    try {
+                        foreach ($line in $header) { $w.WriteLine($line) }
+                        if ($file -eq 0) {
+                            foreach ($line in (AuthSession $fe '08DA000000003A01' 120 $feLocal '10.3.8.3:54002' @((AuthHello 'memory.contoso.test'), (AuthPlain 'memory.user@contoso.test')))) { $w.WriteLine($line); $seq++ }
+                        }
+                        for ($i = 0; $i -lt ($count / 4); $i++) {
+                            $time = $clock.AddMilliseconds($seq).UtcDateTime.ToString("yyyy-MM-dd'T'HH:mm:ss.fff'Z'")
+                            $w.WriteLine("$time,$fe,08DA000000003A01,$seq,$feLocal,10.3.8.3:54002,<,MAIL FROM:<sender@vendor.example>,"); $seq++
+                            $time = $clock.AddMilliseconds($seq).UtcDateTime.ToString("yyyy-MM-dd'T'HH:mm:ss.fff'Z'")
+                            $w.WriteLine("$time,$fe,08DA000000003A01,$seq,$feLocal,10.3.8.3:54002,>,250 OK,"); $seq++
+                        }
+                        if ($file -eq 3) { $w.WriteLine("$($clock.AddMilliseconds($seq).UtcDateTime.ToString("yyyy-MM-dd'T'HH:mm:ss.fff'Z'")),$fe,08DA000000003A01,$seq,$feLocal,10.3.8.3:54002,-,,Local") }
+                    } finally { $w.Dispose() }
+                    [IO.File]::SetLastWriteTimeUtc($path, [DateTime]::UtcNow.AddHours(-1))
+                }
+                $output = & (Join-Path $PSHOME 'pwsh.exe') -NoProfile -File $probe $script:Root $config $warm $count $case.Workers 2>&1
+                $LASTEXITCODE | Should -Be 0 -Because ($output -join "`n")
+                $json = $output | Where-Object { "$_".StartsWith('SMTP_MEMORY_JSON=') } | Select-Object -Last 1
+                $json | Should -Not -BeNullOrEmpty
+                $m = "$json".Substring('SMTP_MEMORY_JSON='.Length) | ConvertFrom-Json
+                $measurements += $m
+                Write-Host ("SMTP actual memory: " + ($m | ConvertTo-Json -Depth 8 -Compress))
+                $m.rows -join '|' | Should -Be "$count|$count|$count"
+                $m.parts[1] | Should -BeLessOrEqual 256
+                $m.parts[2] | Should -BeLessOrEqual 128KB
+                $m.parts[3] | Should -Be 1
+                $m.parts[4] | Should -Be 0
+                $m.scratchRemaining | Should -Be 0
+                $m.samples | Should -BeGreaterThan 1
+                ($m.privatePeak - $m.privateBase) | Should -BeLessOrEqual 64MB
+                ($m.resolver.managedPeak - $m.resolver.managedBase) | Should -BeLessOrEqual 16MB
+                $m.resolver.updated | Should -Be 0
+                $m.resolver.workItems | Should -Be 160000
+                $m.resolver.replayed | Should -Be (2 * $m.resolver.passes)
+                $m.tracker[5] | Should -BeGreaterThan 0
+                $m.tracker[6] | Should -BeLessOrEqual 256
+                $m.tracker.Count | Should -Be 7
+                $m.trackerWorkItems | Should -Be 160000
+                $m.trackerPasses | Should -Be (160000 / $count)
+                $m.trackerSessions.Count | Should -Be $m.trackerPasses
+                foreach ($session in $m.trackerSessions) {
+                    $session[0] | Should -Be $count
+                    $session[1] | Should -Be ([math]::Floor(($count + 5) / 256))
+                    $session[2] | Should -Be (($count + 5) % 256)
+                    $session[2] | Should -BeLessOrEqual 256
+                    $session[3] | Should -Be ([math]::Ceiling(($count + 6) / 256))
+                    $session[4] | Should -Be 0
+                    $session[5] | Should -Be $session[3]
+                }
+                Assert-MemoryTelemetry $m.trackerTelemetry $m.tracker[1] $m.tracker[3]
+                Assert-MemoryTelemetry $m.resolver.telemetry $m.resolver.managedPeak $m.resolver.samples
+            }
+            $small = $measurements[0]; $large = $measurements[2]
+            ($large.managedEnd - $large.managedBase) - ($small.managedEnd - $small.managedBase) | Should -BeLessOrEqual 8MB
+            ($large.tracker[2] - $large.tracker[0]) - ($small.tracker[2] - $small.tracker[0]) | Should -BeLessOrEqual 2MB
+            ($large.tracker[1] - $large.tracker[0]) | Should -BeLessOrEqual ([math]::Max(8MB, 1.5 * ($small.tracker[1] - $small.tracker[0])))
+            ($large.resolver.managedEnd - $large.resolver.managedBase) - ($small.resolver.managedEnd - $small.resolver.managedBase) | Should -BeLessOrEqual 8MB
+            ($large.resolver.managedPeak - $large.resolver.managedBase) | Should -BeLessOrEqual ([math]::Max(8MB, 1.5 * ($small.resolver.managedPeak - $small.resolver.managedBase)))
+            ($large.privatePeak - $large.privateBase) | Should -BeLessOrEqual ([math]::Max(16MB, 1.5 * ($small.privatePeak - $small.privateBase)))
+        }
     }
 }
 
@@ -1186,6 +3566,14 @@ Describe 'Command line and periods' {
 }
 
 Describe 'Entry script' {
+    BeforeAll {
+        # The entry script emits UTF-8; native stdout is decoded using the caller's console encoding.
+        $script:EntryOutputEncoding = [Console]::OutputEncoding
+        [Console]::OutputEncoding = [Text.UTF8Encoding]::new($false)
+    }
+    AfterAll {
+        [Console]::OutputEncoding = $script:EntryOutputEncoding
+    }
     It 'keeps the runtime readme and script disclaimer identical to the project readme' {
         $pattern = '(?ms)^## Disclaimer\r?\n\s*(.+?)(?=^## |\z)'
         $projectReadme = Get-Content -LiteralPath (Join-Path $script:RepoRoot 'README.md') -Raw
@@ -1197,6 +3585,32 @@ Describe 'Entry script' {
         $help = Get-Help (Join-Path $script:Root 'Invoke-ExchangeLogReport.ps1') -Full
         $notes = [regex]::Replace(($help.alertSet.alert.Text -join ' '), '\s+', ' ').Trim()
         $notes.EndsWith($expected, [StringComparison]::Ordinal) | Should -BeTrue
+    }
+    It 'documents the as-is support boundary and every e-mail opt-in' {
+        $help = Get-Help (Join-Path $script:Root 'Invoke-ExchangeLogReport.ps1') -Full
+        $expected = @(
+            'This Script is a Personal project.'
+            'It''s provided "AS-IS". It''s not an official Microsoft product so no support can be expected from Microsoft.'
+            'As any scripts you must read carefully the documentation and test it first in a Test environment before any run in Production.'
+        ) -join ' '
+        $notes = [regex]::Replace(($help.alertSet.alert.Text -join ' '), '\s+', ' ').Trim()
+        $notes.EndsWith($expected, [StringComparison]::Ordinal) | Should -BeTrue
+        $readme = Get-Content -LiteralPath (Join-Path $script:Root 'README.md') -Raw
+        $disclaimer = [regex]::Match($readme, '(?ms)^## Disclaimer\r?\n\s*(.+?)(?=^## |\z)').Groups[1].Value
+        [regex]::Replace($disclaimer, '\s+', ' ').Trim() | Should -BeExactly $expected
+        $description = $help.description.Text -join ' '
+        $description | Should -Match 'disabled in the delivered configuration'
+        $description | Should -Match 'Mail\.Enabled'
+        $description | Should -Match ([regex]::Escape('-SendMail:$false'))
+        $description | Should -Match 'MailTest sends a test message'
+        $description | Should -Not -Match 'never sends anything'
+    }
+    It 'uses the manifest version in the runtime and the entry-script help' {
+        $version = (Import-PowerShellDataFile (Join-Path $script:Root 'ExchangeLogReport.psd1')).ModuleVersion
+        $moduleVersion = & (Get-Module ExchangeLogReport) { $script:ToolVersion }
+        $moduleVersion | Should -Be $version
+        $help = Get-Help (Join-Path $script:Root 'Invoke-ExchangeLogReport.ps1') -Full
+        ($help.alertSet.alert.Text -join ' ') | Should -Match ('Version\s*:\s*' + [regex]::Escape($version))
     }
     It 'Status on a new installation confirms the configuration and creates no database' {
         $dir = Join-Path $TestDrive 'fresh'
