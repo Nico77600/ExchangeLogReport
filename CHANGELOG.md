@@ -3,6 +3,11 @@
 All notable changes are listed here. Versions follow MAJOR.MINOR.PATCH (see the developer guide, Annex C).
 Author: Nicolas Fabert.
 
+## [2.1.1] — 2026-10-14
+
+### Fixed
+- The delivered `Report.TimeZone` and the default used when it is absent are now `Romance Standard Time`, the native Windows Paris zone. Winter/summer rules and explicit `Europe/Paris` configurations remain supported.
+
 ## [2.1.0] — 2026-10-13
 
 The SMTP clients, the SMTP CSV files and the Messages route show the authenticated user, and large Detailed reports run within a bounded memory budget. Version 2.0.1 was only a local candidate and was never published; its changes are listed here.

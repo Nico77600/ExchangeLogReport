@@ -1,9 +1,9 @@
 ---
 title: Exchange Log Report
 subtitle: User guide
-version: 2.1.0
+version: 2.1.1
 author: Nicolas Fabert
-updated: 2026-10-12
+updated: 2026-10-14
 ---
 
 # Exchange Log Report — User guide
@@ -383,7 +383,7 @@ Add `-Collect` to read the new lines first whatever the age of the data, `-NoCol
 
 ### Time zone error
 
-If the configuration stops with **Unknown time zone 'Europe/Paris'**, set `Report.TimeZone = 'Romance Standard Time'` in the configuration file, then repeat the command. This is the native Windows Paris zone, with daylight-saving rules, not a fixed UTC offset. Some Windows/.NET installations cannot resolve IANA names; the local corrected version performs this fallback automatically.
+The delivered configuration uses `Report.TimeZone = 'Romance Standard Time'`, the native Windows Paris zone, with daylight-saving rules, not a fixed UTC offset. The same default applies when this setting is absent. Existing configurations that explicitly use `Europe/Paris` remain supported, with an automatic fallback to the native Windows zone when IANA lookup is unavailable. With an older package that stops with **Unknown time zone 'Europe/Paris'**, set `Report.TimeZone = 'Romance Standard Time'`, then repeat the command.
 
 ### After a CU, a new server or a moved log folder
 
