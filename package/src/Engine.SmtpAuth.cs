@@ -826,34 +826,38 @@ namespace ExchangeLogReport
                 int sub = 0;
                 foreach (var e in doc.RootElement.EnumerateArray())
                 {
-                    var o = new AuthObs
-                    {
-                        K = e[0].GetString()[0], Ms = e[1].GetInt64(), Seq = e[2].GetInt64(),
-                        A = e[3].ValueKind == JsonValueKind.Null ? null : e[3].GetString(),
-                        B = e[4].ValueKind == JsonValueKind.Null ? null : e[4].GetString(),
-                        Code = e[5].GetInt32(), Frag = fragmentId
-                    };
-                    if (e.GetArrayLength() >= 8)
-                    {
-                        o.Off = e[6].GetInt64(); o.Sub = e[7].GetInt32();
-                        o.Pos = o.Seq >= 0 ? o.Seq : o.Off;
-                    }
-                    else
-                    {
-                        // First format: no offset, the subordinal is the order inside the array.
-                        o.Pos = o.Seq >= 0 ? o.Seq : (long)part * 256 + index;
-                        sub = o.Pos == previousPos ? sub + 1 : 0;
-                        o.Sub = sub;
-                        long ordinal;
-                        if (o.K == 'M' && o.Seq < 0 && long.TryParse(o.A, NumberStyles.None, CultureInfo.InvariantCulture, out ordinal)) o.A = (-(ordinal + 2)).ToString(CultureInfo.InvariantCulture);
-                        else if (o.K == 'M') o.A = o.Seq.ToString(CultureInfo.InvariantCulture);
-                    }
-                    previousPos = o.Pos;
+                    var o = new AuthObs();
+                    ReadObservation(e, fragmentId, part, index, ref previousPos, ref sub, o);
                     list.Add(o);
                     index++;
                 }
             }
             return list;
+        }
+
+        internal static void ReadObservation(JsonElement e, long fragmentId, long part, int index, ref long previousPos, ref int sub, AuthObs o)
+        {
+            o.K = e[0].ValueEquals("M") ? 'M' : e[0].GetString()[0];
+            o.Ms = e[1].GetInt64(); o.Seq = e[2].GetInt64();
+            o.A = e[3].ValueKind == JsonValueKind.Null ? null : e[3].GetString();
+            o.B = e[4].ValueKind == JsonValueKind.Null ? null : e[4].GetString();
+            o.Code = e[5].GetInt32(); o.Frag = fragmentId; o.Off = -1; o.Conflict = false;
+            if (e.GetArrayLength() >= 8)
+            {
+                o.Off = e[6].GetInt64(); o.Sub = e[7].GetInt32();
+                o.Pos = o.Seq >= 0 ? o.Seq : o.Off;
+            }
+            else
+            {
+                // First format: no offset, the subordinal is the order inside the array.
+                o.Pos = o.Seq >= 0 ? o.Seq : part * 256 + index;
+                sub = o.Pos == previousPos ? sub + 1 : 0;
+                o.Sub = sub;
+                long ordinal;
+                if (o.K == 'M' && o.Seq < 0 && long.TryParse(o.A, NumberStyles.None, CultureInfo.InvariantCulture, out ordinal)) o.A = (-(ordinal + 2)).ToString(CultureInfo.InvariantCulture);
+                else if (o.K == 'M') o.A = o.Seq.ToString(CultureInfo.InvariantCulture);
+            }
+            previousPos = o.Pos;
         }
 
         public static List<long[]> ReadCoverage(string text)
@@ -1151,8 +1155,12 @@ namespace ExchangeLogReport
         readonly Store _store;
         readonly Writer _writer;
         readonly long _idleMs;
-        readonly Dictionary<string, SqliteCommand> _scratchCommands = new Dictionary<string, SqliteCommand>(StringComparer.Ordinal);
-        readonly Dictionary<string, SqliteCommand> _mainCommands = new Dictionary<string, SqliteCommand>(StringComparer.Ordinal);
+        readonly Dictionary<string, Prepared> _scratchCommands = new Dictionary<string, Prepared>(StringComparer.Ordinal);
+        readonly Dictionary<string, Prepared> _mainCommands = new Dictionary<string, Prepared>(StringComparer.Ordinal);
+        struct MailReference { public long Fragment, Position; }
+        struct MailUpdate { public long Id; public bool Changed; }
+        readonly MailReference[] _mailReferences = new MailReference[256];
+        readonly MailUpdate[] _mailUpdates = new MailUpdate[256];
         ReportScratch _scratch;
         int _pending;
         SqliteTransaction _tx;
@@ -1187,6 +1195,7 @@ namespace ExchangeLogReport
 
         void CloseScratch()
         {
+            foreach (var c in _scratchCommands.Values) c.Dispose();
             _scratchCommands.Clear();
             if (_scratch != null) { _scratch.Dispose(); _scratch = null; }
         }
@@ -1210,43 +1219,41 @@ namespace ExchangeLogReport
 
         void Exec(string sql) { using (var c = _scratch.Command(sql)) c.ExecuteNonQuery(); }
 
-        static SqliteCommand Typed(SqliteCommand c, string types)
+        Prepared S(string name, string sql, string types)
         {
-            for (int i = 0; i < types.Length; i++) c.Parameters.Add("@p" + i.ToString(CultureInfo.InvariantCulture), types[i] == 'i' ? SqliteType.Integer : SqliteType.Text);
-            c.Prepare();
-            return c;
-        }
-
-        SqliteCommand S(string name, string sql, string types)
-        {
-            SqliteCommand c;
+            Prepared c;
             if (_scratchCommands.TryGetValue(name, out c)) return c;
             Open();
-            c = Typed(_scratch.Own(_scratch.Command(sql)), types);
+            using (var command = _scratch.Command(sql)) c = new Prepared(command, types.Length);
             _scratchCommands[name] = c;
             return c;
         }
 
-        SqliteCommand M(string name, string sql, string types)
+        Prepared M(string name, string sql, string types)
         {
-            SqliteCommand c;
+            Prepared c;
             if (!_mainCommands.TryGetValue(name, out c))
             {
-                c = Typed(_store.Command(sql, _tx), types);
+                using (var command = _store.Command(sql, _tx)) c = new Prepared(command, types.Length);
                 _mainCommands[name] = c;
             }
-            c.Transaction = _tx;
             return c;
         }
 
-        static SqliteCommand With(SqliteCommand c, params object[] values)
+        static Prepared With(Prepared c, params object[] values)
         {
-            for (int i = 0; i < values.Length; i++) c.Parameters[i].Value = values[i] ?? DBNull.Value;
+            for (int i = 0; i < values.Length; i++) c.Set(i, values[i]);
             return c;
         }
 
-        static string Str(SqliteDataReader r, int i) { return r.IsDBNull(i) ? null : r.GetString(i); }
-        static long Num(SqliteDataReader r, int i, long fallback) { return r.IsDBNull(i) ? fallback : r.GetInt64(i); }
+        static Prepared With(Prepared c, long a, long b) { c.Set(0, a); c.Set(1, b); return c; }
+        static Prepared With(Prepared c, long a, long b, long d) { With(c, a, b); c.Set(2, d); return c; }
+        static Prepared With(Prepared c, long a, long b, long d, long e) { With(c, a, b, d); c.Set(3, e); return c; }
+        static Prepared With(Prepared c, long a, long b, long d, long e, long f) { With(c, a, b, d, e); c.Set(4, f); return c; }
+        static Prepared With(Prepared c, long a, long b, long d, long e, long f, long g) { With(c, a, b, d, e, f); c.Set(5, g); return c; }
+
+        static string Str(Prepared.Rows r, int i) { return r.IsDBNull(i) ? null : r.GetString(i); }
+        static long Num(Prepared.Rows r, int i, long fallback) { return r.IsDBNull(i) ? fallback : r.GetInt64(i); }
 
         void ClearScope(int scope)
         {
@@ -1386,54 +1393,75 @@ namespace ExchangeLogReport
         void ReadParts(int scope, AuthEpoch e, Origin o, string server, string direction, string role, string sid)
         {
             long after = 0;
+            var observation = new AuthObs();
             string sql = "SELECT id, part, COALESCE(evidence_format,1), coverage, conflicted, conflict_positions, observations FROM smtp_auth_fragment WHERE server=@p0 AND role=@p1 AND direction=@p2 AND session_id=@p3 AND COALESCE(source_key,'')=@p4 AND first_offset=@p5 AND COALESCE(origin_first_ms,first_ms)=@p6 AND id>@p7 ORDER BY id LIMIT " + PartPage.ToString(CultureInfo.InvariantCulture) + ";";
             while (true)
             {
-                var rows = new List<object[]>();
+                int count = 0;
+                // Insertion only touches the separate scratch connection; keep one JSON part live, not a page of strings.
                 using (var r = With(M("parts", sql, "tttttiii"), server, role, direction, sid, o.SourceKey, o.FirstOffset, o.OriginMs, after).ExecuteReader())
-                    while (r.Read()) rows.Add(new object[] { r.GetInt64(0), r.GetInt64(1), r.GetInt64(2), Str(r, 3), r.GetInt64(4) != 0, Str(r, 5), Str(r, 6) });
-                foreach (var row in rows)
                 {
-                    long id = (long)row[0];
-                    int format = (int)(long)row[2];
-                    long logical = format >= 2 ? -1L - (long)row[1] : (long)row[1];
-                    after = id;
-                    if (e.SeqLess && format < 2 && o.MaxFormat >= 2) continue;
-                    foreach (var iv in SmtpAuthStore.ReadCoverage((string)row[3]))
-                        With(S("covraw", "INSERT OR IGNORE INTO covraw(scope, epoch, lo, hi) VALUES(@p0,@p1,@p2,@p3);", "iiii"), (long)scope, (long)e.Index, iv[0], iv[1]).ExecuteNonQuery();
-                    HashSet<long> positions = null;
-                    bool partConflict = (bool)row[4];
-                    if (partConflict && row[5] != null)
+                    while (r.Read())
                     {
-                        positions = new HashSet<long>();
-                        foreach (var t in ((string)row[5]).Split(new[] { ',' }, StringSplitOptions.RemoveEmptyEntries)) { long v; if (long.TryParse(t, NumberStyles.AllowLeadingSign, CultureInfo.InvariantCulture, out v)) positions.Add(v); }
+                        count++;
+                        long id = r.GetInt64(0);
+                        int format = (int)r.GetInt64(2);
+                        long logical = format >= 2 ? -1L - r.GetInt64(1) : r.GetInt64(1);
+                        after = id;
+                        if (e.SeqLess && format < 2 && o.MaxFormat >= 2) continue;
+                        foreach (var iv in SmtpAuthStore.ReadCoverage(Str(r, 3)))
+                            With(S("covraw", "INSERT OR IGNORE INTO covraw(scope, epoch, lo, hi) VALUES(@p0,@p1,@p2,@p3);", "iiii"), (long)scope, (long)e.Index, iv[0], iv[1]).ExecuteNonQuery();
+                        HashSet<long> positions = null;
+                        bool partConflict = r.GetInt64(4) != 0;
+                        string conflictPositions = Str(r, 5);
+                        if (partConflict && conflictPositions != null)
+                        {
+                            positions = new HashSet<long>();
+                            foreach (var t in conflictPositions.Split(new[] { ',' }, StringSplitOptions.RemoveEmptyEntries)) { long v; if (long.TryParse(t, NumberStyles.AllowLeadingSign, CultureInfo.InvariantCulture, out v)) positions.Add(v); }
+                        }
+                        if (!r.IsDBNull(6) && r.GetUtf8(6).Length != 0)
+                        {
+                            var json = new Utf8JsonReader(r.GetUtf8(6));
+                            using (var document = JsonDocument.ParseValue(ref json))
+                            {
+                                int index = 0, sub = 0;
+                                long previousPos = long.MinValue;
+                                foreach (var item in document.RootElement.EnumerateArray())
+                                {
+                                    SmtpAuthStore.ReadObservation(item, id, logical, index++, ref previousPos, ref sub, observation);
+                                    // Insert copies every value to SQLite before this observation is filled again.
+                                    Insert(scope, e, observation, partConflict && (positions == null || positions.Contains(observation.Pos)));
+                                }
+                                if (json.Read()) throw new JsonException("Unexpected trailing JSON value.");
+                            }
+                        }
                     }
-                    foreach (var ob in SmtpAuthStore.Read((string)row[6] ?? "[]", id, logical))
-                        Insert(scope, e, ob, partConflict && (positions == null || positions.Contains(ob.Pos)));
                 }
-                if (rows.Count < PartPage) break;
+                if (count < PartPage) break;
             }
         }
 
         void Insert(int scope, AuthEpoch e, AuthObs o, bool conflict)
         {
-            object[] values = { (long)scope, (long)e.Index, o.Pos, (long)o.Sub, o.K.ToString(), o.Ms, o.Seq, o.A, o.B, (long)o.Code, o.Frag, conflict ? 1L : 0L };
+            string kind = o.K == 'M' ? "M" : o.K.ToString();
             if (o.K == 'M')
             {
                 long position;
                 if (long.TryParse(o.A, NumberStyles.AllowLeadingSign, CultureInfo.InvariantCulture, out position))
                     With(S("mref", "INSERT OR IGNORE INTO mref(scope, epoch, pos, sub, frag, position) VALUES(@p0,@p1,@p2,@p3,@p4,@p5);", "iiiiii"), (long)scope, (long)e.Index, o.Pos, (long)o.Sub, o.Frag, position).ExecuteNonQuery();
             }
-            if (conflict)
-            {
-                With(S("evconflict", "INSERT INTO ev(scope,epoch,pos,sub,k,ms,seq,a,b,code,frag,conflict) VALUES(@p0,@p1,@p2,@p3,@p4,@p5,@p6,@p7,@p8,@p9,@p10,@p11) ON CONFLICT(scope,epoch,pos,sub) DO UPDATE SET conflict=1;", "iiiitiittiii"), values).ExecuteNonQuery();
-                return;
-            }
-            if (With(S("evinsert", "INSERT OR IGNORE INTO ev(scope,epoch,pos,sub,k,ms,seq,a,b,code,frag,conflict) VALUES(@p0,@p1,@p2,@p3,@p4,@p5,@p6,@p7,@p8,@p9,@p10,@p11);", "iiiitiittiii"), values).ExecuteNonQuery() > 0) return;
+            var insert = conflict
+                ? S("evconflict", "INSERT INTO ev(scope,epoch,pos,sub,k,ms,seq,a,b,code,frag,conflict) VALUES(@p0,@p1,@p2,@p3,@p4,@p5,@p6,@p7,@p8,@p9,@p10,@p11) ON CONFLICT(scope,epoch,pos,sub) DO UPDATE SET conflict=1;", "iiiitiittiii")
+                : S("evinsert", "INSERT OR IGNORE INTO ev(scope,epoch,pos,sub,k,ms,seq,a,b,code,frag,conflict) VALUES(@p0,@p1,@p2,@p3,@p4,@p5,@p6,@p7,@p8,@p9,@p10,@p11);", "iiiitiittiii");
+            insert.Set(0, scope); insert.Set(1, e.Index); insert.Set(2, o.Pos); insert.Set(3, o.Sub);
+            insert.Set(4, kind); insert.Set(5, o.Ms); insert.Set(6, o.Seq); insert.Set(7, o.A);
+            insert.Set(8, o.B); insert.Set(9, o.Code); insert.Set(10, o.Frag); insert.Set(11, conflict ? 1L : 0L);
+            int inserted = insert.ExecuteNonQuery();
+            if (conflict || inserted > 0) return;
             // The same position was already read (the part was read again by another file or collection): only a different content is a conflict.
             bool same = false;
             using (var r = With(S("evsame", "SELECT k, ms, a, b, code FROM ev WHERE scope=@p0 AND epoch=@p1 AND pos=@p2 AND sub=@p3;", "iiii"), (long)scope, (long)e.Index, o.Pos, (long)o.Sub).ExecuteReader())
-                if (r.Read()) same = r.GetString(0) == o.K.ToString() && r.GetInt64(1) == o.Ms && Str(r, 2) == o.A && Str(r, 3) == o.B && r.GetInt64(4) == o.Code;
+                if (r.Read()) same = r.GetString(0) == kind && r.GetInt64(1) == o.Ms && Str(r, 2) == o.A && Str(r, 3) == o.B && r.GetInt64(4) == o.Code;
             if (!same) With(S("evmark", "UPDATE ev SET conflict=1 WHERE scope=@p0 AND epoch=@p1 AND pos=@p2 AND sub=@p3;", "iiii"), (long)scope, (long)e.Index, o.Pos, (long)o.Sub).ExecuteNonQuery();
         }
 
@@ -1458,17 +1486,27 @@ namespace ExchangeLogReport
         {
             long pos = long.MinValue;
             long sub = long.MinValue;
-            var page = new List<AuthObs>(EventPage);
+            // Each replay owns its page: a nested front-end replay must not overwrite the back-end page.
+            var page = new AuthObs[EventPage];
             while (true)
             {
-                page.Clear();
+                int count = 0;
                 using (var r = With(S("events", "SELECT pos, sub, k, ms, seq, a, b, code, frag, conflict FROM ev WHERE scope=@p0 AND epoch=@p1 AND (pos, sub) > (@p2, @p3) ORDER BY pos, sub LIMIT " + EventPage.ToString(CultureInfo.InvariantCulture) + ";", "iiii"), (long)scope, (long)e.Index, pos, sub).ExecuteReader())
                     while (r.Read())
-                        page.Add(new AuthObs { Pos = r.GetInt64(0), Sub = (int)r.GetInt64(1), K = r.GetString(2)[0], Ms = r.GetInt64(3), Seq = r.GetInt64(4), A = Str(r, 5), B = Str(r, 6), Code = (int)r.GetInt64(7), Frag = r.GetInt64(8), Conflict = r.GetInt64(9) != 0 });
-                if (page.Count == 0) break;
-                foreach (var o in page) replay.Feed(o);
-                pos = page[page.Count - 1].Pos; sub = page[page.Count - 1].Sub;
-                if (page.Count < EventPage) break;
+                    {
+                        var o = page[count] ?? (page[count] = new AuthObs());
+                        var kind = r.GetUtf8(2);
+                        o.K = kind.Length == 1 && kind[0] < 128 ? (char)kind[0] : r.GetString(2)[0];
+                        o.Pos = r.GetInt64(0); o.Sub = (int)r.GetInt64(1); o.Ms = r.GetInt64(3); o.Seq = r.GetInt64(4);
+                        // MAIL's physical reference was indexed by Insert; replay only needs its position and time.
+                        o.A = o.K == 'M' ? null : Str(r, 5); o.B = o.K == 'M' ? null : Str(r, 6);
+                        o.Code = (int)r.GetInt64(7); o.Frag = r.GetInt64(8); o.Conflict = r.GetInt64(9) != 0;
+                        count++;
+                    }
+                if (count == 0) break;
+                for (int i = 0; i < count; i++) replay.Feed(page[i]);
+                pos = page[count - 1].Pos; sub = page[count - 1].Sub;
+                if (count < EventPage) break;
             }
             replay.Finish();
             Replayed++;
@@ -1488,34 +1526,40 @@ namespace ExchangeLogReport
             long afterRef = 0;
             while (true)
             {
-                var refs = new List<long[]>();
+                int referenceCount = 0;
                 using (var r = With(S("mailrefs", "SELECT frag, position FROM mref WHERE scope=@p0 AND epoch=@p1 AND pos=@p2 AND sub=@p3 AND frag>@p4 ORDER BY frag LIMIT 256;", "iiiii"),
                     (long)scope, (long)e.Index, mail.Pos, (long)mail.Sub, afterRef).ExecuteReader())
-                    while (r.Read()) refs.Add(new[] { r.GetInt64(0), r.GetInt64(1) });
-                if (refs.Count == 0) break;
-                foreach (var f in refs)
+                    while (r.Read()) _mailReferences[referenceCount++] = new MailReference { Fragment = r.GetInt64(0), Position = r.GetInt64(1) };
+                if (referenceCount == 0) break;
+                // Only main replays write MAILs, after Snapshot has finished any nested front-end replay.
+                for (int f = 0; f < referenceCount; f++)
                 {
                     long after = 0;
                     while (true)
                     {
-                        var rows = new List<object[]>();
-                        using (var r = With(M("txlookup", "SELECT id, auth_user, auth_mechanism, auth_result, auth_attempt_result, auth_source, auth_evidence_id FROM smtp_transaction WHERE auth_fragment_id=@p0 AND auth_sequence=@p1 AND id>@p2 ORDER BY id LIMIT 256;", "iii"), f[0], f[1], after).ExecuteReader())
-                            while (r.Read()) rows.Add(new object[] { r.GetInt64(0), Str(r, 1), Str(r, 2), Str(r, 3), Str(r, 4), Str(r, 5), r.IsDBNull(6) ? (object)null : r.GetInt64(6) });
-                        foreach (var row in rows)
+                        int count = 0;
+                        using (var r = With(M("txlookup", "SELECT id, auth_user, auth_mechanism, auth_result, auth_attempt_result, auth_source, auth_evidence_id FROM smtp_transaction WHERE auth_fragment_id=@p0 AND auth_sequence=@p1 AND id>@p2 ORDER BY id LIMIT 256;", "iii"), _mailReferences[f].Fragment, _mailReferences[f].Position, after).ExecuteReader())
+                            while (r.Read())
+                                _mailUpdates[count++] = new MailUpdate { Id = r.GetInt64(0), Changed =
+                                    !(r.TextEquals(1, s.User) && r.TextEquals(2, s.Mechanism) && r.TextEquals(3, s.Result) &&
+                                      r.TextEquals(4, s.Attempt) && r.TextEquals(5, s.Source) &&
+                                      (r.IsDBNull(6) ? s.Evidence <= 0 : s.Evidence > 0 && r.GetInt64(6) == s.Evidence)) };
+                        for (int i = 0; i < count; i++)
                         {
-                            after = (long)row[0];
-                            object evidence = s.Evidence > 0 ? (object)s.Evidence : null;
-                            if (Equals(row[1], s.User) && Equals(row[2], s.Mechanism) && Equals(row[3], s.Result) && Equals(row[4], s.Attempt) && Equals(row[5], s.Source) && Equals(row[6], evidence)) continue;
+                            after = _mailUpdates[i].Id;
+                            if (!_mailUpdates[i].Changed) continue;
                             var u = _writer.UpdateAuth;
-                            u.Set(0, s.User); u.Set(1, s.Mechanism); u.Set(2, s.Result); u.Set(3, s.Attempt); u.Set(4, s.Source); u.Set(5, evidence); u.Set(6, after);
+                            u.Set(0, s.User); u.Set(1, s.Mechanism); u.Set(2, s.Result); u.Set(3, s.Attempt); u.Set(4, s.Source);
+                            if (s.Evidence > 0) u.Set(5, s.Evidence); else u.Set(5, null);
+                            u.Set(6, after);
                             u.Run();
                             Updated++;
                         }
-                        if (rows.Count < 256) break;
+                        if (count < 256) break;
                     }
                 }
-                afterRef = refs[refs.Count - 1][0];
-                if (refs.Count < 256) break;
+                afterRef = _mailReferences[referenceCount - 1].Fragment;
+                if (referenceCount < 256) break;
             }
         }
 
@@ -1618,6 +1662,7 @@ namespace ExchangeLogReport
             readonly int _scope;
             readonly AuthBind _anchor;
             readonly bool _projection;
+            readonly AuthSnap _snapshot = new AuthSnap();
             Principal _est, _window;
             Principal _atAnchor;
             string _attemptAtAnchor;
@@ -1860,7 +1905,10 @@ namespace ExchangeLogReport
 
             AuthSnap Snapshot(AuthObs m)
             {
-                var s = new AuthSnap { Result = SmtpAuth.Unknown, Attempt = SmtpAuth.Unknown, Source = SmtpAuth.Missing };
+                // Consumed synchronously by WriteMail; retained proof lives in Principal/AuthToken, never in this slot.
+                var s = _snapshot;
+                s.Mechanism = null; s.User = null; s.Evidence = 0; s.Bind = null;
+                s.Result = SmtpAuth.Unknown; s.Attempt = SmtpAuth.Unknown; s.Source = SmtpAuth.Missing;
                 if (_est != null ? _est.Conflict : _stateConflict) { s.Source = SmtpAuth.Ambiguous; return s; }
                 if (_est != null) { if (_est.StartUnknown || _est.Broken) return s; }
                 else if (_unknown) return s;
@@ -1885,7 +1933,7 @@ namespace ExchangeLogReport
                     if (_bind == null) { s.Source = SmtpAuth.NotApplicable; return s; }
                     s.Mechanism = null; s.Result = SmtpAuth.Unknown; s.Attempt = SmtpAuth.Unknown; s.Evidence = 0;
                     if (_bind.Broken || !_bind.Accepted) { s.Source = SmtpAuth.Missing; return s; }
-                    return _r.Handoff(_e, _bind, m);
+                    return _r.Handoff(_e, _bind, m, s);
                 }
                 if (est.TechId || est.Technical) { s.Source = SmtpAuth.NotApplicable; return s; }
                 if (est.User == null) { s.Source = SmtpAuth.Missing; return s; }
@@ -1933,9 +1981,8 @@ namespace ExchangeLogReport
         }
 
         /// <summary>The five values of a transaction of a back end handed over by a front end, from the proof of the handshake.</summary>
-        AuthSnap Handoff(AuthEpoch be, AuthBind bind, AuthObs mail)
+        AuthSnap Handoff(AuthEpoch be, AuthBind bind, AuthObs mail, AuthSnap s)
         {
-            var s = new AuthSnap { Result = SmtpAuth.Unknown, Attempt = SmtpAuth.Unknown, Source = SmtpAuth.Missing };
             var t = bind.Token ?? (bind.Token = ResolveToken(be, bind));
             if (t.Status == SmtpAuth.Ambiguous) { s.Source = SmtpAuth.Ambiguous; return s; }
             if (t.Status != AuthToken.Ok || mail.Ms < t.ReadyMs) return s;

@@ -2803,6 +2803,87 @@ public sealed class SmtpMemoryTelemetry {
                 }
             }
         }
+        It 'resets prepared row cursors and compares nullable Unicode text ordinally without retaining readers' {
+            $dir = Join-Path $TestDrive 'smtp-auth-prepared-rows'
+            $s = Import-ExlConfiguration -Path (New-TestConfig $dir) -Root $script:Root
+            $store = Open-ExlStore -Settings $s
+            $type = [ExchangeLogReport.Collector].Assembly.GetType('ExchangeLogReport.Prepared')
+            $prepared = [Activator]::CreateInstance($type, [object[]]@($store, 'SELECT @p0,@p1,@p2;', 3))
+            try {
+                foreach ($text in 'MixedCase', "ab`0cd", (('用户' * 2500) + '😀@test'), '') {
+                    $prepared.Set(0, $text); $prepared.Set(1, $null); $prepared.Set(2, [long]123)
+                    $rows = $prepared.ExecuteReader()
+                    try {
+                        $rows.Read() | Should -BeTrue
+                        $rows.GetString(0) | Should -Be $text
+                        $rows.TextEquals(0, $text) | Should -BeTrue
+                        $rows.TextEquals(0, ($text + 'x')) | Should -BeFalse
+                        $rows.IsDBNull(1) | Should -BeTrue
+                        $rows.TextEquals(1, [NullString]::Value) | Should -BeTrue
+                        $rows.TextEquals(1, '') | Should -BeFalse
+                        $rows.TextEquals(0, [NullString]::Value) | Should -BeFalse
+                        $rows.GetInt64(2) | Should -Be 123
+                    } finally { $rows.Dispose() }
+                    $again = $prepared.ExecuteReader()
+                    try {
+                        $again.Read() | Should -BeTrue
+                        $again.TextEquals(0, $text) | Should -BeTrue
+                        if ($text -ceq 'MixedCase') { $again.TextEquals(0, 'mixedcase') | Should -BeFalse }
+                        $again.Read() | Should -BeFalse
+                    } finally { $again.Dispose() }
+                }
+            } finally { $prepared.Dispose(); $store.Dispose() }
+        }
+        It 'keeps replay pages and MAIL lookup pages isolated across identity resets and repeated enrichment' {
+            $dir = Join-Path $TestDrive 'smtp-auth-reused-pages'
+            $s = Import-ExlConfiguration -Path (New-TestConfig $dir) -Root $script:Root
+            $steps = @((AuthHello 'reuse.contoso.test'), (AuthPlain $alice))
+            $tls = @('C STARTTLS', 'S 220 Ready', 'E |TLS protocol SP_PROT_TLS1_2_SERVER negotiation succeeded using bulk encryption algorithm CALG_AES_256', 'C EHLO reuse.contoso.test', 'S 250 Hello')
+            foreach ($phase in 'first', 'second', 'none') {
+                if ($phase -eq 'second') { $steps += $tls; $steps += @(AuthPlain 'bob@contoso.test') }
+                if ($phase -eq 'none') { $steps += $tls }
+                foreach ($i in 1..270) { $steps += @(AuthTx "$phase$i@vendor.example" "reuse-$phase-$i") }
+            }
+            $steps += '-Local'
+            Write-Log (Join-Path (Join-Path $dir 'logs-src') ($recv -f 'FrontEnd')) @($header + @(AuthSession $fe '08DA000000008A01' 158 $feLocal '10.3.8.8:55009' $steps))
+            [void](Invoke-TestCollection $s)
+            $store = Open-ExlStore -Settings $s
+            $resolver = $null; $writer = $null; $tx = $null
+            try {
+                $first = $store.Query("SELECT MIN(id) FROM smtp_transaction WHERE message_id LIKE '<reuse-first-%';", $null).Rows[0][0]
+                $columns = @($store.Query('PRAGMA table_info(smtp_transaction);', $null).Rows | ForEach-Object { $_[1] } | Where-Object { $_ -ne 'id' })
+                foreach ($copy in 1..280) {
+                    $values = foreach ($column in $columns) {
+                        switch ($column) {
+                            'time_ms' { "time_ms+$copy" }
+                            'end_ms' { "end_ms+$copy" }
+                            'message_id' { "'<reuse-copy-$copy@contoso.test>'" }
+                            default { "[$column]" }
+                        }
+                    }
+                    $store.Exec("INSERT INTO smtp_transaction($($columns -join ',')) SELECT $($values -join ',') FROM smtp_transaction WHERE id=$first;")
+                }
+                $store.Exec("UPDATE smtp_transaction SET auth_user='stale@test',auth_mechanism='stale',auth_result='stale',auth_attempt_result='stale',auth_source='stale',auth_evidence_id=NULL;")
+                $engine = [ExchangeLogReport.Collector].Assembly
+                $writer = [Activator]::CreateInstance($engine.GetType('ExchangeLogReport.Writer'), [object[]]@($store))
+                $resolver = [Activator]::CreateInstance($engine.GetType('ExchangeLogReport.AuthResolver'), [object[]]@($store, $writer, [long]600000))
+                $tx = $store.Begin(); $writer.Use($tx)
+                $resolver.Touch('EXCH01', 'Receive', 'FrontEnd', '08DA000000008A01'); $resolver.Flush($tx)
+                $resolver.Updated | Should -Be 1090
+                $resolver.Touch('EXCH01', 'Receive', 'FrontEnd', '08DA000000008A01'); $resolver.Flush($tx)
+                $resolver.Updated | Should -Be 1090
+                $tx.Commit(); $tx.Dispose(); $tx = $null
+                $store.Query("SELECT COUNT(*) FROM smtp_transaction WHERE (message_id LIKE '<reuse-first-%' OR message_id LIKE '<reuse-copy-%') AND auth_user='$alice' AND auth_mechanism='PLAIN' AND auth_result='Succeeded' AND auth_attempt_result='Succeeded' AND auth_source='Direct' AND auth_evidence_id>0;", $null).Rows[0][0] | Should -Be 550
+                $store.Query("SELECT COUNT(*) FROM smtp_transaction WHERE message_id LIKE '<reuse-second-%' AND auth_user='bob@contoso.test' AND auth_mechanism='PLAIN' AND auth_source='Direct' AND auth_evidence_id>0;", $null).Rows[0][0] | Should -Be 270
+                $store.Query("SELECT COUNT(*) FROM smtp_transaction WHERE message_id LIKE '<reuse-none-%' AND auth_user IS NULL AND auth_mechanism IS NULL AND auth_result='Not attempted' AND auth_attempt_result='Not attempted' AND auth_source='NotApplicable' AND auth_evidence_id IS NULL;", $null).Rows[0][0] | Should -Be 270
+            } finally {
+                if ($tx) { $tx.Dispose() }
+                if ($resolver) { $resolver.Dispose() }
+                if ($writer) { $writer.Dispose() }
+                $store.Dispose()
+            }
+            @(Get-ChildItem -LiteralPath (Split-Path $s.Storage.DatabasePath) -Filter '.report-*' -Force).Count | Should -Be 0
+        }
         It 'replays legacy six-cell format-1 aliases beside format-2 parts without changing retained transaction IDs or offsets' {
                 $dir = Join-Path $TestDrive 'smtp-auth-format-aliases'
                 $s = Import-ExlConfiguration -Path (New-TestConfig $dir) -Root $script:Root

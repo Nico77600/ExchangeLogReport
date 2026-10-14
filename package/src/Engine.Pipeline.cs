@@ -87,9 +87,13 @@ namespace ExchangeLogReport
         readonly SQLitePCL.sqlite3_stmt _stmt;
         readonly int[] _index;
 
-        public Prepared(Store store, string sql, int parameters)
+        public Prepared(Store store, string sql, int parameters) : this(store.Connection, sql, parameters) { }
+
+        public Prepared(SqliteCommand command, int parameters) : this(command.Connection, command.CommandText, parameters) { }
+
+        Prepared(SqliteConnection connection, string sql, int parameters)
         {
-            _db = store.Connection.Handle;
+            _db = connection.Handle;
             int rc = SQLitePCL.raw.sqlite3_prepare_v2(_db, sql, out _stmt);
             if (rc != SQLitePCL.raw.SQLITE_OK) throw new SqliteException("SQLite: " + SQLitePCL.raw.sqlite3_errmsg(_db).utf8_to_string() + " (" + sql + ")", rc);
             _index = new int[parameters];
@@ -99,6 +103,7 @@ namespace ExchangeLogReport
         public void Use(SqliteTransaction tx) { }
 
         byte[] _utf8 = new byte[4096];
+        char[] _characters;
 
         public void Set(int i, object value)
         {
@@ -141,6 +146,53 @@ namespace ExchangeLogReport
             int changes = SQLitePCL.raw.sqlite3_changes(_db);
             SQLitePCL.raw.sqlite3_reset(_stmt);
             return changes;
+        }
+
+        public int ExecuteNonQuery() { return Run(); }
+
+        public Rows ExecuteReader() { return new Rows(this); }
+
+        public readonly struct Rows : IDisposable
+        {
+            readonly Prepared _owner;
+            internal Rows(Prepared owner) { _owner = owner; }
+            public bool Read()
+            {
+                int rc = SQLitePCL.raw.sqlite3_step(_owner._stmt);
+                _owner.Check(rc);
+                return rc == SQLitePCL.raw.SQLITE_ROW;
+            }
+            public bool IsDBNull(int i) { return SQLitePCL.raw.sqlite3_column_type(_owner._stmt, i) == SQLitePCL.raw.SQLITE_NULL; }
+            public long GetInt64(int i)
+            {
+                if (IsDBNull(i)) throw new InvalidOperationException("The column is NULL.");
+                return SQLitePCL.raw.sqlite3_column_int64(_owner._stmt, i);
+            }
+            public string GetString(int i)
+            {
+                if (IsDBNull(i)) throw new InvalidOperationException("The column is NULL.");
+                return SQLitePCL.raw.sqlite3_column_text(_owner._stmt, i).utf8_to_string();
+            }
+            // Borrowed from SQLite: consume before the next Read or Dispose; never retain the span.
+            public ReadOnlySpan<byte> GetUtf8(int i)
+            {
+                if (IsDBNull(i)) throw new InvalidOperationException("The column is NULL.");
+                return SQLitePCL.raw.sqlite3_column_blob(_owner._stmt, i);
+            }
+            public bool TextEquals(int i, string value)
+            {
+                if (value == null) return IsDBNull(i);
+                if (IsDBNull(i)) return false;
+                var bytes = GetUtf8(i);
+                int count = System.Text.Encoding.UTF8.GetCharCount(bytes);
+                if (count != value.Length) return false;
+                if (_owner._characters == null || _owner._characters.Length < count)
+                    _owner._characters = new char[Math.Max(32, count)];
+                System.Text.Encoding.UTF8.GetChars(bytes, _owner._characters);
+                for (int j = 0; j < count; j++) if (_owner._characters[j] != value[j]) return false;
+                return true;
+            }
+            public void Dispose() { SQLitePCL.raw.sqlite3_reset(_owner._stmt); }
         }
 
         /// <summary>Runs the statement and returns the integer of the first row (RETURNING id), null without row.</summary>
