@@ -1,7 +1,7 @@
 #Requires -Version 7.4
 <#
 .SYNOPSIS
-    Measures a collection of Exchange Log Report on logs written by New-ExlSyntheticLogs.ps1 (load test):
+    Measures a collection of Exchange Log Report on logs written by tests\support\New-ExlSyntheticLogs.ps1 (load test):
     same console table as -Mode Collect, then duration, rate, database size and peak memory.
 
 .DESCRIPTION
@@ -11,7 +11,7 @@
     A second run on the same -WorkPath measures an incremental collection (only the new lines).
 
 .PARAMETER LogPath
-    Root folder given to New-ExlSyntheticLogs.ps1 (<LogPath>\<SERVER>\Exchange...). '{0}' is replaced by the
+    Root folder given to tests\support\New-ExlSyntheticLogs.ps1 (<LogPath>\<SERVER>\Exchange...). '{0}' is replaced by the
     server name, for logs generated on each server: '\\{0}\E$\ElrSim'.
 
 .PARAMETER Server

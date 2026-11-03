@@ -21,7 +21,7 @@
 
 .NOTES
     Author  : Nicolas Fabert
-    Version : 2.1.1
+    Version : 3.0.0
     History : see CHANGELOG.md
 
     This Script is a Personal project.
@@ -32,12 +32,40 @@
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
-$script:ToolVersion = '2.1.1'
+$script:ToolVersion = '3.0.0'
 $script:ToolRoot = $PSScriptRoot
+# Package integrity. A package carries the owner-signed PackageIntegrity.psd1 manifest; when it is present, the signed
+# verifier (src\Test-PackageIntegrity.ps1) must accept the tree before any engine code is compiled. A source tree
+# without a manifest is an unverified development tree: the entry scripts refuse it unless -DevelopmentMode is given.
 function Assert-ExlPackageIntegrity {
-    $verifier = Join-Path $script:ToolRoot 'src\Test-PackageIntegrity.ps1'
+    [CmdletBinding()]
+    param(
+        [string]$Root = $script:ToolRoot,
+        [switch]$Distribution,
+        [switch]$DevelopmentMode,
+        [switch]$RequireManifest
+    )
+    $packageRoot = [IO.Path]::TrimEndingDirectorySeparator([IO.Path]::GetFullPath($Root))
+    $manifest = Join-Path $packageRoot 'PackageIntegrity.psd1'
+    if ((Test-Path -LiteralPath $manifest) -and -not (Test-Path -LiteralPath $manifest -PathType Leaf)) {
+        throw 'Package integrity: PackageIntegrity.psd1 must be a file.'
+    }
+    if (-not (Test-Path -LiteralPath $manifest -PathType Leaf)) {
+        if ($RequireManifest -and -not $DevelopmentMode) {
+            throw 'Package integrity: PackageIntegrity.psd1 is missing. This command requires the verified package; use -DevelopmentMode explicitly for an unverified source checkout.'
+        }
+        # Without a manifest nothing is verified: say so once in every process that imports the module (an unverified source tree), not only for
+        # the commands that require it. The flag lives in the process, so a repeated import or check in the same process does not repeat it.
+        if (-not [AppDomain]::CurrentDomain.GetData('ExchangeLogReport.UnverifiedTreeWarned')) {
+            [AppDomain]::CurrentDomain.SetData('ExchangeLogReport.UnverifiedTreeWarned', $true)
+            Write-Warning 'Package integrity: no PackageIntegrity.psd1; this is an unverified source tree (package byte integrity and publisher authentication are not established).'
+        }
+        return
+    }
+    $verifier = Join-Path $packageRoot 'src\Test-PackageIntegrity.ps1'
     $cursor = [IO.Path]::GetFullPath($verifier)
     while ($cursor) {
+        if (-not (Test-Path -LiteralPath $cursor)) { throw 'Package integrity: the verifier is missing; no engine or SQLite library was loaded.' }
         $item = Microsoft.PowerShell.Management\Get-Item -LiteralPath $cursor -Force -ErrorAction Stop
         if ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) {
             throw "Package integrity: reparse point: $cursor"
@@ -50,7 +78,13 @@ function Assert-ExlPackageIntegrity {
         $null -eq $signature.TimeStamperCertificate) {
         throw 'Package integrity: verifier must have the trusted, timestamped owner signature.'
     }
-    & $verifier -Root $script:ToolRoot
+    $arguments = @{ Root = $packageRoot }
+    if ($Distribution) { $arguments.Distribution = $true }
+    if ($DevelopmentMode) { $arguments.DevelopmentMode = $true }
+    $result = @(& $verifier @arguments)
+    if ($result.Count -ne 1 -or -not $result[0].PSObject.Properties['Status'] -or $result[0].Status -notlike 'Valid*') {
+        throw 'Package integrity: the verifier did not return an explicit Valid result; engine initialization is blocked.'
+    }
 }
 Assert-ExlPackageIntegrity
 $script:LogWriter = $null
@@ -356,9 +390,19 @@ function Import-ExlConfiguration {
         if ($Value -isnot [bool]) { $errors.Add("$Name must be `$true or `$false (current value: '$Value').") ; return $false }
         return $Value
     }
+    function Test-Choice($Value, [string]$Name, [string[]]$Allowed) {
+        $match = @($Allowed | Where-Object { $_ -ieq "$Value" })
+        if ($match.Count -ne 1) { $errors.Add("$Name must be one of: $($Allowed -join ', ') (current value: '$Value')."); return $Allowed[0] }
+        return [string]$match[0]
+    }
     function Test-Patterns($Value, [string]$Name) {
         $list = @($Value | Where-Object { $_ })
         foreach ($p in $list) { try { [void][regex]::new($p) } catch { $errors.Add("$Name contains an invalid regular expression: '$p'.") } }
+        return [string[]]$list
+    }
+    function Test-Domains($Value, [string]$Name) {
+        $list = @($Value | Where-Object { $_ } | ForEach-Object { ([string]$_).Trim() } | Where-Object { $_ })
+        foreach ($d in $list) { if ($d -notmatch '^@?[^\s@;,<>"'']+$' -or $d.TrimStart('@').StartsWith('.') -or $d.EndsWith('.')) { $errors.Add("$Name must list domain names such as 'contoso.com' (current value: '$d').") } }
         return [string[]]$list
     }
 
@@ -424,6 +468,13 @@ function Import-ExlConfiguration {
             StaleSourceHours       = Test-Int (Get-Value $c 'Collection' 'StaleSourceHours' 24) 'Collection.StaleSourceHours' 0 8760
             Parallelism            = Test-Int (Get-Value $c 'Collection' 'Parallelism' 0) 'Collection.Parallelism' 0 64
             MaxFilesPerServer      = Test-Int (Get-Value $c 'Collection' 'MaxFilesPerServer' 4) 'Collection.MaxFilesPerServer' 0 64
+            DeferRollups           = Test-Choice (Get-Value $c 'Collection' 'DeferRollups' 'Never') 'Collection.DeferRollups' @('Auto', 'Never', 'Always')
+            ResolveSids            = Test-Bool (Get-Value $c 'Collection' 'ResolveSids' $true) 'Collection.ResolveSids'
+            IdentityMapFile        = ([string](Get-Value $c 'Collection' 'IdentityMapFile' '')).Trim()
+            EvidenceRescanMBPerRun = Test-Int (Get-Value $c 'Collection' 'EvidenceRescanMBPerRun' 2048) 'Collection.EvidenceRescanMBPerRun' 1 1048576
+            InternalDomains        = Test-Domains (Get-Value $c 'Collection' 'InternalDomains' @()) 'Collection.InternalDomains'
+            InternalConnectors     = Test-Patterns (Get-Value $c 'Collection' 'InternalConnectors' @()) 'Collection.InternalConnectors'
+            IdentityMap            = $null
         }
         Storage    = [ordered]@{
             DatabasePath        = Resolve-ExlPath ([string](Get-Value $st 'Storage' 'DatabasePath' '.\data\ExchangeLogReport.sqlite')) $Root
@@ -440,7 +491,10 @@ function Import-ExlConfiguration {
             IncludeRoutingDetails = Test-Bool (Get-Value $r 'Report' 'IncludeRoutingDetails' $true) 'Report.IncludeRoutingDetails'
             IncludeSessionDetails = Test-Bool (Get-Value $r 'Report' 'IncludeSessionDetails' $true) 'Report.IncludeSessionDetails'
             CsvDelimiter          = [string](Get-Value $r 'Report' 'CsvDelimiter' ';')
-            MaxHtmlRows           = Test-Int (Get-Value $r 'Report' 'MaxHtmlRows' 200000) 'Report.MaxHtmlRows' 1000 2000000
+            HtmlLayout            = Test-Choice (Get-Value $r 'Report' 'HtmlLayout' 'Auto') 'Report.HtmlLayout' @('Auto', 'SingleFile', 'Folder')
+            SingleFileMaxMB       = Test-Int (Get-Value $r 'Report' 'SingleFileMaxMB' 200) 'Report.SingleFileMaxMB' 1 4096
+            MaxHtmlRows           = Test-Int (Get-Value $r 'Report' 'MaxHtmlRows' 0) 'Report.MaxHtmlRows' 0 2000000
+            ScratchFolder         = ([string](Get-Value $r 'Report' 'ScratchFolder' '')).Trim()
             MemoryBudgetMB        = Test-Int (Get-Value $r 'Report' 'MemoryBudgetMB' 512) 'Report.MemoryBudgetMB' 64 16384
             Parallelism           = Test-Int (Get-Value $r 'Report' 'Parallelism' 0) 'Report.Parallelism' 0 16
             MaxDataAgeMinutes     = Test-Int (Get-Value $r 'Report' 'MaxDataAgeMinutes' 90) 'Report.MaxDataAgeMinutes' 0 525600
@@ -497,7 +551,33 @@ function Import-ExlConfiguration {
     if ($settings.Report.DefaultType -notin 'Usage', 'Detailed') { $errors.Add("Report.DefaultType must be 'Usage' or 'Detailed'.") }
     if (-not $settings.Report.Formats.Count -or @($settings.Report.Formats | Where-Object { $_ -notin 'Csv', 'Html' }).Count) { $errors.Add("Report.Formats must contain 'Csv', 'Html' or both.") }
     if ($settings.Report.CsvDelimiter -notin ';', ',', "`t", '|') { $errors.Add("Report.CsvDelimiter must be ';', ',', '|' or a tab.") }
-    if (-not $settings.Report.FilePrefix -or $settings.Report.FilePrefix.IndexOfAny([IO.Path]::GetInvalidFileNameChars()) -ge 0) { $errors.Add('Report.FilePrefix must be a valid file name part.') }
+    # A cap below 1000 rows makes no sense for a table (0 = every row).
+    if ($settings.Report.MaxHtmlRows -ne 0 -and $settings.Report.MaxHtmlRows -lt 1000) { $errors.Add("Report.MaxHtmlRows must be 0 (every row) or between 1000 and 2000000 (current value: '$($settings.Report.MaxHtmlRows)').") }
+    if ($settings.Report.ScratchFolder) { $settings.Report.ScratchFolder = Resolve-ExlPath $settings.Report.ScratchFolder $Root }
+    # The optional mapping file of the security identifiers the logs cannot name: @{ 'S-1-5-21-...' = 'DOMAIN\sam' }.
+    if ($settings.Collection.IdentityMapFile) {
+        $mapPath = Resolve-ExlPath $settings.Collection.IdentityMapFile $Root
+        $settings.Collection.IdentityMapFile = $mapPath
+        $entries = $null
+        if (-not (Test-Path -LiteralPath $mapPath -PathType Leaf)) { $errors.Add("Collection.IdentityMapFile: the file $mapPath does not exist.") }
+        else {
+            try { $entries = Import-PowerShellDataFile -LiteralPath $mapPath }
+            catch { $errors.Add("Collection.IdentityMapFile is not a valid PowerShell data file ($mapPath): $($_.Exception.Message)") }
+        }
+        if ($null -ne $entries) {
+            $map = [ordered]@{}
+            foreach ($key in @($entries.Keys | Sort-Object)) {
+                $value = $entries[$key]
+                if ("$key" -notmatch '^[Ss]-1-\d+(-\d+){1,14}$') { $errors.Add("Collection.IdentityMapFile: '$key' is not a security identifier (S-1-5-21-...)."); continue }
+                if ($value -isnot [string] -or -not $value.Trim() -or $value.Contains('|') -or $value.Trim() -match '^[Ss]-1-\d') {
+                    $errors.Add("Collection.IdentityMapFile: the account of '$key' must be an account name such as 'DOMAIN\sam' (current value: '$value')."); continue
+                }
+                $map[([string]$key).ToLowerInvariant()] = $value.Trim()
+            }
+            $settings.Collection.IdentityMap = $map
+        }
+    }
+    if (-not $settings.Report.FilePrefix -or$settings.Report.FilePrefix.IndexOfAny([IO.Path]::GetInvalidFileNameChars()) -ge 0) { $errors.Add('Report.FilePrefix must be a valid file name part.') }
     try { $settings['Zone'] = Get-ExlTimeZone $settings.Report.TimeZone } catch { $errors.Add($_.Exception.Message) }
     $found = if ($discovery -and $discovery['Servers'] -is [hashtable]) { $discovery['Servers'] } else { @{} }
     $settings.Servers = @(foreach ($b in $blocks) {
@@ -608,18 +688,29 @@ function Resolve-ExlServerPaths {
 function Initialize-ExlEngine {
     <#
     .SYNOPSIS
-        Verifies the package, then loads SQLite (lib\sqlite) and compiles the authenticated C# sources
-        (src\Engine.*.cs) in memory, once per process. A compiled copy in bin\ is never loaded: it cannot be
-        authenticated, so a bin\ left by an earlier version is ignored.
+        Loads SQLite (lib\sqlite) and compiles src\Engine.*.cs into memory.
+        With -WithStorage the storage maintenance sources (src\Storage.*.cs) are compiled in the same assembly.
+        Compiled engine assemblies on disk (bin\) are never loaded or created.
     #>
     [CmdletBinding()]
-    param([string]$Root = $script:ToolRoot)
-    if (-not [string]::Equals([IO.Path]::GetFullPath($Root).TrimEnd('\'),
-        [IO.Path]::GetFullPath($script:ToolRoot).TrimEnd('\'), [StringComparison]::OrdinalIgnoreCase)) {
-        throw 'Package integrity: engine root must be the imported package root.'
+    param([string]$Root = $script:ToolRoot, [switch]$WithStorage)
+    Assert-ExlPackageIntegrity -Root $Root
+    $filters = if ($WithStorage) { @('Engine.*.cs', 'Storage.*.cs') } else { @('Engine.*.cs') }
+    $sources = @($filters | ForEach-Object { Get-ChildItem -LiteralPath (Join-Path $Root 'src') -Filter $_ -File } | Sort-Object Name)
+    if (-not $sources.Count) { throw "Engine source files not found in $(Join-Path $Root 'src')." }
+    $hasher = [Security.Cryptography.SHA256]::Create()
+    try {
+        $all = [Text.StringBuilder]::new()
+        foreach ($f in $sources) { [void]$all.Append($f.Name).Append((Get-FileHash -LiteralPath $f.FullName -Algorithm SHA256).Hash) }
+        $hash = [Convert]::ToHexString($hasher.ComputeHash([Text.Encoding]::UTF8.GetBytes($all.ToString())))
+    } finally { $hasher.Dispose() }
+    $existing = 'ExchangeLogReport.Store' -as [type]
+    if ($existing) {
+        if ($existing.Assembly.Location -or [AppDomain]::CurrentDomain.GetData('ExchangeLogReport.EngineSourceHash') -ne $hash) {
+            throw 'An engine from disk or different source is already loaded. Restart PowerShell; only the current in-memory engine is used.'
+        }
+        return
     }
-    Assert-ExlPackageIntegrity
-    if ('ExchangeLogReport.Store' -as [type]) { return }
     $lib = Join-Path $Root 'lib\sqlite'
     $arch = if ([Runtime.InteropServices.RuntimeInformation]::ProcessArchitecture -eq 'Arm64') { 'win-arm64' } else { 'win-x64' }
     $native = Join-Path $lib "runtimes\$arch\e_sqlite3.dll"
@@ -630,16 +721,55 @@ function Initialize-ExlEngine {
     }
     [SQLitePCL.Batteries_V2]::Init()
 
-    $sources = @(Get-ChildItem -LiteralPath (Join-Path $Root 'src') -Filter 'Engine.*.cs' -File | Sort-Object Name)
-    if (-not $sources.Count) { throw "Engine source files not found in $(Join-Path $Root 'src')." }
     $references = @(
-        (Join-Path $lib 'Microsoft.Data.Sqlite.dll'), (Join-Path $lib 'SQLitePCLRaw.core.dll'), 'System.IO.Compression', 'System.Text.Json', 'System.Text.Encodings.Web', 'System.Data.Common', 'System.Linq',
-        'System.Collections', 'System.Text.RegularExpressions', 'System.Runtime', 'System.Memory', 'System.ComponentModel.Primitives', 'System.ComponentModel',
-        'System.Transactions.Local', 'System.Text.Encoding.Extensions', 'System.Runtime.Extensions', 'System.IO', 'System.Runtime.InteropServices', 'System.Console',
-        'System.Collections.NonGeneric', 'System.Diagnostics.Process', 'System.Linq.Expressions', 'System.Collections.Concurrent', 'System.Threading',
-        'System.Threading.Thread', 'System.Threading.Tasks.Parallel', 'System.IO.FileSystem', 'System.Net.Primitives', 'System.Net.Security', 'System.Net.Sockets',
-        'System.Net.NetworkInformation', 'System.Security.Cryptography', 'System.Security.Cryptography.X509Certificates', 'Microsoft.Win32.Primitives', 'System.IO.Compression.ZipFile', 'netstandard')
+            (Join-Path $lib 'Microsoft.Data.Sqlite.dll'), (Join-Path $lib 'SQLitePCLRaw.core.dll'), 'System.IO.Compression', 'System.Text.Json', 'System.Text.Encodings.Web', 'System.Data.Common', 'System.Linq',
+            'System.Collections', 'System.Text.RegularExpressions', 'System.Runtime', 'System.Memory', 'System.ComponentModel.Primitives', 'System.ComponentModel',
+            'System.Transactions.Local', 'System.Text.Encoding.Extensions', 'System.Runtime.Extensions', 'System.IO', 'System.Runtime.InteropServices', 'System.Console',
+            'System.Collections.NonGeneric', 'System.Diagnostics.Process', 'System.Linq.Expressions', 'System.Collections.Concurrent', 'System.Threading',
+            'System.Threading.Thread', 'System.Threading.Tasks.Parallel', 'System.IO.FileSystem', 'System.IO.FileSystem.DriveInfo', 'System.Net.Primitives', 'System.Net.Security', 'System.Net.Sockets',
+            'System.Net.NetworkInformation', 'System.Security.Cryptography', 'System.Security.Cryptography.X509Certificates', 'Microsoft.Win32.Primitives', 'System.IO.Compression.ZipFile',
+            'System.Net.HttpListener', 'System.Net.WebHeaderCollection', 'System.Threading.Tasks', 'System.Security.AccessControl', 'System.Security.Claims', 'System.IO.FileSystem.AccessControl', 'System.Security.Principal.Windows', 'System.Security.Principal', 'System.ObjectModel', 'System.Collections.Specialized', 'System.IO.Pipelines', 'netstandard')
     Add-Type -LiteralPath $sources.FullName -ReferencedAssemblies $references -IgnoreWarnings -WarningAction SilentlyContinue
+    [AppDomain]::CurrentDomain.SetData('ExchangeLogReport.EngineSourceHash', $hash)
+}
+
+function Start-ExlServe {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$DatabasePath,
+        # The folder of the report template (Report.template.html and its script): the package's templates\. The portal serves its page only.
+        [string]$WebRoot = (Join-Path $script:ToolRoot 'templates'),
+        # The time zone of the days of the daily tables (Report.TimeZone of the collection); default: this computer's.
+        [TimeZoneInfo]$TimeZone,
+        [ValidateRange(0, 65535)][int]$Port = 8765,
+        [switch]$NoBrowser,
+        [string]$ReadyFile,
+        [switch]$ReadyFileWithToken,
+        [ValidateRange(1, 120)][int]$RequestTimeoutSeconds = 15,
+        [ValidateRange(1, 120)][int]$AggregateTimeoutSeconds = 60,
+        [ValidateRange(0, 256)][int]$MmapMB = 0,
+        # The largest list the portal page loads whole (a larger one is browsed on the server).
+        [ValidateRange(10000, 1000000)][int]$ClientRowsMax = 50000,
+        # The time budget of one scan request of the portal, in milliseconds.
+        [ValidateRange(100, 120000)][int]$ScanBudgetMs = 2000,
+        [switch]$DevelopmentMode
+    )
+    Assert-ExlPackageIntegrity -Root $script:ToolRoot -RequireManifest -DevelopmentMode:$DevelopmentMode
+    Initialize-ExlEngine
+    $options = [ExchangeLogReport.ServeOptions]::new()
+    $options.DatabasePath = [IO.Path]::GetFullPath($DatabasePath)
+    $options.WebRoot = [IO.Path]::GetFullPath($WebRoot)
+    $options.Port = $Port
+    $options.NoBrowser = [bool]$NoBrowser
+    if ($ReadyFile) { $options.ReadyFile = [IO.Path]::GetFullPath($ReadyFile) }
+    $options.ReadyFileWithToken = [bool]$ReadyFileWithToken
+    $options.RequestTimeoutSeconds = $RequestTimeoutSeconds
+    $options.AggregateTimeoutSeconds = $AggregateTimeoutSeconds
+    $options.MmapMB = $MmapMB
+    $options.ClientRowsMax = $ClientRowsMax
+    $options.ScanBudgetMs = $ScanBudgetMs
+    if ($TimeZone) { $options.Zone = $TimeZone }
+    [ExchangeLogReport.ServeHost]::Run($options)
 }
 
 function Resolve-ExlReportCollection {
@@ -683,10 +813,25 @@ function Resolve-ExlReportCollection {
     return $r
 }
 
+$script:UpgradeLockWaitSeconds = 120
+
 function Open-ExlStore {
+    <#
+    .SYNOPSIS
+        Opens the database. -ReadOnly (reports, -Mode Status): a database of an older version is upgraded once first, as a collection would do it;
+        that upgrade takes the collector lock, so it never runs beside a collection: it waits for a running collection up to
+        $script:UpgradeLockWaitSeconds (120 s), then stops with a message.
+    #>
     param([Parameter(Mandatory)]$Settings, [switch]$ReadOnly)
     $path = $Settings.Storage.DatabasePath
     if ($ReadOnly -and -not (Test-Path -LiteralPath $path)) { throw "The database does not exist yet: $path. Run a collection first (-Mode Collect)." }
+    if ($ReadOnly -and [ExchangeLogReport.Store]::RequiresUpgrade($path)) {
+        $wait = $script:UpgradeLockWaitSeconds
+        Write-ExlLog 'INFO' "The database was written by an earlier version: it is upgraded once before it is read (collector lock, waiting up to $wait s for a running collection)."
+        $lock = Enter-ExlLock -Path ($path + '.lock') -TimeoutSeconds $wait -BusyMessage ('The database must be upgraded once for this version before it can be read, and a collection is running ({0}). Run this command again when the collection has finished.')
+        try { return [ExchangeLogReport.Store]::new($path, $true, $script:ToolVersion) }
+        finally { Exit-ExlLock $lock }
+    }
     return [ExchangeLogReport.Store]::new($path, [bool]$ReadOnly, $script:ToolVersion)
 }
 
@@ -701,7 +846,7 @@ function Get-ExlIgnoredParameter {
         a parameter is never ignored silently (the script shows these sentences as warnings).
           period      -Range -Month -Date -Start -End        -Mode Report only
           report      -ReportType -User -Include*Details      -Mode Report only
-                      -OutputPath -Collect -NoCollect
+                      -OutputPath -HtmlLayout -Collect -NoCollect
           servers     -Server                                 -Mode Report and Collect
           discovery   -ConnectTo                              -Mode Discover only
           credential  -Credential                             -Mode Discover and MailTest
@@ -714,7 +859,7 @@ function Get-ExlIgnoredParameter {
                 Status   = '-Mode Status describes the whole database, whatever the period'
                 Discover = '-Mode Discover reads no log line, it only finds the log folders'
                 MailTest = '-Mode MailTest only sends a test message' } }
-        @{ Names = 'ReportType', 'User', 'IncludeRoutingDetails', 'IncludeSessionDetails', 'OutputPath', 'Collect', 'NoCollect', 'SendMail'; Modes = @('Report'); Why = 'used by -Mode Report only' }
+        @{ Names = 'ReportType', 'User', 'IncludeRoutingDetails', 'IncludeSessionDetails', 'OutputPath', 'HtmlLayout', 'Collect', 'NoCollect', 'SendMail'; Modes = @('Report'); Why = 'used by -Mode Report only' }
         @{ Names = 'Server'; Modes = 'Report', 'Collect'; Why = @{
                 Status   = '-Mode Status describes the whole database'
                 Discover = '-Mode Discover reads the settings of every Exchange server'
@@ -1024,6 +1169,18 @@ function New-ExlCollector {
     $o.MaxSegmentSteps = $Settings.Collection.MaxSessionSteps
     $o.Parallelism = $Settings.Collection.Parallelism
     $o.MaxFilesPerServer = $Settings.Collection.MaxFilesPerServer
+    $o.DeferRollups = [ExchangeLogReport.DeferRollupsMode]$Settings.Collection.DeferRollups
+    if ($null -ne $Settings.Collection.ResolveSids) { $o.ResolveSids = [bool]$Settings.Collection.ResolveSids }
+    if ($null -ne $Settings.Collection.EvidenceRescanMBPerRun) { $o.EvidenceRescanBytesPerRun = [long]$Settings.Collection.EvidenceRescanMBPerRun * 1MB }
+    # The external status of a message: the domains and Send connectors that stay inside, and every configured server (collected servers).
+    if ($Settings.Collection.InternalDomains) { $o.InternalDomains = [string[]]@($Settings.Collection.InternalDomains) }
+    if ($Settings.Collection.InternalConnectors) { $o.InternalConnectors = [string[]]@($Settings.Collection.InternalConnectors) }
+    $o.ConfiguredServers = [string[]]@($Settings.Servers | ForEach-Object Name)
+    if ($Settings.Collection.IdentityMap -and $Settings.Collection.IdentityMap.Count) {
+        $manual = [Collections.Generic.Dictionary[string, string]]::new([StringComparer]::Ordinal)
+        foreach ($k in $Settings.Collection.IdentityMap.Keys) { $manual[$k] = $Settings.Collection.IdentityMap[$k] }
+        $o.ManualIdentities = $manual
+    }
     return [ExchangeLogReport.Collector]::new($Store, $o)
 }
 
@@ -1039,6 +1196,7 @@ function Invoke-ExlCollection {
     param([Parameter(Mandatory)]$Store, [Parameter(Mandatory)]$Settings, [Parameter(Mandatory)][long]$RunId, [object[]]$Servers)
     if (-not $Servers) { $Servers = $Settings.Servers }
     $collector = New-ExlCollector -Store $Store -Settings $Settings -RunId $RunId
+    $identityLog = { foreach ($l in $collector.TakeMessages()) { $level, $text = $l.Split('|', 2); Write-ExlLog $level $text } }
     $since = [DateTime]::UtcNow.AddDays(-$Settings.Collection.BackfillDays)
     $totals = [ordered]@{ Files = 0L; Bytes = 0L; Lines = 0L; Kept = 0L; Noise = 0L; Stored = 0L; Errors = 0L; Recovered = 0L; Seconds = 0.0; Threads = 0; Statistics = $null; Unreachable = [Collections.Generic.List[string]]::new(); Stale = [Collections.Generic.List[string]]::new(); NoiseReasons = @{} }
     $clock = [Diagnostics.Stopwatch]::StartNew()
@@ -1060,6 +1218,10 @@ function Invoke-ExlCollection {
     $collector.Plan($jobs.ToArray(), $since)
     Write-ExlLog 'INFO' ("Listing: {0} folder(s), {1} file(s), {2} to read, in {3:0.0} s" -f $jobs.Count, ($jobs | Measure-Object Total -Sum).Sum, ($jobs | ForEach-Object { $_.Files.Count } | Measure-Object -Sum).Sum, $watch.Elapsed.TotalSeconds)
     Write-Progress -Id 1 -Activity 'Reading the new log lines' -Completed
+    # The SIDs stored as logged that the logs name: the next part of the evidence scan of the lines collected while no evidence was gathered (only
+    # in the log folders the listing found), then their rows renamed, before the new lines.
+    $collector.PrepareIdentities()
+    & $identityLog
 
     Write-ExlTableRow -Header
     $staleOf = @{}
@@ -1141,7 +1303,8 @@ function Invoke-ExlCollection {
     }
     $watch = [Diagnostics.Stopwatch]::StartNew()
     $totals.Recovered = $collector.Complete()
-    Write-ExlLog 'INFO' ("Back-end IMAP/POP connections and recoveries ({0}) written in {1:0.0} s; WAL {2}" -f $totals.Recovered, $watch.Elapsed.TotalSeconds, (Format-ExlBytes $Store.WalBytes))
+    Write-ExlLog 'INFO' ("Back-end IMAP/POP connections, recoveries ({0}) and identities written in {1:0.0} s; WAL {2}" -f $totals.Recovered, $watch.Elapsed.TotalSeconds, (Format-ExlBytes $Store.WalBytes))
+    & $identityLog
     $totals.Seconds = $clock.Elapsed.TotalSeconds
     return [pscustomobject]$totals
 }
@@ -1160,11 +1323,6 @@ function New-ExlReport {
     [CmdletBinding()]
     param([Parameter(Mandatory)]$Store, [Parameter(Mandatory)]$Settings, [Parameter(Mandatory)]$Period,
         [ValidateSet('Usage', 'Detailed')][string]$ReportType = 'Usage', [string[]]$User, [string[]]$Server, [bool]$IncludeRoutingDetails = $true, [bool]$IncludeSessionDetails = $true)
-    Assert-ExlPackageIntegrity
-    if (-not [string]::Equals([IO.Path]::GetFullPath($Settings.Report.TemplatePath),
-        [IO.Path]::Combine($script:ToolRoot, 'templates\Report.template.html'), [StringComparison]::OrdinalIgnoreCase)) {
-        throw 'Package integrity: report template must belong to the authenticated package.'
-    }
     $zone = $Settings.Zone
     $scope = @($Settings.Servers | Where-Object { -not $Server -or $_.Name -in $Server })
     $edge = $scope.Count -gt 0 -and @($scope | Where-Object { -not (Test-ExlEdgeServer $_) }).Count -eq 0
@@ -1196,6 +1354,9 @@ function New-ExlReport {
     $q.Generated = Format-ExlLocalTime ([DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()) $zone 'yyyy-MM-dd HH:mm'
     $q.RecoveryWindowMs = [long]$Settings.Collection.RecoveryWindowMinutes * 60000
     $q.MaxHtmlRows = $Settings.Report.MaxHtmlRows
+    $q.HtmlLayout = $Settings.Report.HtmlLayout
+    $q.SingleFileMaxMB = $Settings.Report.SingleFileMaxMB
+    $q.ScratchFolder = $Settings.Report.ScratchFolder
     $q.MemoryBudgetMB = $Settings.Report.MemoryBudgetMB
     $q.Parallelism = $Settings.Report.Parallelism
     $q.Progress = [Action[string]]{ param($stage) Write-ExlLog 'INFO' "Report stage: $stage" }
@@ -1204,8 +1365,15 @@ function New-ExlReport {
     foreach ($s in @($result.Steps | Select-Object -First 8)) { Write-ExlLog 'INFO' "Report step: $s" }
     Write-ExlLog 'INFO' ("Report buffers: budget {0} MB including SQLite caches (source {4} MB, temporary 8 MB), estimated row/worker peak {1:0.0} MB, {2} CPU worker(s), {3} rows spooled to disk (process RAM includes other allocations)." -f
         $result.MemoryBudgetMB, ($result.PeakBufferBytes / 1MB), $result.Parallelism, $result.SpilledRows, $result.DatabaseCacheMB)
-    Write-ExlLog 'INFO' ("Report I/O: {0} transcript value(s) decoded ({1}); scratch peak {2}." -f
-        $result.TranscriptReads, (Format-ExlBytes $result.TranscriptBytes), (Format-ExlBytes $result.ScratchPeakBytes))
+    Write-ExlLog 'INFO' ("Report I/O: {0} transcript value(s) decoded ({1}); work file in {2} ({3} free at the start), scratch peak {4}." -f
+        $result.TranscriptReads, (Format-ExlBytes $result.TranscriptBytes), $result.ScratchFolder,
+        $(if ($result.ScratchFreeBytes -ge 0) { Format-ExlBytes $result.ScratchFreeBytes } else { 'unknown' }), (Format-ExlBytes $result.ScratchPeakBytes))
+    if ($result.HtmlCutTables.Count) {
+        Write-ExlLog 'WARN' ("Report.MaxHtmlRows = {0} cut the HTML tables {1}; the CSV files are complete. Set Report.MaxHtmlRows = 0 for every row (a configuration written by an earlier version still says 200000)." -f
+            $Settings.Report.MaxHtmlRows, ($result.HtmlCutTables -join ', '))
+    }
+    if ($result.HtmlPreviousDataFolder) { Write-ExlLog 'WARN' ("The data folder of the earlier report could not be removed: delete {0}. The new report is complete." -f $result.HtmlPreviousDataFolder) }
+    if ($result.HtmlDataFolder) { Write-ExlLog 'INFO' ("HTML data: {0} file(s), {1} in {2} (keep it next to the page)." -f $result.HtmlDataFiles, (Format-ExlBytes $result.HtmlDataBytes), $result.HtmlDataFolder) }
     return $result
 }
 
@@ -1223,7 +1391,7 @@ function Show-ExlStatus {
     Write-ExlItem Info ('{0} real users {6} {1} daily usage rows {6} {2} failed requests kept {6} {3} SMTP transactions {6} {4} tracking events ({5} messages)' -f
         (Format-ExlNumber $counts[5]), (Format-ExlNumber $counts[0]), (Format-ExlNumber $counts[1]), (Format-ExlNumber $counts[2]), (Format-ExlNumber $counts[3]), (Format-ExlNumber $counts[4]), $dot) -Icon Chart
     $rows = $Store.Query("SELECT server, kind, COUNT(*), SUM(offset), SUM(lines), SUM(kept), SUM(noise), MIN(first_ms), MAX(last_ms), MAX(updated_ms) FROM source_file GROUP BY server, kind ORDER BY server, kind", $null).Rows
-    if (-not $rows.Count) { Write-ExlItem Warn 'Nothing has been collected yet. Run: .\Invoke-ExchangeLogReport.ps1 -Mode Collect'; return }
+    if (-not $rows.Count) { Write-ExlItem Warn 'Nothing has been collected yet. Run: .\Run-Collector.cmd -Mode Collect'; return }
     Write-Host ''
     Write-Host ('      {0}{1}{2,-10} {3,-12} {4,7} {5,10} {6,13} {7,11} {8,6}  {9,-33} {10}{11}' -f $K.Dim, ('  ' + $script:IconPad), 'Server', 'Source', 'Files', 'Read', 'Lines', 'Kept', 'Noise', 'Data from - to', 'Last read', $K.Reset)
     $staleMs = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds() - [long]$Settings.Collection.StaleSourceHours * 3600000
@@ -1251,6 +1419,102 @@ function Show-ExlStatus {
             foreach ($n in $noise) { Write-Host ('          {0}{1,12}{2}  {3}' -f $K.Dim, (Format-ExlNumber $n[1]), $K.Reset, $n[0]) }
         }
     }
+    Show-ExlIdentityStatus -Store $Store -Settings $Settings
+    Show-ExlMailFlowStatus -Store $Store
+}
+
+function Show-ExlMailFlowStatus {
+    <#
+        The rules of the Sent to external status (metadata mailflow_rules and mailflow_accepted_domains): on or off and why, and the domains the
+        collector learnt from the logs as yours (every one in the log file, the first 40 on the screen); the domains and server addresses a
+        collection learnt and has not applied yet (it applies them at its end; an interrupted one leaves them to the next).
+    #>
+    param([Parameter(Mandatory)]$Store)
+    $rules = $Store.ReadMailFlowRules()
+    $learnt = @($rules.LearnedDomains)
+    $configured = @($rules.InternalDomains)
+    $pendingDomains = $null; $pendingServers = $null
+    [ExchangeLogReport.MailFlowRules]::ParsePending($Store.ReadPendingMailFlow($null), [ref]$pendingDomains, [ref]$pendingServers)
+    $count = Format-ExlNumber $learnt.Count
+    Write-Host ''
+    if ($rules.Saturated) {
+        Write-ExlItem Warn ("Sent to external: off. The list of your domains learnt from the logs is full ({0} domains), so it may miss one of yours: no message is shown as sent to external; the messages handed to another server stay Handed off outside collection." -f (Format-ExlNumber ([ExchangeLogReport.MailFlowRules]::MaxLearnedDomains))) -Icon Mail
+    }
+    elseif (-not $rules.HasDomains) {
+        Write-ExlItem Info 'Sent to external: not yet. No domain of yours is known yet (the collector learns them from the mail your servers deliver and send, or list them in Collection.InternalDomains).' -Icon Mail
+    }
+    else {
+        Write-ExlItem Info ("Sent to external: on. {0} domain(s) of yours learnt from the logs{1}." -f $count, $(if ($configured.Count) { ", $($configured.Count) in Collection.InternalDomains ($($configured -join ', '))" } else { '' })) -Icon Mail
+    }
+    if ($learnt.Count) {
+        $shown = @($learnt | Select-Object -First 40)
+        Write-Host ('          {0}{1}{2}{3}' -f $script:C.Dim, ($shown -join ', '), $(if ($learnt.Count -gt $shown.Count) { " and $(Format-ExlNumber ($learnt.Count - $shown.Count)) more (the log file lists every domain)" } else { '' }), $script:C.Reset)
+    }
+    Write-ExlLog 'INFO' ("Status Sent to external: {0}; learnt domains ({1}): {2}; configured domains: {3}; collected servers: {4}" -f
+        $(if ($rules.Saturated) { 'off (the list of learnt domains is full)' } elseif ($rules.HasDomains) { 'on' } else { 'no domain known' }), $learnt.Count, ($learnt -join ', '), ($configured -join ', '), (@($rules.Servers) -join ', '))
+    if (@($pendingDomains).Count + @($pendingServers).Count) {
+        Write-ExlItem Info ("Learnt by a collection and not applied yet: {0} domain(s) and {1} server address(es). The end of that collection, or the next collection, applies them." -f @($pendingDomains).Count, @($pendingServers).Count) -Icon Mail
+        Write-ExlLog 'INFO' ("Status Sent to external: not applied yet: domains {0}; server addresses {1}" -f (@($pendingDomains) -join ', '), (@($pendingServers) -join ', '))
+    }
+}
+
+function Show-ExlIdentityStatus {
+    <#
+        The security identifiers Exchange logged as the user of token (OAuth) requests: resolved (requests stored under the SID were merged),
+        paired in advance (named before any token request: nothing to merge), unresolved (with the evidence that waits for a second day and the
+        hints), ambiguous; and, for a SID no longer resolved, the account its rows of earlier collections were merged with.
+    #>
+    param([Parameter(Mandatory)]$Store, [Parameter(Mandatory)]$Settings)
+    if (-not $Store.Query("SELECT 1 FROM sqlite_master WHERE type='table' AND name='identity_map'", $null).Rows.Count) { return }
+    $rows = $Store.Query("SELECT sid, user, status, names, hints, lines, last_ms FROM identity_map ORDER BY lines DESC, sid", $null).Rows
+    if (-not $rows.Count) { return }
+    $zone = $Settings.Zone
+    # names: "kind:name=lines;...;days:kind=first-last" (the days are not evidence).
+    $evidence = { param([string]$Names) @($Names.Split(';', [StringSplitOptions]::RemoveEmptyEntries) | Where-Object { $_ -notlike 'days:*' }) }
+    $kindOf = { param([string]$Names) foreach ($k in 'anchor', 'mapi-backend', 'file') { if ($Names -match "(^|;)$k`:") { return $k } }; return '' }
+    $namesOf = { param([string]$Names, [string[]]$Kinds)
+        @(& $evidence $Names | Where-Object { -not $Kinds -or $_.Substring(0, $_.IndexOf(':')) -in $Kinds } |
+            ForEach-Object { $_.Substring($_.IndexOf(':') + 1, $_.LastIndexOf('=') - $_.IndexOf(':') - 1) } | Select-Object -Unique) }
+    $resolved = @($rows | Where-Object { [string]$_[2] -eq 'resolved' -and [long]$_[5] -gt 0 })
+    $paired = @($rows | Where-Object { [string]$_[2] -eq 'resolved' -and [long]$_[5] -eq 0 })
+    $kinds = @($resolved | ForEach-Object { & $kindOf ([string]$_[3]) } | Group-Object | Sort-Object Name | ForEach-Object { '{0} {1}' -f $_.Name, $_.Count })
+    $unresolved = @($rows | Where-Object { [string]$_[2] -eq 'unresolved' }); $ambiguous = @($rows | Where-Object { [string]$_[2] -eq 'ambiguous' })
+    Write-Host ''
+    Write-ExlItem Info ('Security identifiers (accounts Exchange logged by SID on token requests): {0} resolved{1}, {2}{3} unresolved, {4} ambiguous' -f
+        $resolved.Count, $(if ($kinds.Count) { ' (' + ($kinds -join ', ') + ')' } else { '' }), $(if ($paired.Count) { "$($paired.Count) paired in advance, " } else { '' }),
+        $unresolved.Count, $ambiguous.Count) -Icon People
+    foreach ($r in @($unresolved + $ambiguous)) {
+        $hints = @(([string]$r[4]).Split(';', [StringSplitOptions]::RemoveEmptyEntries) | ForEach-Object { $_.Substring(0, $_.LastIndexOf('=')) })
+        $merged = [string]$r[1]
+        $backEnd = @(& $namesOf ([string]$r[3]) 'mapi-backend')
+        if ([string]$r[2] -eq 'ambiguous') {
+            $what = 'ambiguous, the logs name ' + ((& $namesOf ([string]$r[3]) 'anchor', 'mapi-backend') -join ', ')
+            $todo = 'check which of these accounts uses the SID'
+        } elseif ($backEnd.Count) {
+            $what = 'unresolved, the MAPI back end names ' + ($backEnd -join ', ') + ' on one day only (two days are needed)'
+            $todo = 'it resolves when the back end names it again on another day, or add it to Collection.IdentityMapFile'
+        } else {
+            $what = 'unresolved'
+            $todo = 'add it to Collection.IdentityMapFile to name it'
+        }
+        if ($merged) { $what += ', rows of earlier collections merged with ' + $merged; $todo = "check the requests of $merged" }
+        Write-ExlItem Warn ('{0}: {1}, {2} requests{3}, last seen {4} - {5}' -f $r[0], $what, (Format-ExlNumber ([long]$r[5])),
+            $(if ($hints.Count) { ', hints ' + ($hints -join ', ') } else { '' }), (Format-ExlLocalTime ([long]$r[6]) $zone 'yyyy-MM-dd HH:mm'), $todo)
+    }
+    if ($Settings.Collection.IdentityMap) {
+        foreach ($sid in $Settings.Collection.IdentityMap.Keys) {
+            $row = @($rows | Where-Object { [string]$_[0] -eq $sid }) | Select-Object -First 1
+            if (-not $row -or (& $kindOf ([string]$row[3])) -in 'file', '') { continue }
+            $named = ([string]$Settings.Collection.IdentityMap[$sid]).ToLowerInvariant()
+            $user = if ([string]$row[2] -eq 'resolved') { [string]$row[1] } else { '' }
+            $logs = if ($user) { $user } else { (& $namesOf ([string]$row[3]) 'anchor', 'mapi-backend') -join ', ' }
+            $bare = { param([string]$n) $n = $n.Substring($n.LastIndexOf('\') + 1); if ($n.IndexOf('@') -gt 0) { $n.Substring(0, $n.IndexOf('@')) } else { $n } }
+            $domain = { param([string]$n) if ($n.IndexOf('\') -gt 0) { $n.Substring(0, $n.IndexOf('\')) } else { '' } }
+            $same = $user -and (& $bare $named) -eq (& $bare $user) -and (-not (& $domain $named) -or -not (& $domain $user) -or (& $domain $named) -eq (& $domain $user))
+            if ([string]$row[2] -eq 'ambiguous') { Write-ExlItem Warn "Mapping file entry for $sid ignored: the logs name more than one account." }
+            elseif (-not $same) { Write-ExlItem Warn "Mapping file entry for $sid ignored: the logs name $logs." }
+        }
+    }
 }
 
 function Invoke-ExlRetention {
@@ -1269,8 +1533,11 @@ function Invoke-ExlRetention {
 }
 
 function Enter-ExlLock {
-    <# Prevents two executions from collecting at the same time. Release with Exit-ExlLock. -NoWait: $null when the lock is taken. #>
-    param([Parameter(Mandatory)][string]$Path, [int]$TimeoutSeconds = 30, [switch]$NoWait)
+    <#
+        Prevents two executions from collecting (or upgrading the database) at the same time. Release with Exit-ExlLock. -NoWait: $null when the
+        lock is taken. -BusyMessage: the error when the wait ends, {0} the owner of the lock.
+    #>
+    param([Parameter(Mandatory)][string]$Path, [int]$TimeoutSeconds = 30, [switch]$NoWait, [string]$BusyMessage)
     [void][IO.Directory]::CreateDirectory((Split-Path $Path -Parent))
     $deadline = [DateTime]::UtcNow.AddSeconds($TimeoutSeconds)
     while ($true) {
@@ -1284,6 +1551,7 @@ function Enter-ExlLock {
             if ($NoWait) { return $null }
             if ([DateTime]::UtcNow -ge $deadline) {
                 $owner = try { [IO.File]::ReadAllText($Path) } catch { 'unknown' }
+                if ($BusyMessage) { throw ($BusyMessage -f $owner) }
                 throw "Another execution is already collecting ($owner). Wait for it to finish, or build the report without -Collect: it uses the data already collected."
             }
             Start-Sleep -Seconds 2
@@ -1701,7 +1969,6 @@ function Get-ExlExchangeSettings {
     param([string[]]$ConnectTo, [pscredential]$Credential)
     $windowsPowerShell = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
     if (-not (Test-Path -LiteralPath $windowsPowerShell -PathType Leaf)) { throw "Windows PowerShell 5.1 is needed for -Mode Discover (the Exchange cmdlets run in Windows PowerShell only): $windowsPowerShell not found." }
-    Assert-ExlPackageIntegrity
     $helper = Join-Path $script:ToolRoot 'src\Get-ExlExchangeSettings.ps1'
     $out = Join-Path ([IO.Path]::GetTempPath()) ("elr-discover-{0}.json" -f [guid]::NewGuid().ToString('N'))
     $credentialFile = $null
@@ -2011,7 +2278,7 @@ function New-ExlMailSettings {
     if ($m.Authentication -in 'Basic', 'Kerberos') {
         $credential = Read-ExlMailCredential -Settings $Settings
         if ($credential) { $s.UserName = $credential.UserName; $s.Password = $credential.Password }
-        elseif ($m.Authentication -eq 'Basic') { throw "Basic authentication needs Mail.CredentialFile ($($m.CredentialFile)): run once .\Invoke-ExchangeLogReport.ps1 -Mode MailTest -Credential (Get-Credential), with the account of the scheduled task." }
+        elseif ($m.Authentication -eq 'Basic') { throw "Basic authentication needs Mail.CredentialFile ($($m.CredentialFile)): run once .\Run-Collector.cmd -Mode MailTest -Credential (Get-Credential), with the account of the scheduled task." }
     }
     return $s
 }
@@ -2066,12 +2333,11 @@ function Send-ExlTestMail {
 
 #endregion
 
-
 # SIG # Begin signature block
-# MIIghgYJKoZIhvcNAQcCoIIgdzCCIHMCAQExDzANBglghkgBZQMEAgEFADB5Bgor
+# MIImJAYJKoZIhvcNAQcCoIImFTCCJhECAQExDzANBglghkgBZQMEAgEFADB5Bgor
 # BgEEAYI3AgEEoGswaTA0BgorBgEEAYI3AgEeMCYCAwEAAAQQH8w7YFlLCE63JNLG
-# KX7zUQIBAAIBAAIBAAIBAAIBADAxMA0GCWCGSAFlAwQCAQUABCBIlaQ/peqhk5/a
-# 2WlTEl9m/Mq+Xtk8nhb/7EZGYrfpsKCCDW8wggZyMIIEWqADAgECAghkM1HTxzif
+# KX7zUQIBAAIBAAIBAAIBAAIBADAxMA0GCWCGSAFlAwQCAQUABCD9olEhimaJNGx3
+# W30Sw1YwgULsovhsHiizEleQfyOOUqCCDW8wggZyMIIEWqADAgECAghkM1HTxzif
 # CDANBgkqhkiG9w0BAQsFADB8MQswCQYDVQQGEwJVUzEOMAwGA1UECAwFVGV4YXMx
 # EDAOBgNVBAcMB0hvdXN0b24xGDAWBgNVBAoMD1NTTCBDb3Jwb3JhdGlvbjExMC8G
 # A1UEAwwoU1NMLmNvbSBSb290IENlcnRpZmljYXRpb24gQXV0aG9yaXR5IFJTQTAe
@@ -2143,103 +2409,133 @@ function Send-ExlTestMail {
 # ULeH38N0Vr83psiJVuBSxQyt5nRVrpYz7FACq5gtXELkyViq/rGOlJKaRrgQ6WWq
 # eoIXqKhVFAdP/jAEm2M8ezoVYsUgPyKY2OcuecV9coulAcxUIUydx6qYiOfsGj5u
 # Dy7l4aYjvB771wkUMzUQwxzcDYXJtMMTaWRe6n9EemR67jc73u5CJyFg3PfA5WR1
-# wZislcdCZuS6MYISbTCCEmkCAQEwgYwweDELMAkGA1UEBhMCVVMxDjAMBgNVBAgM
+# wZislcdCZuS6MYIYCzCCGAcCAQEwgYwweDELMAkGA1UEBhMCVVMxDjAMBgNVBAgM
 # BVRleGFzMRAwDgYDVQQHDAdIb3VzdG9uMREwDwYDVQQKDAhTU0wgQ29ycDE0MDIG
 # A1UEAwwrU1NMLmNvbSBDb2RlIFNpZ25pbmcgSW50ZXJtZWRpYXRlIENBIFJTQSBS
 # MQIQBof4ljXihJpmCqqt2mhAWzANBglghkgBZQMEAgEFAKCBhDAYBgorBgEEAYI3
 # AgEMMQowCKACgAChAoAAMBkGCSqGSIb3DQEJAzEMBgorBgEEAYI3AgEEMBwGCisG
-# AQQBgjcCAQsxDjAMBgorBgEEAYI3AgEVMC8GCSqGSIb3DQEJBDEiBCCdcWPtiNVs
-# i8SS08U0kIG6q+G4MWe3QUxj5VlnaC7W9zANBgkqhkiG9w0BAQEFAASCAgBtlRkX
-# W2X5w+UHVIRi1ALJUG6VhIwvtKJ24yVl1LKurIFhMGz37Ck9lwugvAY1eELA9gOw
-# WR45YMUaiOhE0EF/g8FB79ViDXVJbrTm+f9EGR/NTEd3Ge78X/S4TmlHaafDGl5N
-# MkUP97PZ5iQZ9PGECK8W1euZd6g3FrgykjFClXeqtMMc3l+BogmeFClFlgHO0mWD
-# 2anRjr2/uHg2+LE0DVAZDRc9vDeiAga1NnMZhAegfF72s0pc45NrDQLY3RXTVXah
-# 9eROwqghzfjK2k95uvm88rSHWsXeTUOLk9zZ1Sj+aYqqZwj1+9pziOEYcKP/xiYA
-# zLjWe6muQ9ONj8iK0gQynz8KVF4Y7nC0l7o+k0Iv2NpBX9zmI8/E4B4wIQ/KltGU
-# EVftzBulZgYEqnrkfVX67u8lcjH9S7QcGaw3VE+zGbky6StPyd/MsreMM+jVD/Uy
-# sYR3stHfa0md5uozcFlok40P6WC7ano6Xc3Y+1m0RdJz2Lx5tjuDIQZWqmFEV6pW
-# o3h7lqeiSIuhgVGaqacnfQuT0MwB2JlnbhBBQzNlPRbv0vuPgkruk3RMnOg0eeTN
-# NxRHrdwlgReCmKGsgShSYlG6OnV+DXlT80SZtOrOgD48/w3wTZTRTb0/T3oxZoi6
-# vfMwEicztcIJfwhxJ+I0LszT7ih4JiT6RgxByqGCDyowgg8mBgorBgEEAYI3AwMB
-# MYIPFjCCDxIGCSqGSIb3DQEHAqCCDwMwgg7/AgEDMQ0wCwYJYIZIAWUDBAIBMIGJ
-# BgsqhkiG9w0BCRABBKB6BHgwdgIBAQYMKwYBBAGCqTABAwYBMDEwDQYJYIZIAWUD
-# BAIBBQAEIOMDVW0q0Tl1rqpjPyGO61OT9QEARctrfuJ2uNONIYx4Aghg1D7q8W69
-# oRgPMjAyNjEwMTQxNTE2MjRaMAMCAQECEEWm24/0XlDjbzLuwrLJkQ2gggwAMIIE
-# /DCCAuSgAwIBAgIQH2sWYtIuG2xd8cDBoGAOODANBgkqhkiG9w0BAQsFADBzMQsw
-# CQYDVQQGEwJVUzEOMAwGA1UECAwFVGV4YXMxEDAOBgNVBAcMB0hvdXN0b24xETAP
-# BgNVBAoMCFNTTCBDb3JwMS8wLQYDVQQDDCZTU0wuY29tIFRpbWVzdGFtcGluZyBJ
-# c3N1aW5nIFJTQSBDQSBSMTAeFw0yNTAyMTgxNjMyMDJaFw0zNDExMTIxODUwMDVa
-# MG4xCzAJBgNVBAYTAlVTMQ4wDAYDVQQIDAVUZXhhczEQMA4GA1UEBwwHSG91c3Rv
-# bjERMA8GA1UECgwIU1NMIENvcnAxKjAoBgNVBAMMIVNTTC5jb20gVGltZXN0YW1w
-# aW5nIFVuaXQgMjAyNSBFMTBZMBMGByqGSM49AgEGCCqGSM49AwEHA0IABBv7UVHH
-# b+ZVluxPXlfE3M6tg0Xnq8dic+O3vPOCRpalUM1vO9A+GRzSVVjyygHhYrBw62XL
-# Fh1kv7e+yRd/aTajggFaMIIBVjAfBgNVHSMEGDAWgBQMnRAljpqnG5mHQ88IfuG9
-# gZD0zzBRBggrBgEFBQcBAQRFMEMwQQYIKwYBBQUHMAKGNWh0dHA6Ly9jZXJ0LnNz
-# bC5jb20vU1NMLmNvbS10aW1lU3RhbXBpbmctSS1SU0EtUjEuY2VyMFEGA1UdIARK
-# MEgwPAYMKwYBBAGCqTABAwYBMCwwKgYIKwYBBQUHAgEWHmh0dHBzOi8vd3d3LnNz
-# bC5jb20vcmVwb3NpdG9yeTAIBgZngQwBBAIwFgYDVR0lAQH/BAwwCgYIKwYBBQUH
-# AwgwRgYDVR0fBD8wPTA7oDmgN4Y1aHR0cDovL2NybHMuc3NsLmNvbS9TU0wuY29t
-# LXRpbWVTdGFtcGluZy1JLVJTQS1SMS5jcmwwHQYDVR0OBBYEFM582cAEgMUkEGoJ
-# 6hyrJT0R/ajSMA4GA1UdDwEB/wQEAwIHgDANBgkqhkiG9w0BAQsFAAOCAgEAgHN1
-# JIW9ZlNip07FfY9r1LJwLKTl1h/y9r1BjDgHMEz7U7J7mAy32JxA1KLyjCCJqNku
-# RfhDHGFEfZtjTOru7AQMDSDiUDvCCc3jaz5py9jGvwIe5npkLbXqXhA+SqCzG719
-# USigwhHkYr7v8NiXoaY0Xu03p0BiZZreZlpngmGB9+86N94FqIFx2I5Z5iuu7d4j
-# 7aAOZBNxfU9jFDIIGDtWfWeCpF0Q8rLE/3DHDlzJKs5Il3i/VoOl7rTU938oSrxM
-# www6GDBlKX8rGHxvkjgIb9MXkVglJSDHsNAZDeCS/inaxKHA+ChuB8K4OxIxa6k1
-# e+eHBypakAY3wuN7w7PlPmhN6k5IdqZn3HZHs2VjoR841Z9wmVPFdGDdkBZ7XOmb
-# 5OZUaKufsvtER0VbY2DkzaqAaItt1kc+I+FUz7PiVz2PUzpegkftRRxvrPyIL08b
-# lJTnbMQ0XrqDN0rEfuTLv4XhhnKyJaXhxCUdjO/cRumMzZ35QTUMItBWy1xGp0iy
-# oFVnAya2pPsVMuAI+sy1zxlOS9l5iSxvKJ8gpnpOgjqYTa7u1eyZo+4JlcGoiiR1
-# 7LthMTrF1q62tO5xOpI8txUZ6gtKGtkJV6wdj+vZLcwKZ2M93GqVpOo6UBlGjx1s
-# KsVZ7AIUzJZli4NJ0M2KYcrfNnlebkYKpDnSqWwwggb8MIIE5KADAgECAhBtUhhw
-# h+gjTYVgANCAj5NWMA0GCSqGSIb3DQEBCwUAMHwxCzAJBgNVBAYTAlVTMQ4wDAYD
-# VQQIDAVUZXhhczEQMA4GA1UEBwwHSG91c3RvbjEYMBYGA1UECgwPU1NMIENvcnBv
-# cmF0aW9uMTEwLwYDVQQDDChTU0wuY29tIFJvb3QgQ2VydGlmaWNhdGlvbiBBdXRo
-# b3JpdHkgUlNBMB4XDTE5MTExMzE4NTAwNVoXDTM0MTExMjE4NTAwNVowczELMAkG
-# A1UEBhMCVVMxDjAMBgNVBAgMBVRleGFzMRAwDgYDVQQHDAdIb3VzdG9uMREwDwYD
-# VQQKDAhTU0wgQ29ycDEvMC0GA1UEAwwmU1NMLmNvbSBUaW1lc3RhbXBpbmcgSXNz
-# dWluZyBSU0EgQ0EgUjEwggIiMA0GCSqGSIb3DQEBAQUAA4ICDwAwggIKAoICAQCu
-# URAT0vk8IKAghd7JUBxkyeH9xek0/wp/MUjoclrFXqhh/fGH91Fc+7fm0MHCE7A+
-# wmOiqBj9ODrJAYGq3rm33jCnHSsCBNWAQYyoauLq8IjqsS1JlXL29qDNMMdwZ8UN
-# zQS7vWZMDJ40JSGNphMGTIA2qn2bohGtgRc4p1395ESypUOaGvJ3t0FNL3BuKmb6
-# YctMcQUF2sqooMzd89h0E6ujdvBDo6ZwNnWoxj7YmfWjSXg33A5GuY9ym4QZM5OE
-# Vgo8ebz/B+gyhyCLNNhh4Mb/4xvCTCMVmNYrBviGgdPZYrym8Zb84TQCmSuX0JlL
-# La6WK1aO6qlwISbb9bVGh866ekKblC/XRP20gAu1CjvcYciUgNTrGFg8f8AJgQPO
-# Cc1/CCdaJSYwhJpSdheKOnQgESgNmYZPhFOC6IKaMAUXk5U1tjTcFCgFvvArXtK4
-# azAWUOO1Y3fdldIBL6LjkzLUCYJNkFXqhsBVcPMuB0nUDWvLJfPimstjJ8lF4S6E
-# CxWnlWi7OElVwTnt1GtRqeY9ydvvGLntU+FecK7DbqHDUd366UreMkSBtzevAc9a
-# qoZPnjVMjvFqV1pYOjzmTiVHZtAc80bAfFe5LLfJzPI6DntNyqobpwTevQpHqPDN
-# 9qqNO83r3kaw8A9j+HZiSw2AX5cGdQP0kG0vhzfgBwIDAQABo4IBgTCCAX0wEgYD
+# AQQBgjcCAQsxDjAMBgorBgEEAYI3AgEVMC8GCSqGSIb3DQEJBDEiBCDOHnr5klho
+# 9HRl0w4uT2f+o6o9zhs8DJPwFG0U7o7+6zANBgkqhkiG9w0BAQEFAASCAgAtEBkM
+# 0V12Clvxg8hlYk0zvWmUMgO4Y1jzuiW99oJjQpthCorlKteWBxmu/dLYuqdPsZ89
+# AkBEYepz9Zg0t/+t3HGUN29e1by6E3u6bSJIpkxp24o7y7BLwbTK48s546iGjM/F
+# 6AB13iNEyHcgAvNm4S+fQmEbBy7CoEARY5y/dTJeH1EpiUNCy3o2rYDGxSyODaRF
+# pC8mc+hBrdRLF3JedRmkNPpEICUV4nPBGFMVwxBJ01YYqBy6vszOiG5pMesj6GRD
+# HuAcLpKjL9W9CHISI3wlve07mha2HnCbFtucqkg410+jS2YRNq9HL80Mk4Kd9U9A
+# Gm/cpVczVVPe+WPiUQU36cB91sSvvgD2o5us21IcewyEVfoxGiG5xuGDgxpkmXV5
+# ZYEldNO+gNODysNUqtpIcKE/XmNhpfBNcyytODy0nzPISpBVFj3OUE6TKw4vbyk1
+# VMqAhy9MKl5qIb44bYAqy0v0GQsfvMoBMCY8tjuJNOl9dl5rg02d6wbj+ca23IXg
+# rtJSJo/XMDF7NDV6m6Q8/BcP6G+YX1+3G1DwqVe9MshFn8CTWSomHB4uxiH7fLEL
+# aIq1KRORn/2pa3hbZiCMEqyIdwBc8IqBbHJIZ+CZEJRYa6pvbxswGiGVAz0UlI8c
+# qMZLwKEmBmd7X+be+bwt1U6c5I8QTv2meWY4CqGCFMgwghTEBgorBgEEAYI3AwMB
+# MYIUtDCCFLAGCSqGSIb3DQEHAqCCFKEwghSdAgEDMQ0wCwYJYIZIAWUDBAIBMIGC
+# BgsqhkiG9w0BCRABBKBzBHEwbwIBAQYMKwYBBAGCqTABAwYBMDEwDQYJYIZIAWUD
+# BAIBBQAEIEh7cMK5+Poh1J4RRMGl0PObtbUotPTbnkRnAcKeuhOXAgghztvXmsL3
+# iRgPMjAyNjExMDMwOTM4MDRaMAMCAQECCQCqNl+4fo8M/6CCEacwggTzMIIC26AD
+# AgECAhBUQ/g3vVruGAGEcrhc2o7jMA0GCSqGSIb3DQEBCwUAMHIxCzAJBgNVBAYT
+# AlVTMQ4wDAYDVQQIDAVUZXhhczEQMA4GA1UEBwwHSG91c3RvbjERMA8GA1UECgwI
+# U1NMIENvcnAxLjAsBgNVBAMMJVNTTC5jb20gVGltZXN0YW1waW5nIElzc3Vpbmcg
+# UlNBIENBIDIwHhcNMjYwNjEyMTcyMjQ2WhcNMzYwNjA5MTcyMjQ1WjBuMQswCQYD
+# VQQGEwJVUzEOMAwGA1UECAwFVGV4YXMxEDAOBgNVBAcMB0hvdXN0b24xETAPBgNV
+# BAoMCFNTTCBDb3JwMSowKAYDVQQDDCFTU0wuY29tIFRpbWVzdGFtcGluZyBVbml0
+# IDIwMjYgRTEwWTATBgcqhkjOPQIBBggqhkjOPQMBBwNCAAToJYu4ZhMuSJI48ws2
+# yQ4G2FewiFFIDjp945DC9ItwNo2Hq/FTMEoTHUp0UFEWzs4eucf8rRUDoxsNAgWl
+# SDQ9o4IBUjCCAU4wHwYDVR0jBBgwFoAUcJplwUOAo/zpsWSJbvEwnAkhyXwwTQYI
+# KwYBBQUHAQEEQTA/MD0GCCsGAQUFBzAChjFodHRwOi8vY2VydC5zc2wuY29tL1NT
+# TC5jb20tdGltZVN0YW1waW5nLUktUjIuY2VyMFEGA1UdIARKMEgwPAYMKwYBBAGC
+# qTABAwYBMCwwKgYIKwYBBQUHAgEWHmh0dHBzOi8vd3d3LnNzbC5jb20vcmVwb3Np
+# dG9yeTAIBgZngQwBBAIwFgYDVR0lAQH/BAwwCgYIKwYBBQUHAwgwQgYDVR0fBDsw
+# OTA3oDWgM4YxaHR0cDovL2NybHMuc3NsLmNvbS9TU0wuY29tLXRpbWVTdGFtcGlu
+# Zy1JLVIyLmNybDAdBgNVHQ4EFgQUJ6wDVrooaroXO4M9QH95qCTswzwwDgYDVR0P
+# AQH/BAQDAgeAMA0GCSqGSIb3DQEBCwUAA4ICAQBPdm7O/AOewhlNcGf6GOa4FeDM
+# HXZ9tjFP25h7pm+G+ltlYpzINCBpwROQ/DyTrJ6qdgJjIVnTreUw8SoCEAPacwbr
+# XhmHs+0db0Nap+yCK/Fs9gF4363tTGCRhPd7GltYx08SoG1ZXIc68twq8zGAlZ8m
+# MA3BWTBUN+TL+Ptx/bz6KKY3w8pztL+7z8t6dFGdXZbZh+dxGeTP0J+zmdEPNpmC
+# 6IeuunYbHCCc1BIfgYGMc6Xc/MuydVsahkqLhkSOBe6mziYYY4rv4YHYcCVCf45L
+# 3jhweqWQfSASW3ZZ7OgI1GkQumH2prG4GeNISpdZZ+ATrIYHA7S7Eo2qlZVMeYDC
+# vpK8E+h/G5tci4Sf2K9HgIs64DFRKsnjVkGD+qobSgmMXoaREpvGrtzJZKQRlgmG
+# YoKDYeDl9cdqA7GLBuafkk9nW+FYKtuTe/91PHaC9Mrn56sLkf3+tNyWNQjvvrJ3
+# at+GN+Sm/ICxu1ezgPueufDyL3Civn5921FIkFXGrMubKQV+2gvRSnZD763IoJR2
+# uJt1yesHgcpLez63cCN1xsDToMIvwaJ9CL18vTJEFE2UDijoE/5KvvnkxoI2NRFh
+# kO8PLEkcEFPtyqNkjCyJHyz7rzrSegVsEG12B7YjDsI8L/VDfUjbuFWiVLsHTJqj
+# e/xfYy1bLeaxmVdNwTCCBd0wggPFoAMCAQICCHssm9MWgDKZMA0GCSqGSIb3DQEB
+# CwUAMHwxCzAJBgNVBAYTAlVTMQ4wDAYDVQQIDAVUZXhhczEQMA4GA1UEBwwHSG91
+# c3RvbjEYMBYGA1UECgwPU1NMIENvcnBvcmF0aW9uMTEwLwYDVQQDDChTU0wuY29t
+# IFJvb3QgQ2VydGlmaWNhdGlvbiBBdXRob3JpdHkgUlNBMB4XDTE2MDIxMjE3Mzkz
+# OVoXDTQxMDIxMjE3MzkzOVowfDELMAkGA1UEBhMCVVMxDjAMBgNVBAgMBVRleGFz
+# MRAwDgYDVQQHDAdIb3VzdG9uMRgwFgYDVQQKDA9TU0wgQ29ycG9yYXRpb24xMTAv
+# BgNVBAMMKFNTTC5jb20gUm9vdCBDZXJ0aWZpY2F0aW9uIEF1dGhvcml0eSBSU0Ew
+# ggIiMA0GCSqGSIb3DQEBAQUAA4ICDwAwggIKAoICAQD5D92jK33L0Cr+7GeFpucu
+# G7p34eP1r6Ts+kpdkcRXR2sYd2t28v2T5D0PwhaeC2bDVpSeF4OFzlbv8hb9AGL1
+# IglU6GUXTkG54E9Gl6obyLhuYl5psV/bKgJ+/GzK80HY7dDo/D9hSO2wAxQdEA5L
+# GeC7TuyGZf82815nAgudhlVh/Xo47f7iGQC3b6FQYnV0PKD6yCWStG56Isf4HqHj
+# st2RMasrHQT/pUoEN+mFpDMr/eLWVTR8GaRKaMeyqNO3yqGTiOvBl7yM+R3ZIoQk
+# dMcEPWqpKZPM67hb4f5fJao0WMjBI1SdG5gRwzicfj2GbKUPQIZ8AvRcAk8oy65x
+# nw86yDP+ESU16vy6xWA92XwY1bKp03V4A3IiyjrDH+8s5S6p+p4stlFG/a8D1upg
+# aOqFFjZrhekewLPdxCTcgCqBQW2UPsjgyYFBAJ5ev3/FCJiiGCxCQLP5bzgnS06A
+# 9D2BR+CIfOoczrV1XFEuHCt/GnIo5wC10XTG1+SfrQeTtlM1Nfw35MP2XRa+IXPe
+# kgr4oGNqvJaSaj74vGVVm971DYkmBPwlGqYlacvCbcp84llfl6zr7y7IvNcbWTwr
+# zPIZyJNrJ2MZz/zpJvjKcZt/k/40Z4ROmev8s3gJM3C6ZqZ27Rtz6xqlDcQiEyCU
+# VgpOLGxOsf3PnAm6ojPthwIDAQABo2MwYTAdBgNVHQ4EFgQU3QQJB6L1en1SUxKS
+# le44gCUNplkwDwYDVR0TAQH/BAUwAwEB/zAfBgNVHSMEGDAWgBTdBAkHovV6fVJT
+# EpKV7jiAJQ2mWTAOBgNVHQ8BAf8EBAMCAYYwDQYJKoZIhvcNAQELBQADggIBACAY
+# EZQp+yadHB4ecGHxlXKTcSStaJNYjjKvG7NwA/wlK3SFkD14avS5i6WXO7UYkbse
+# p/lAW5H5VZmvHhHQXB2nZuOxlAcMMjmm6huwedgdnHBE44rdxPmVH4o4Qz8BhaVH
+# pz1GsrzlImj3e5zYLD4KIcgtM6y/xYGZMXTBdXHFvrHwI0X0nWv8GWOdo7wExhgL
+# JbtTiQ+zgFDeRe5Ef6uUeGSY0/Yo3YfYcGV0+w65E+unD2GpMpbM3rvtY0wYu6lA
+# 96BUbiCIcXUY6nq0NHLgIyd3XLaQ6oYlQKvvMw/Ln4K+oiD79rUtGubChbF0D/vI
+# ZQKkUgFH3Ukiwb/Y62usft7sYzMVtyMIj8YPjUFa3Y7FuY/lRT9427rSG0Cx/nFN
+# P+CBorpetOwV4JPdCB9+4VWZCyHek54K++ajSb02MP7nd7KgdZe1LYGIF2Ug99qQ
+# AJ/JUswyyjV89T0P2CvX9SZsyQY0lhbqcFkaMnl5C7aIfw9SSD2/bNiiRC7RTrdy
+# WNOJE5X+RKv414sbbpy8LKBb1WoAr1834dX6EAuYnIbnJo/O8OxuilcLgONOssCg
+# Y2GQulVoN3RqtpLbn6GGIrZlJw7stp9CYORnwrXaQQvE04thG7z6H5Er10QHXrop
+# rNnF6e9TSFrrgPEoWCHNsAZV+yc/U5BwqQQeVye5MIIGyzCCBLOgAwIBAgIQUp27
+# wriJh/WDgOCw66IGNjANBgkqhkiG9w0BAQsFADB8MQswCQYDVQQGEwJVUzEOMAwG
+# A1UECAwFVGV4YXMxEDAOBgNVBAcMB0hvdXN0b24xGDAWBgNVBAoMD1NTTCBDb3Jw
+# b3JhdGlvbjExMC8GA1UEAwwoU1NMLmNvbSBSb290IENlcnRpZmljYXRpb24gQXV0
+# aG9yaXR5IFJTQTAeFw0yNjA2MTIxNjQyMTVaFw00MTAyMTIxNzM5MzlaMHIxCzAJ
+# BgNVBAYTAlVTMQ4wDAYDVQQIDAVUZXhhczEQMA4GA1UEBwwHSG91c3RvbjERMA8G
+# A1UECgwIU1NMIENvcnAxLjAsBgNVBAMMJVNTTC5jb20gVGltZXN0YW1waW5nIElz
+# c3VpbmcgUlNBIENBIDIwggIiMA0GCSqGSIb3DQEBAQUAA4ICDwAwggIKAoICAQCf
+# L6vmc02QvDFGmzYHeVpQY1T3Lu9aInnTXfJ/SJfPrltB3Br1uOPyX9KR5eocap9K
+# HYWhp77zQTyYMR/3egjCOzLYJfZxeYrGq0XwckZgHh/rJGEoQPnTCRs7KwvTYhd/
+# 78RmdrjiN9+GFXPg5T+TnbFD8+ciD+4WFzZaT5Jz8IeoCv6VhWQ/PsvLlGoH1/VE
+# oav0kLftbUuBV0cLnR00h2xrdBc+GW1hm5tHeekTgFt+LSOhRbmfk7RrLB43jlH9
+# hUvEDRgaWnU4dV9WeyperxuGfDUtziSMnpc6BeU6XD9rzN7ntO9t25mXd6F7BOa8
+# 7QCTL+eo5YNL0g8/F3F0bq+msFtK4eXE0A0EBsdOIWCR9mZ/R1liVP8CdkigXECr
+# Qcgs+iV/g6BaARPvpKJZKWbZdhEhfBWOl6obSmW9fBEhAHNKIQmPtB5AWcK8fHiB
+# Awg283f7Ib/WvGERtqMa97S1M/eVfg884dUATRAmnhnM8jVhgmSFVGuJVXFVFTgW
+# yDgE/A/oj5guYdvW1nhEvA4U0uH+AlgOA+UKEKjE6iAXFeDA9lmsPIRFgHRp457F
+# bQ4ppw3hFG71yoXYoq78BvkAvt5gMtUZQ+sQTJhsgwClUqql5tzT+MNCeIL7euRq
+# 5ECOBVzybWKn8JCAbUPDhn26VVEBj1VHplrbouxNtQIDAQABo4IBUTCCAU0wEgYD
 # VR0TAQH/BAgwBgEB/wIBADAfBgNVHSMEGDAWgBTdBAkHovV6fVJTEpKV7jiAJQ2m
-# WTCBgwYIKwYBBQUHAQEEdzB1MFEGCCsGAQUFBzAChkVodHRwOi8vd3d3LnNzbC5j
-# b20vcmVwb3NpdG9yeS9TU0xjb21Sb290Q2VydGlmaWNhdGlvbkF1dGhvcml0eVJT
-# QS5jcnQwIAYIKwYBBQUHMAGGFGh0dHA6Ly9vY3Nwcy5zc2wuY29tMD8GA1UdIAQ4
-# MDYwNAYEVR0gADAsMCoGCCsGAQUFBwIBFh5odHRwczovL3d3dy5zc2wuY29tL3Jl
-# cG9zaXRvcnkwEwYDVR0lBAwwCgYIKwYBBQUHAwgwOwYDVR0fBDQwMjAwoC6gLIYq
-# aHR0cDovL2NybHMuc3NsLmNvbS9zc2wuY29tLXJzYS1Sb290Q0EuY3JsMB0GA1Ud
-# DgQWBBQMnRAljpqnG5mHQ88IfuG9gZD0zzAOBgNVHQ8BAf8EBAMCAYYwDQYJKoZI
-# hvcNAQELBQADggIBAJIZdQ2mWkLPGQfZ8vyU+sCb8BXpRJZaL3Ez3VDlE3uZk3cP
-# xPtybVfLuqaci0W6SB22JTMttCiQMnIVOsXWnIuAbD/aFTcUkTLBI3xys+wEajzX
-# aXJYWACDS47BRjDtYlDW14gLJxf8W6DQoH3jHDGGy8kGJFOlDKG7/YrK7UGfHtBA
-# EDVe6lyZ+FtCsrk7dD/IiL/+Q3Q6SFASJLQ2XI89ihFugdYL77CiDNXrI2MFspQG
-# swXEAGpHuaQDTHUp/LdR3TyrIsLlnzoLskUGswF/KF8+kpWUiKJNC4rPWtNrxlbX
-# YRGgdEdx8SMjUTDClldcrknlFxbqHsVmr9xkT2QtFmG+dEq1v5fsIK0vHaHrWjMM
-# maJ9i+4qGJSD0stYfQ6v0PddT7EpGxGd867Ada6FZyHwbuQSadMb0K0P0OC2r7rw
-# qBUe0BaMqTa6LWzWItgBjGcObXeMxmbQqlEz2YtAcErkZvh0WABDDE4U8GyV/32F
-# daAvJgTfe9MiL2nSBioYe/g5mHUSWAay/Ip1RQmQCvmF9sNfqlhJwkjy/1U1ibUk
-# TIUBX3HgymyQvqQTZLLys6pL2tCdWcjI9YuLw30rgZm8+K387L7ycUvqrmQ3ZJlu
-# jHl3r1hgV76s3WwMPgKk1bAEFMj+rRXimSC+Ev30hXZdqyMdl/il5Ksd0vhGMYIC
-# WTCCAlUCAQEwgYcwczELMAkGA1UEBhMCVVMxDjAMBgNVBAgMBVRleGFzMRAwDgYD
-# VQQHDAdIb3VzdG9uMREwDwYDVQQKDAhTU0wgQ29ycDEvMC0GA1UEAwwmU1NMLmNv
-# bSBUaW1lc3RhbXBpbmcgSXNzdWluZyBSU0EgQ0EgUjECEB9rFmLSLhtsXfHAwaBg
-# DjgwCwYJYIZIAWUDBAIBoIIBYTAaBgkqhkiG9w0BCQMxDQYLKoZIhvcNAQkQAQQw
-# HAYJKoZIhvcNAQkFMQ8XDTI2MTAxNDE1MTYyNFowKAYJKoZIhvcNAQk0MRswGTAL
-# BglghkgBZQMEAgGhCgYIKoZIzj0EAwIwLwYJKoZIhvcNAQkEMSIEIPVFG0KM1DX9
-# yisfoDyN+D7kiHJwIK7s+w1n0jSJNSWxMIHJBgsqhkiG9w0BCRACLzGBuTCBtjCB
-# szCBsAQgVCr5oWqNci5mEUl4iumUwYqaruWmXLNEolSa+Wx5x4swgYswd6R1MHMx
-# CzAJBgNVBAYTAlVTMQ4wDAYDVQQIDAVUZXhhczEQMA4GA1UEBwwHSG91c3RvbjER
-# MA8GA1UECgwIU1NMIENvcnAxLzAtBgNVBAMMJlNTTC5jb20gVGltZXN0YW1waW5n
-# IElzc3VpbmcgUlNBIENBIFIxAhAfaxZi0i4bbF3xwMGgYA44MAoGCCqGSM49BAMC
-# BEgwRgIhAPyVDAXoDjXPBdKxl8oIDOTYFyiwCsM85IeVMnHukooHAiEA1miqUZ0J
-# bT4M58e5d3VlCNwVrxG3zfj7P8A6mG/hWDc=
+# WTBNBggrBgEFBQcBAQRBMD8wPQYIKwYBBQUHMAKGMWh0dHA6Ly9jZXJ0LnNzbC5j
+# b20vU1NMY29tLVJvb3RDQS1SU0EtNDA5Ni1SMS5jZXIwPwYDVR0gBDgwNjA0BgRV
+# HSAAMCwwKgYIKwYBBQUHAgEWHmh0dHBzOi8vd3d3LnNzbC5jb20vcmVwb3NpdG9y
+# eTATBgNVHSUEDDAKBggrBgEFBQcDCDBCBgNVHR8EOzA5MDegNaAzhjFodHRwOi8v
+# Y3Jscy5zc2wuY29tL1NTTGNvbS1Sb290Q0EtUlNBLTQwOTYtUjEuY3JsMB0GA1Ud
+# DgQWBBRwmmXBQ4Cj/OmxZIlu8TCcCSHJfDAOBgNVHQ8BAf8EBAMCAYYwDQYJKoZI
+# hvcNAQELBQADggIBAGUUW80x6YDqIGIFijnogpCNaFa5Bpgq6jiql/Qok0REC3WD
+# P4ewDZIvfED9X4QDxJE80/1K9fSKz7mYOymli+krJgapg/fpgVbSZsXUXRm1fG6Y
+# JRQ79lXmYE0oN/lDg9jtBvR5YB6lRzSs0mv8y+flmJd8k/ENvbGZyDxpEPrnb+ev
+# 46uTZQE/QTjeIl0jgsXtWzb1HdIZEthk7EzXkMjhB5uwpGXQoOV/g6ZgYIpzu6ZP
+# GJuRm03ULUpaCd/2Np1T8nCfJJpgQGDHr+/4VULpIY43OJjtNy8j0xX6pjEdQ+U6
+# boBpA/Z1LhuNZeebzqV0JtSTG04AK6ZJ9P3vTvsk2JVrs9nUgGR3/Y8TUALyCztT
+# 79iTUE31dE8iLXmT+4DXEX2h557koaPKIYqSohPtbxCSBRPnN4KKcUqRwpp9kxxE
+# 5JVile2a1CoYZHaDi49ionQrWGazqAlese3/finwz0+tXyg1Z7RmXUSsMy1ed1SD
+# eqEkvikDdlSWjvDmUzmaX4DuKOv/caTa/hBGgN4TZKGZNd0eC2qjwv99PXX2ZhwR
+# PJwTY1gZFewGXc3SvMOwdGvw/dOumuqFGtfTiJLQ/t5D6UPGBLfKEafc7NYaEO30
+# Z/bHWp7T+p2EUBU6RfHMxnPhRq3rGwB/NfT7+bwYQpbk6PD8dj6Qu9XDNI87MYIC
+# VzCCAlMCAQEwgYYwcjELMAkGA1UEBhMCVVMxDjAMBgNVBAgMBVRleGFzMRAwDgYD
+# VQQHDAdIb3VzdG9uMREwDwYDVQQKDAhTU0wgQ29ycDEuMCwGA1UEAwwlU1NMLmNv
+# bSBUaW1lc3RhbXBpbmcgSXNzdWluZyBSU0EgQ0EgMgIQVEP4N71a7hgBhHK4XNqO
+# 4zALBglghkgBZQMEAgGgggFgMBoGCSqGSIb3DQEJAzENBgsqhkiG9w0BCRABBDAc
+# BgkqhkiG9w0BCQUxDxcNMjYxMTAzMDkzODA0WjAoBgkqhkiG9w0BCTQxGzAZMAsG
+# CWCGSAFlAwQCAaEKBggqhkjOPQQDAjAvBgkqhkiG9w0BCQQxIgQgFIMBPwd8O1+X
+# qcabMRRdvraut3daKKk9h5A7+gQ/uaAwgcgGCyqGSIb3DQEJEAIvMYG4MIG1MIGy
+# MIGvBCBXT+oXqvpefGormwjJmLFzXkULOHPKROaiTKCTDmPzsDCBijB2pHQwcjEL
+# MAkGA1UEBhMCVVMxDjAMBgNVBAgMBVRleGFzMRAwDgYDVQQHDAdIb3VzdG9uMREw
+# DwYDVQQKDAhTU0wgQ29ycDEuMCwGA1UEAwwlU1NMLmNvbSBUaW1lc3RhbXBpbmcg
+# SXNzdWluZyBSU0EgQ0EgMgIQVEP4N71a7hgBhHK4XNqO4zAKBggqhkjOPQQDAgRI
+# MEYCIQCmc+Zq4PWRKBfyPHp0lqshuV/YfXz9lSdvHr2O4/RzbgIhAPT12u9Jl2Cz
+# /NPm2D97XrvMPA4L51p6ZIlCdjbjdt4y
 # SIG # End signature block

@@ -2,7 +2,7 @@
 //  Exchange Log Report - engine, part 1: text helpers
 // -----------------------------------------------------------------------------
 //  Author  : Nicolas Fabert
-//  Version : 2.0.0
+//  Version : 3.0.0
 //  The src\Engine.*.cs files are compiled together by ExchangeLogReport.psm1
 //  the first time they are used (and again whenever one of them changes).
 //
@@ -13,9 +13,13 @@
 // =============================================================================
 using System;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.Globalization;
 using System.IO;
+using System.Linq;
 using System.Text;
+using System.Threading;
+using System.Threading.Tasks;
 
 namespace ExchangeLogReport
 {
@@ -106,47 +110,137 @@ namespace ExchangeLogReport
     /// </summary>
     public static class LogReader
     {
-        public static IEnumerable<LogLine> Lines(string path, long offset)
+        public static IEnumerable<LogLine> Lines(string path, long offset) { return Lines(path, offset, null); }
+
+        /// <summary>
+        /// The same, through the buffer of reuse (one per parse thread): the 1 MB buffer is not allocated again for every file. A buffer
+        /// already in use (a file read inside the loop of another) or no reuse: a buffer of its own.
+        /// A read that fills the room it was given is followed by a read ahead of the next LineBuffer.AheadSize bytes on the thread pool, while the
+        /// lines already read are parsed; the next read takes those bytes first. The file is read in the same order, from the same position, until
+        /// a read returns nothing, so the bytes and the lines are the same; a file that a first read does not fill (a small file) is never read ahead.
+        /// </summary>
+        public static IEnumerable<LogLine> Lines(string path, long offset, LineBuffer reuse)
         {
-            using (var fs = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete, 1, FileOptions.SequentialScan))
+            bool pooled = reuse != null && !reuse.InUse;
+            byte[] buffer = pooled && reuse.Bytes != null ? reuse.Bytes : new byte[LineBuffer.Size];
+            byte[] ahead = null;
+            if (pooled) reuse.InUse = true;
+            try
             {
-                if (offset < 0 || offset > fs.Length) offset = 0;
-                fs.Seek(offset, SeekOrigin.Begin);
-                var line = new LogLine { Buffer = new byte[1 << 20] };
-                byte[] buffer = line.Buffer;
-                int begin = 0, end = 0;          // unread data: buffer[begin..end)
-                long position = offset;          // file offset of buffer[begin]
-                bool first = offset == 0;
-                while (true)
+                using (var fs = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete, 1, FileOptions.SequentialScan))
                 {
-                    int nl = end > begin ? Array.IndexOf(buffer, (byte)'\n', begin, end - begin) : -1;
-                    if (nl < 0)
+                    Task<int> reading = null;            // the read ahead in progress (into ahead), null: none
+                    int aheadStart = 0, aheadLength = 0; // bytes read ahead and not taken yet: ahead[aheadStart..aheadStart+aheadLength)
+                    try
                     {
-                        // Move the partial line to the start of the buffer (grow it for a very long line), then read more.
-                        int pending = end - begin;
-                        if (pending > 0 && begin > 0) Buffer.BlockCopy(buffer, begin, buffer, 0, pending);
-                        else if (pending == buffer.Length) { Array.Resize(ref buffer, buffer.Length * 2); line.Buffer = buffer; }
-                        begin = 0; end = pending;
-                        int read = fs.Read(buffer, end, buffer.Length - end);
-                        if (read <= 0) yield break;
-                        if (first)
+                        if (offset < 0 || offset > fs.Length) offset = 0;
+                        fs.Seek(offset, SeekOrigin.Begin);
+                        var line = new LogLine { Buffer = buffer };
+                        int begin = 0, end = 0;          // unread data: buffer[begin..end)
+                        long position = offset;          // file offset of buffer[begin]
+                        bool first = offset == 0;
+                        while (true)
                         {
-                            first = false;
-                            if (end + read >= 3 && buffer[0] == 0xEF && buffer[1] == 0xBB && buffer[2] == 0xBF) { begin = 3; position += 3; }
+                            int nl = end > begin ? Array.IndexOf(buffer, (byte)'\n', begin, end - begin) : -1;
+                            if (nl < 0)
+                            {
+                                // Move the partial line to the start of the buffer (grow it for a very long line), then read more.
+                                int pending = end - begin;
+                                if (pending > 0 && begin > 0) Buffer.BlockCopy(buffer, begin, buffer, 0, pending);
+                                else if (pending == buffer.Length) { Array.Resize(ref buffer, buffer.Length * 2); line.Buffer = buffer; }
+                                begin = 0; end = pending;
+                                int room = buffer.Length - end, read;
+                                bool full;
+                                long waitMark = Stopwatch.GetTimestamp();
+                                bool ended = false;
+                                if (reading != null)
+                                {
+                                    // The bytes that follow were read ahead: wait for them (the exception of a failed read is thrown here). A read
+                                    // ahead that returned nothing is the read that ends the file.
+                                    var task = reading;
+                                    reading = null;
+                                    aheadStart = 0; aheadLength = Math.Max(0, task.GetAwaiter().GetResult());
+                                    ended = aheadLength == 0;
+                                }
+                                if (ended) { read = 0; full = false; }
+                                else if (aheadLength > 0)
+                                {
+                                    // A read ahead shorter than its room is not the end: once its bytes are taken, the next read is made here.
+                                    read = Math.Min(room, aheadLength);
+                                    Buffer.BlockCopy(ahead, aheadStart, buffer, end, read);
+                                    aheadStart += read; aheadLength -= read;
+                                    full = aheadLength == 0 && aheadStart == ahead.Length;
+                                }
+                                else
+                                {
+                                    read = fs.Read(buffer, end, room);
+                                    if (reuse != null) reuse.ReadTicks += Stopwatch.GetTimestamp() - waitMark;
+                                    full = read == room;
+                                }
+                                if (reuse != null) reuse.WaitTicks += Stopwatch.GetTimestamp() - waitMark;
+                                if (read <= 0) yield break;
+                                if (full)
+                                {
+                                    // More bytes are likely: read the next ones while these lines are parsed.
+                                    if (ahead == null) ahead = pooled && reuse.Ahead != null ? reuse.Ahead : new byte[LineBuffer.AheadSize];
+                                    var target = ahead;
+                                    aheadStart = 0;
+                                    reading = Task.Run(() =>
+                                    {
+                                        long mark = Stopwatch.GetTimestamp();
+                                        int n = fs.Read(target, 0, target.Length);
+                                        if (reuse != null) Interlocked.Add(ref reuse.ReadTicks, Stopwatch.GetTimestamp() - mark);
+                                        return n;
+                                    });
+                                }
+                                if (first)
+                                {
+                                    first = false;
+                                    if (end + read >= 3 && buffer[0] == 0xEF && buffer[1] == 0xBB && buffer[2] == 0xBF) { begin = 3; position += 3; }
+                                }
+                                end += read;
+                                continue;
+                            }
+                            int length = nl - begin;
+                            if (length > 0 && buffer[nl - 1] == (byte)'\r') length--;
+                            line.Buffer = buffer; line.Start = begin; line.Length = length;
+                            position += nl + 1 - begin;
+                            line.NextOffset = position;
+                            begin = nl + 1;
+                            yield return line;
                         }
-                        end += read;
-                        continue;
                     }
-                    int length = nl - begin;
-                    if (length > 0 && buffer[nl - 1] == (byte)'\r') length--;
-                    line.Buffer = buffer; line.Start = begin; line.Length = length;
-                    position += nl + 1 - begin;
-                    line.NextOffset = position;
-                    begin = nl + 1;
-                    yield return line;
+                    finally
+                    {
+                        // A read ahead still running (the lines were not all taken, or the parse failed) ends before the file is closed.
+                        if (reading != null) { try { reading.Wait(); } catch (Exception) { } }
+                    }
+                }
+            }
+            finally
+            {
+                if (pooled)
+                {
+                    // A buffer grown for a very long line is kept up to LineBuffer.MaxKept.
+                    if (buffer.Length <= LineBuffer.MaxKept) reuse.Bytes = buffer;
+                    if (ahead != null) reuse.Ahead = ahead;
+                    reuse.InUse = false;
                 }
             }
         }
+    }
+
+    /// <summary>The read buffers of LogReader.Lines kept from one file to the next by a parse thread (not shared between threads).</summary>
+    public sealed class LineBuffer
+    {
+        internal const int Size = 1 << 20, MaxKept = 8 << 20, AheadSize = Size / 2;
+        internal byte[] Bytes;
+        internal byte[] Ahead;   // the bytes read ahead (AheadSize), allocated by the first file that is read ahead
+        internal bool InUse;
+        /// <summary>Stopwatch ticks spent in FileStream.Read by the reads of this thread, ahead ones included (statistics: file reads of the collection).</summary>
+        internal long ReadTicks;
+        /// <summary>Stopwatch ticks the thread of the lines waited for bytes: its own reads, and the reads ahead not finished when it needed them.</summary>
+        internal long WaitTicks;
     }
 
     /// <summary>
@@ -359,9 +453,8 @@ namespace ExchangeLogReport
     }
 
     /// <summary>
-    /// Long texts stored compressed (SMTP transcripts, session timelines): a BLOB made of one header byte (1) and the
-    /// UTF-8 text compressed with Deflate, 5 to 10 times smaller than the text. Texts written by an older version stay
-    /// TEXT: readers accept both.
+    /// Long texts stored compressed: a BLOB made of one header byte (1) and UTF-8 text compressed with Deflate.
+    /// Texts written by an older version stay TEXT: readers accept both.
     /// </summary>
     public static class Packed
     {
@@ -375,6 +468,38 @@ namespace ExchangeLogReport
                 using (var z = new System.IO.Compression.DeflateStream(ms, System.IO.Compression.CompressionLevel.Fastest, true)) z.Write(bytes, 0, bytes.Length);
                 return ms.ToArray();
             }
+        }
+
+        /// <summary>
+        /// Pack of a text already encoded as UTF-8: the same bytes as Pack of the string those bytes decode to (valid UTF-8), with the bytes
+        /// given to Deflate in one write as Pack does.
+        /// </summary>
+        public static byte[] PackUtf8(ReadOnlySpan<byte> utf8)
+        {
+            using (var ms = new MemoryStream(utf8.Length / 3 + 16))
+            {
+                ms.WriteByte(1);
+                using (var z = new System.IO.Compression.DeflateStream(ms, System.IO.Compression.CompressionLevel.Fastest, true)) z.Write(utf8);
+                return ms.ToArray();
+            }
+        }
+
+        /// <summary>Keep short or incompressible values as TEXT; the header counts towards the stored size.</summary>
+        public static object Adaptive(string text)
+        {
+            if (text == null) return null;
+            int length = Encoding.UTF8.GetByteCount(text);
+            if (length < 200) return text;
+            byte[] packed = Pack(text);
+            return packed.Length < length ? (object)packed : text;
+        }
+
+        public static string Text(object value)
+        {
+            if (value == null || value is DBNull) return null;
+            object unpacked = Unpack(value);
+            if (unpacked is string) return (string)unpacked;
+            throw new InvalidDataException("Expected TEXT or a recognised packed text BLOB.");
         }
 
         /// <summary>The text of a value read from the database: a packed BLOB is decompressed, anything else is returned as is.</summary>
@@ -565,6 +690,32 @@ namespace ExchangeLogReport
             return s;
         }
 
+        /// <summary>
+        /// A security identifier in the lower-case form of the stored users ("s-1-5-21-...-1105"): how Exchange names the account of a token
+        /// (OAuth) request: "s-1-", then two to fifteen decimal numbers separated by "-".
+        /// </summary>
+        public static bool IsSid(string user)
+        {
+            if (user == null || user.Length < 5 || !user.StartsWith("s-1-", StringComparison.Ordinal)) return false;
+            int parts = 0, digits = 0;
+            for (int i = 4; i < user.Length; i++)
+            {
+                char ch = user[i];
+                if (ch >= '0' && ch <= '9') { if (++digits > 10) return false; continue; }
+                if (ch != '-' || digits == 0) return false;
+                parts++; digits = 0;
+            }
+            return digits > 0 && parts >= 1 && parts <= 14;
+        }
+
+        /// <summary>The lower-case SID of an HttpProxy anchor "Sid~S-1-5-21-...", else null.</summary>
+        public static string AnchorSid(string anchor)
+        {
+            if (anchor == null || anchor.Length < 9 || !anchor.StartsWith("sid~", StringComparison.OrdinalIgnoreCase)) return null;
+            string sid = anchor.Substring(4).Trim().ToLowerInvariant();
+            return IsSid(sid) ? sid : null;
+        }
+
         /// <summary>Address between angle brackets of an SMTP command ("MAIL FROM:&lt;a@b&gt; SIZE=1").</summary>
         public static string SmtpAddress(string value)
         {
@@ -698,5 +849,101 @@ namespace ExchangeLogReport
             int colon = s.LastIndexOf(':');
             return colon > 0 && s.IndexOf(':') == colon ? s.Substring(0, colon) : s;
         }
+
+        /// <summary>
+        /// Peer of an SMTP transaction: the lower-case address without port; null when no endpoint was observed. Schema 11 stores it as
+        /// smtp_client.remote_host (a pure function of the endpoint text, shared by the collector, the migration, Serve and the verifier).
+        /// </summary>
+        public static string RemoteHost(string endpoint)
+        {
+            string value = Host(endpoint);
+            return string.IsNullOrEmpty(value) ? null : value.ToLowerInvariant();
+        }
+    }
+
+    /// <summary>
+    /// Authentication type of client access. The collector stores the HttpProxy AuthenticationType token as Exchange wrote it (Token); the
+    /// display mode is a pure read-time function of it (Of), so a change of the mapping needs no migration and an unknown token is shown as logged.
+    /// </summary>
+    public static class AuthMode
+    {
+        /// <summary>The stored form: "" when the log has none, else the trimmed token cut to 40 characters (case kept).</summary>
+        public static string Token(string raw)
+        {
+            if (string.IsNullOrWhiteSpace(raw)) return "";
+            string s = raw.Trim();
+            return s.Length > 40 ? s.Substring(0, 40) : s;
+        }
+
+        /// <summary>The display mode of a stored token (case-insensitive): OAuth, Negotiate, Kerberos, NTLM, Basic, Forms, Certificate, ADFS,
+        /// Anonymous, Unknown ("": no type recorded), or the token as logged.</summary>
+        public static string Of(string token)
+        {
+            if (string.IsNullOrEmpty(token)) return "Unknown";
+            switch (token.ToLowerInvariant())
+            {
+                case "oauth": case "bearer": case "oauth2": return "OAuth";
+                case "negotiate": return "Negotiate";
+                case "kerberos": return "Kerberos";
+                case "ntlm": return "NTLM";
+                case "basic": case "liveidbasic": return "Basic";
+                case "fba": case "forms": return "Forms";
+                case "certificate": case "certificateauth": case "clientcertificate": return "Certificate";
+                case "adfs": return "ADFS";
+                case "anonymous": return "Anonymous";
+                default: return token;
+            }
+        }
+
+        /// <summary>The modes of a client_session.auth_modes text ("Negotiate=57;OAuth=3", most requests first): mapped, merged, in order,
+        /// joined with ", "; "" when the text is null or empty.</summary>
+        public static string Modes(string joined)
+        {
+            if (string.IsNullOrEmpty(joined)) return "";
+            var modes = new List<string>();
+            foreach (string part in joined.Split(';'))
+            {
+                if (part.Length == 0) continue;
+                int eq = part.LastIndexOf('=');
+                string mode = Of(eq >= 0 ? part.Substring(0, eq) : part);
+                if (!modes.Contains(mode)) modes.Add(mode);
+            }
+            return string.Join(", ", modes);
+        }
+
+        /// <summary>The modes of a group_concat(DISTINCT auth_type) text ("," separated): mapped, merged, joined with ", " in a fixed order (the
+        /// modes in the order of Of, then a token shown as logged in ordinal order, then Unknown); an empty part is Unknown; "" when the text is null.</summary>
+        public static string ModesOf(string concat)
+        {
+            if (concat == null) return "";
+            var modes = new List<string>();
+            foreach (string part in concat.Split(','))
+            {
+                string mode = Of(part);
+                if (!modes.Contains(mode)) modes.Add(mode);
+            }
+            return string.Join(", ", modes.OrderBy(Rank).ThenBy(m => m, StringComparer.Ordinal));
+        }
+        static readonly string[] Order = { "OAuth", "Negotiate", "Kerberos", "NTLM", "Basic", "Forms", "Certificate", "ADFS", "Anonymous" };
+        static int Rank(string mode) { int k = Array.IndexOf(Order, mode); return k >= 0 ? k : mode == "Unknown" ? Order.Length + 1 : Order.Length; }
+
+        /// <summary>
+        /// Whether a protocol supports (hybrid) modern authentication: "Yes" for the protocols of Microsoft's table that support it and for
+        /// Autodiscover (the same page configures OAuth on its virtual directory), "No" for those of the table that do not, "" for a protocol the table
+        /// does not name (REST, remote PowerShell and any other).
+        /// </summary>
+        public static string OAuthPossible(string protocol)
+        {
+            switch ((protocol ?? "").ToLowerInvariant())
+            {
+                case "mapi": case "ews": case "eas": case "owa": case "ecp": case "oab": case "autodiscover": return "Yes";
+                case "rpchttp": case "imap4": case "pop3": return "No";
+                default: return "";
+            }
+        }
+
+        public static bool IsOAuth(string mode) { return mode == "OAuth"; }
+        public static bool IsBasic(string mode) { return mode == "Basic"; }
+        public static bool IsIntegrated(string mode) { return mode == "Negotiate" || mode == "Kerberos" || mode == "NTLM"; }
     }
 }

@@ -4,8 +4,17 @@
   "testEntry": null,
   "tests": [
     "tests/ExchangeLogReport.Tests.ps1",
-    "tests/PackageIntegrity.Tests.ps1"
+    "tests/SqliteOptimization.Tests.ps1",
+    "tests/Serve.Backend.Tests.ps1",
+    "tests/Serve.Initialization.Tests.ps1",
+    "tests/Serve.MeasurementGate.Tests.ps1",
+    "tests/Serve.Performance.Tests.ps1",
+    "tests/Serve.RollupVerification.Tests.ps1",
+    "tests/Serve.SmtpClients.Tests.ps1",
+    "tests/Storage.Tests.ps1",
+    "tests/PackageIntegrity.Tests.ps1",
+    "tests/Workflow.Tests.ps1"
   ],
-  "packageBuilder": "tools/New-ExchangeLogReportPackage.ps1",
+  "packageBuilder": "tools/Build-Standalone.ps1",
   "packageEntry": "Invoke-ExchangeLogReport.ps1"
 }

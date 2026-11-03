@@ -1,76 +1,59 @@
-name: CI
-
-on:
-  pull_request:
-    branches: [main]
-  push:
-    branches: [main]
-  workflow_dispatch:
-
-permissions:
-  contents: read
-
-concurrency:
-  group: ci-${{ github.repository }}-${{ github.ref }}
-  cancel-in-progress: true
-
-jobs:
-  validate:
-    name: Validate (${{ matrix.engine }})
-    runs-on: windows-2022
-    timeout-minutes: 35
-    strategy:
-      fail-fast: false
-      matrix:
-        include: [{"engine":"PowerShell 7","shell":"pwsh","package":true}]
-    steps:
-      - name: Check out the tested revision
-        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-        with:
-          persist-credentials: false
-
-      - name: Load pinned analysis and test modules
-        shell: pwsh
-        run: .\.github\scripts\Initialize-CIModules.ps1 -Destination "$env:RUNNER_TEMP\ci-modules"
-
-      - name: Analyze PowerShell sources (PowerShell 7)
-        if: matrix.shell == 'pwsh'
-        shell: pwsh
-        run: .\.github\scripts\Invoke-CI.ps1 -Stage Analyze -OutputDirectory "$env:RUNNER_TEMP\ci-results"
-
-      - name: Analyze PowerShell sources (Windows PowerShell 5.1)
-        if: matrix.shell == 'powershell'
-        shell: powershell
-        run: .\.github\scripts\Invoke-CI.ps1 -Stage Analyze -OutputDirectory "$env:RUNNER_TEMP\ci-results"
-
-      - name: Run the existing project tests (PowerShell 7)
-        if: matrix.shell == 'pwsh'
-        shell: pwsh
-        run: .\.github\scripts\Invoke-CI.ps1 -Stage Test -OutputDirectory "$env:RUNNER_TEMP\ci-results"
-
-      - name: Run the existing project tests (Windows PowerShell 5.1)
-        if: matrix.shell == 'powershell'
-        shell: powershell
-        run: .\.github\scripts\Invoke-CI.ps1 -Stage Test -OutputDirectory "$env:RUNNER_TEMP\ci-results"
-
-      - name: Build with the existing package tool (PowerShell 7)
-        if: matrix.package && matrix.shell == 'pwsh'
-        shell: pwsh
-        run: .\.github\scripts\Invoke-CI.ps1 -Stage Package -OutputDirectory "$env:RUNNER_TEMP\ci-results"
-
-      - name: Build with the existing package tool (Windows PowerShell 5.1)
-        if: matrix.package && matrix.shell == 'powershell'
-        shell: powershell
-        run: .\.github\scripts\Invoke-CI.ps1 -Stage Package -OutputDirectory "$env:RUNNER_TEMP\ci-results"
-
-      - name: Retain public CI evidence
-        if: always()
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
-        with:
-          name: ci-${{ matrix.engine }}
-          path: |
-            ${{ runner.temp }}/ci-results
-            artifacts/pester-results.xml
-            tests/evidence/gate
-          if-no-files-found: error
-          retention-days: 7
+{
+  "name": "CI",
+  "on": {
+    "pull_request": { "branches": ["main"] },
+    "push": { "branches": ["main"] },
+    "workflow_dispatch": {}
+  },
+  "permissions": { "contents": "read" },
+  "concurrency": {
+    "group": "ci-${{ github.repository }}-${{ github.ref }}",
+    "cancel-in-progress": true
+  },
+  "jobs": {
+    "validate": {
+      "name": "Validate (PowerShell 7)",
+      "if": "${{ github.repository_owner == 'Nico77600' && github.repository == 'Nico77600/ExchangeLogReport' && github.event.repository.private == false }}",
+      "runs-on": "windows-2022",
+      "timeout-minutes": 45,
+      "steps": [
+        {
+          "name": "Check out the tested revision without persistent credentials",
+          "uses": "actions/checkout@11d5960a326750d5838078e36cf38b85af677262",
+          "with": { "persist-credentials": false }
+        },
+        {
+          "name": "Load the exact pinned Pester and PSScriptAnalyzer modules",
+          "shell": "pwsh",
+          "run": "& .\\.github\\scripts\\Initialize-CIModules.ps1 -Destination (Join-Path $env:GITHUB_WORKSPACE 'artifacts\\ci-modules')"
+        },
+        {
+          "name": "Analyze PowerShell sources",
+          "shell": "pwsh",
+          "run": "& .\\.github\\scripts\\Invoke-CI.ps1 -Stage Analyze -OutputDirectory (Join-Path $env:RUNNER_TEMP 'ci-results')"
+        },
+        {
+          "name": "Build and verify the standalone package",
+          "shell": "pwsh",
+          "run": "$ErrorActionPreference = 'Stop'\n& .\\tools\\Build-Standalone.ps1 -OutputRoot (Join-Path $env:GITHUB_WORKSPACE 'artifacts\\ci-package') -Unsigned\n$product = Get-Content .\\product.json -Raw | ConvertFrom-Json\n$package = Join-Path $env:GITHUB_WORKSPACE ('artifacts\\ci-package\\{0}-{1}-win-x64' -f $product.name, $product.version)\n& (Join-Path $package 'src\\Test-PackageIntegrity.ps1') -Root $package -DevelopmentMode"
+        },
+        {
+          "name": "Run collector, Serve, package integrity and workflow tests under the packaged runtime",
+          "shell": "pwsh",
+          "run": "$ErrorActionPreference = 'Stop'\n$product = Get-Content .\\product.json -Raw | ConvertFrom-Json\n$package = Join-Path $env:GITHUB_WORKSPACE ('artifacts\\ci-package\\{0}-{1}-win-x64' -f $product.name, $product.version)\n& (Join-Path $package 'powershell\\pwsh.exe') -NoLogo -NoProfile -File .\\.github\\scripts\\Invoke-CITests.ps1 -PackageRoot $package\nif ($LASTEXITCODE -ne 0) { throw 'Packaged-runtime regression tests failed.' }"
+        },
+        {
+          "name": "Retain only synthetic validation summaries and file hashes",
+          "if": "${{ always() }}",
+          "uses": "actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02",
+          "with": {
+            "name": "package-validation",
+            "path": "artifacts/ci-evidence/module-inventory.json\nartifacts/ci-evidence/validation-summary.json",
+            "if-no-files-found": "error",
+            "retention-days": 7
+          }
+        }
+      ]
+    }
+  }
+}

@@ -2,7 +2,7 @@
 //  Exchange Log Report - engine, part 12: authenticated user of SMTP sessions
 // -----------------------------------------------------------------------------
 //  Author  : Nicolas Fabert
-//  Version : 2.0.0
+//  Version : 3.0.0
 //
 //  The authenticated user of an SMTP transaction is the account that Exchange itself wrote in its protocol log
 //  ("* data=<account> context=authenticated"), tied to a successful AUTH of the same session. It is never decoded from
@@ -826,38 +826,34 @@ namespace ExchangeLogReport
                 int sub = 0;
                 foreach (var e in doc.RootElement.EnumerateArray())
                 {
-                    var o = new AuthObs();
-                    ReadObservation(e, fragmentId, part, index, ref previousPos, ref sub, o);
+                    var o = new AuthObs
+                    {
+                        K = e[0].GetString()[0], Ms = e[1].GetInt64(), Seq = e[2].GetInt64(),
+                        A = e[3].ValueKind == JsonValueKind.Null ? null : e[3].GetString(),
+                        B = e[4].ValueKind == JsonValueKind.Null ? null : e[4].GetString(),
+                        Code = e[5].GetInt32(), Frag = fragmentId
+                    };
+                    if (e.GetArrayLength() >= 8)
+                    {
+                        o.Off = e[6].GetInt64(); o.Sub = e[7].GetInt32();
+                        o.Pos = o.Seq >= 0 ? o.Seq : o.Off;
+                    }
+                    else
+                    {
+                        // First format: no offset, the subordinal is the order inside the array.
+                        o.Pos = o.Seq >= 0 ? o.Seq : (long)part * 256 + index;
+                        sub = o.Pos == previousPos ? sub + 1 : 0;
+                        o.Sub = sub;
+                        long ordinal;
+                        if (o.K == 'M' && o.Seq < 0 && long.TryParse(o.A, NumberStyles.None, CultureInfo.InvariantCulture, out ordinal)) o.A = (-(ordinal + 2)).ToString(CultureInfo.InvariantCulture);
+                        else if (o.K == 'M') o.A = o.Seq.ToString(CultureInfo.InvariantCulture);
+                    }
+                    previousPos = o.Pos;
                     list.Add(o);
                     index++;
                 }
             }
             return list;
-        }
-
-        internal static void ReadObservation(JsonElement e, long fragmentId, long part, int index, ref long previousPos, ref int sub, AuthObs o)
-        {
-            o.K = e[0].ValueEquals("M") ? 'M' : e[0].GetString()[0];
-            o.Ms = e[1].GetInt64(); o.Seq = e[2].GetInt64();
-            o.A = e[3].ValueKind == JsonValueKind.Null ? null : e[3].GetString();
-            o.B = e[4].ValueKind == JsonValueKind.Null ? null : e[4].GetString();
-            o.Code = e[5].GetInt32(); o.Frag = fragmentId; o.Off = -1; o.Conflict = false;
-            if (e.GetArrayLength() >= 8)
-            {
-                o.Off = e[6].GetInt64(); o.Sub = e[7].GetInt32();
-                o.Pos = o.Seq >= 0 ? o.Seq : o.Off;
-            }
-            else
-            {
-                // First format: no offset, the subordinal is the order inside the array.
-                o.Pos = o.Seq >= 0 ? o.Seq : part * 256 + index;
-                sub = o.Pos == previousPos ? sub + 1 : 0;
-                o.Sub = sub;
-                long ordinal;
-                if (o.K == 'M' && o.Seq < 0 && long.TryParse(o.A, NumberStyles.None, CultureInfo.InvariantCulture, out ordinal)) o.A = (-(ordinal + 2)).ToString(CultureInfo.InvariantCulture);
-                else if (o.K == 'M') o.A = o.Seq.ToString(CultureInfo.InvariantCulture);
-            }
-            previousPos = o.Pos;
         }
 
         public static List<long[]> ReadCoverage(string text)
@@ -877,12 +873,22 @@ namespace ExchangeLogReport
 
     // ===================================================================== parse spool
 
-    /// <summary>A finished transaction of a session, with the scalars that are stored (Body: preamble excluded).</summary>
+    /// <summary>
+    /// A finished transaction of a session, with the scalars that are stored (Body: lead-in and conversation of the transaction, without the opening
+    /// and closing of the session; Response: as logged; neither is spooled with the transaction row). Index is its ordinal in the session, counting
+    /// the transactions that are not kept.
+    /// The parse thread computes the stored values, the apply thread only binds them: PackedTranscript is Pack(Cap(opening + Body + closing, 12000))
+    /// (null without transcript), PackedResponse is Packed.Adaptive(Response), MessageHash is Store.MessageHash(MessageId).
+    /// </summary>
     internal sealed class SmtpSpoolTx
     {
         public long StartMs, EndMs, Rcpts, Position;
         public long Part = -1;
+        public int Index;
         public string MailFrom, RcptText, MessageId, InternalId, Status, Response, Body;
+        public byte[] PackedTranscript;
+        public object PackedResponse;
+        public long? MessageHash;
     }
 
     /// <summary>The final metadata of a finished session and the number of its parts and transactions.</summary>
@@ -891,7 +897,7 @@ namespace ExchangeLogReport
         public long Ord, Id;
         public long Parts;
         public int Txns;
-        public string SessionId, Connector, Local, Remote, Helo, Tls, Auth, ProxyIp, ProxyPort, ProxyHelo, Preamble;
+        public string SessionId, Connector, Local, Remote, Helo, Tls, Auth, ProxyIp, ProxyPort, ProxyHelo;
     }
 
     /// <summary>
@@ -902,7 +908,7 @@ namespace ExchangeLogReport
     internal sealed class SmtpSpool : IDisposable, ISmtpSink
     {
         readonly ReportScratch _scratch;
-        SqliteCommand _addPart, _addTx, _addSession, _dropParts, _sessions, _part, _txs;
+        SqliteCommand _addPart, _addTx, _addSession, _dropParts, _sessions, _part, _txs, _rawBodies, _packBody;
         long _nextId;
         bool _open, _disposed;
         public long Parts, Transactions, Sessions;
@@ -924,16 +930,19 @@ namespace ExchangeLogReport
             using (var c = _scratch.Command("PRAGMA cache_size=-2048;")) c.ExecuteNonQuery();
             foreach (var sql in new[] {
                 "CREATE TABLE sp_part(sid INTEGER NOT NULL, part INTEGER NOT NULL, data BLOB NOT NULL, PRIMARY KEY(sid, part)) WITHOUT ROWID;",
-                "CREATE TABLE sp_tx(sid INTEGER NOT NULL, ord INTEGER NOT NULL, data BLOB NOT NULL, PRIMARY KEY(sid, ord)) WITHOUT ROWID;",
+                // transcript: the packed transcript (raw 0), or the UTF-8 body of a transaction written before the end of its session (raw 1, packed by PackTranscripts).
+                "CREATE TABLE sp_tx(sid INTEGER NOT NULL, ord INTEGER NOT NULL, data BLOB NOT NULL, transcript BLOB, raw INTEGER NOT NULL, idx INTEGER NOT NULL, PRIMARY KEY(sid, ord)) WITHOUT ROWID;",
                 "CREATE TABLE sp_session(ord INTEGER PRIMARY KEY AUTOINCREMENT, sid INTEGER NOT NULL, data BLOB NOT NULL);" })
                 using (var c = _scratch.Command(sql)) c.ExecuteNonQuery();
             _addPart = Prepare("INSERT INTO sp_part(sid,part,data) VALUES(@p0,@p1,@p2);", "iib");
-            _addTx = Prepare("INSERT INTO sp_tx(sid,ord,data) VALUES(@p0,@p1,@p2);", "iib");
+            _addTx = Prepare("INSERT INTO sp_tx(sid,ord,data,transcript,raw,idx) VALUES(@p0,@p1,@p2,@p3,@p4,@p5);", "iibbii");
+            _rawBodies = Prepare("SELECT ord, idx, transcript FROM sp_tx WHERE sid=@p0 AND raw=1 AND ord>=@p1 ORDER BY ord LIMIT @p2;", "iii");
+            _packBody = Prepare("UPDATE sp_tx SET transcript=@p2, raw=0 WHERE sid=@p0 AND ord=@p1;", "iib");
             _addSession = Prepare("INSERT INTO sp_session(sid,data) VALUES(@p0,@p1);", "ib");
             _dropParts = Prepare("DELETE FROM sp_part WHERE sid=@p0;", "i");
             _sessions = Prepare("SELECT ord, sid, data FROM sp_session WHERE ord>@p0 ORDER BY ord LIMIT @p1;", "ii");
             _part = Prepare("SELECT data FROM sp_part WHERE sid=@p0 AND part=@p1;", "ii");
-            _txs = Prepare("SELECT ord, data FROM sp_tx WHERE sid=@p0 AND ord>=@p1 ORDER BY ord LIMIT @p2;", "iii");
+            _txs = Prepare("SELECT ord, data, transcript, raw FROM sp_tx WHERE sid=@p0 AND ord>=@p1 ORDER BY ord LIMIT @p2;", "iii");
             _open = true;
         }
 
@@ -986,6 +995,10 @@ namespace ExchangeLogReport
             }
         }
 
+        /// <summary>
+        /// Writes a finished transaction: its stored values (PackedResponse, MessageHash) and its packed transcript, or, when the session is not
+        /// finished yet (the preamble of the transcript may still grow), the UTF-8 bytes of its Body, packed by PackTranscripts at the end of the session.
+        /// </summary>
         public void AddTx(long session, int ord, SmtpSpoolTx x)
         {
             Open();
@@ -994,18 +1007,56 @@ namespace ExchangeLogReport
             {
                 using (var w = new BinaryWriter(ms, Encoding.UTF8, true))
                 {
-                    foreach (var s in new[] { x.MailFrom, x.RcptText, x.MessageId, x.InternalId, x.Status, x.Response, x.Body }) Put(w, s);
+                    foreach (var s in new[] { x.MailFrom, x.RcptText, x.MessageId, x.InternalId, x.Status }) Put(w, s);
+                    // Packed.Adaptive keeps a short or incompressible response as TEXT, else a packed BLOB.
+                    if (x.PackedResponse == null) w.Write((byte)0);
+                    else if (x.PackedResponse is byte[]) { var b = (byte[])x.PackedResponse; w.Write((byte)2); w.Write(b.Length); w.Write(b); }
+                    else { w.Write((byte)1); w.Write((string)x.PackedResponse); }
                     foreach (long n in new[] { x.StartMs, x.EndMs, x.Rcpts, x.Position, (long)x.Part }) w.Write(n);
+                    w.Write(x.MessageHash.HasValue); w.Write(x.MessageHash ?? 0L);
                 }
                 data = ms.ToArray();
             }
+            // The same UTF-8 encoder as the BinaryWriter of the strings: what PackTranscripts reads back is what a spooled string gives back.
+            object transcript = x.PackedTranscript != null ? x.PackedTranscript : x.Body != null ? (object)Encoding.UTF8.GetBytes(x.Body) : DBNull.Value;
             _addTx.Parameters[0].Value = session; _addTx.Parameters[1].Value = (long)ord; _addTx.Parameters[2].Value = data;
+            _addTx.Parameters[3].Value = transcript; _addTx.Parameters[4].Value = x.PackedTranscript == null && x.Body != null ? 1L : 0L;
+            _addTx.Parameters[5].Value = (long)x.Index;
             try { _addTx.ExecuteNonQuery(); }
             finally { foreach (SqliteParameter p in _addTx.Parameters) p.Value = DBNull.Value; }
             Transactions++;
         }
 
-        /// <summary>Up to limit transactions of a session starting at ordinal first.</summary>
+        /// <summary>
+        /// End of a session (parse thread): the transcripts of its transactions written before the end (raw bodies) are replaced by
+        /// pack(index, body), page by page (index: ordinal of the transaction in its session). Returns the number of transcripts packed.
+        /// </summary>
+        public int PackTranscripts(long session, Func<int, string, byte[]> pack)
+        {
+            if (!_open) return 0;
+            int packed = 0;
+            long first = 0;
+            var page = new List<KeyValuePair<long, KeyValuePair<int, string>>>();
+            while (true)
+            {
+                page.Clear();
+                _rawBodies.Parameters[0].Value = session; _rawBodies.Parameters[1].Value = first; _rawBodies.Parameters[2].Value = 32L;
+                using (var r = _rawBodies.ExecuteReader())
+                    while (r.Read()) page.Add(new KeyValuePair<long, KeyValuePair<int, string>>(r.GetInt64(0), new KeyValuePair<int, string>((int)r.GetInt64(1), Encoding.UTF8.GetString((byte[])r.GetValue(2)))));
+                foreach (var kv in page)
+                {
+                    _packBody.Parameters[0].Value = session; _packBody.Parameters[1].Value = kv.Key; _packBody.Parameters[2].Value = pack(kv.Value.Key, kv.Value.Value);
+                    try { _packBody.ExecuteNonQuery(); }
+                    finally { foreach (SqliteParameter p in _packBody.Parameters) p.Value = DBNull.Value; }
+                    packed++;
+                }
+                if (page.Count < 32) break;
+                first = page[page.Count - 1].Key + 1;
+            }
+            return packed;
+        }
+
+        /// <summary>Up to limit transactions of a session starting at ordinal first (a finished session: every transcript is packed).</summary>
         public List<KeyValuePair<int, SmtpSpoolTx>> ReadTx(long session, int first, int limit)
         {
             Open();
@@ -1016,9 +1067,16 @@ namespace ExchangeLogReport
                     using (var ms = new MemoryStream((byte[])r.GetValue(1), false))
                     using (var rd = new BinaryReader(ms, Encoding.UTF8))
                     {
+                        if (r.GetInt64(3) != 0) throw new InvalidOperationException("A transcript of the SMTP spool was not packed at the end of its session.");
                         var x = new SmtpSpoolTx();
-                        x.MailFrom = Get(rd); x.RcptText = Get(rd); x.MessageId = Get(rd); x.InternalId = Get(rd); x.Status = Get(rd); x.Response = Get(rd); x.Body = Get(rd);
+                        x.MailFrom = Get(rd); x.RcptText = Get(rd); x.MessageId = Get(rd); x.InternalId = Get(rd); x.Status = Get(rd);
+                        byte kind = rd.ReadByte();
+                        if (kind == 2) x.PackedResponse = rd.ReadBytes(rd.ReadInt32());
+                        else if (kind == 1) x.PackedResponse = rd.ReadString();
                         x.StartMs = rd.ReadInt64(); x.EndMs = rd.ReadInt64(); x.Rcpts = rd.ReadInt64(); x.Position = rd.ReadInt64(); x.Part = rd.ReadInt64();
+                        bool hashed = rd.ReadBoolean(); long hash = rd.ReadInt64();
+                        if (hashed) x.MessageHash = hash;
+                        if (!r.IsDBNull(2)) x.PackedTranscript = (byte[])r.GetValue(2);
                         list.Add(new KeyValuePair<int, SmtpSpoolTx>((int)r.GetInt64(0), x));
                     }
             return list;
@@ -1034,7 +1092,7 @@ namespace ExchangeLogReport
             {
                 using (var w = new BinaryWriter(ms, Encoding.UTF8, true))
                 {
-                    foreach (var t in new[] { s.SessionId, s.Connector, s.Local, s.Remote, s.Helo, s.Tls, s.Auth, s.ProxyIp, s.ProxyPort, s.ProxyHelo, s.Preamble }) Put(w, t);
+                    foreach (var t in new[] { s.SessionId, s.Connector, s.Local, s.Remote, s.Helo, s.Tls, s.Auth, s.ProxyIp, s.ProxyPort, s.ProxyHelo }) Put(w, t);
                     w.Write(s.Parts); w.Write(s.Txns);
                 }
                 data = ms.ToArray();
@@ -1065,7 +1123,7 @@ namespace ExchangeLogReport
                     {
                         var s = new SmtpSpoolSession { Ord = r.GetInt64(0), Id = r.GetInt64(1) };
                         s.SessionId = Get(rd); s.Connector = Get(rd); s.Local = Get(rd); s.Remote = Get(rd); s.Helo = Get(rd); s.Tls = Get(rd); s.Auth = Get(rd);
-                        s.ProxyIp = Get(rd); s.ProxyPort = Get(rd); s.ProxyHelo = Get(rd); s.Preamble = Get(rd);
+                        s.ProxyIp = Get(rd); s.ProxyPort = Get(rd); s.ProxyHelo = Get(rd);
                         s.Parts = rd.ReadInt64(); s.Txns = rd.ReadInt32();
                         list.Add(s);
                     }
@@ -1123,7 +1181,8 @@ namespace ExchangeLogReport
     /// database and replayed one connection at a time, in order, with scalar state only: what a transaction was authenticated as is
     /// decided from what happened before it, whatever the order of the files (several threads), the size of the batches or the collection
     /// that read each part of a session. All working sets live in a private scratch file; nothing grows with the number of sessions,
-    /// parts or transactions.
+    /// parts or transactions. Only the queue of the sessions to evaluate is in memory: at most Limit touched sessions (the collection
+    /// flushes at Limit) and the back-end sessions that depend on them.
     /// </summary>
     internal sealed class AuthResolver : IDisposable
     {
@@ -1154,35 +1213,82 @@ namespace ExchangeLogReport
 
         readonly Store _store;
         readonly Writer _writer;
+        readonly SmtpClientMaintenance _clients;   // schema 11: set while the collection maintains the SMTP client structures itself (else the triggers queue the work)
         readonly long _idleMs;
-        readonly Dictionary<string, Prepared> _scratchCommands = new Dictionary<string, Prepared>(StringComparer.Ordinal);
-        readonly Dictionary<string, Prepared> _mainCommands = new Dictionary<string, Prepared>(StringComparer.Ordinal);
-        struct MailReference { public long Fragment, Position; }
-        struct MailUpdate { public long Id; public bool Changed; }
-        readonly MailReference[] _mailReferences = new MailReference[256];
-        readonly MailUpdate[] _mailUpdates = new MailUpdate[256];
+        readonly Dictionary<string, SqliteCommand> _scratchCommands = new Dictionary<string, SqliteCommand>(StringComparer.Ordinal);
+        readonly Dictionary<string, SqliteCommand> _mainCommands = new Dictionary<string, SqliteCommand>(StringComparer.Ordinal);
         ReportScratch _scratch;
         int _pending;
         SqliteTransaction _tx;
         public long Evaluated, Updated, Replayed;
 
-        public AuthResolver(Store store, Writer writer, long idleMs) { _store = store; _writer = writer; _idleMs = idleMs; }
+        public AuthResolver(Store store, Writer writer, long idleMs) : this(store, writer, idleMs, null) { }
+        public AuthResolver(Store store, Writer writer, long idleMs, SmtpClientMaintenance clients) { _store = store; _writer = writer; _idleMs = idleMs; _clients = clients; }
 
         public int Count { get { return _pending; } }
 
         static string Key(string server, string direction, string role, string sid) { return server + "\u0001" + direction + "\u0001" + role + "\u0001" + sid; }
 
+        // The session queued by the last Touch: it is still waiting (not done) until Flush, so touching it again changes nothing (null after Flush and Clear).
+        string _lastKey;
+
+        // The sessions to evaluate, in the order they were first queued, each once per Flush: what the scratch table
+        // queue(seq INTEGER PRIMARY KEY AUTOINCREMENT, k TEXT UNIQUE, server, direction, role, sid, done) held, with the same statements
+        // (Touch: INSERT ... ON CONFLICT(k) DO UPDATE SET done=0 WHERE done=1; Enqueue: INSERT OR IGNORE; Flush: the first not done in seq order).
+        sealed class Queued { public string Server, Direction, Role, Sid; public bool Done; }
+        readonly List<Queued> _queue = new List<Queued>();
+        readonly Dictionary<string, int> _queued = new Dictionary<string, int>(StringComparer.Ordinal);   // k -> place in _queue
+        int _next;   // every session before it in _queue is done
+
         public void Touch(string server, string direction, string role, string sid)
         {
-            Open();
-            if (With(S("touch", "INSERT INTO queue(k, server, direction, role, sid, done) VALUES(@p0,@p1,@p2,@p3,@p4,0) ON CONFLICT(k) DO UPDATE SET done=0 WHERE done=1;", "ttttt"),
-                Key(server, direction, role ?? "", sid), server, direction, role ?? "", sid).ExecuteNonQuery() > 0) _pending++;
+            string key = Key(server, direction, role ?? "", sid);
+            if (key == _lastKey) return;
+            if (Queue(key, server, direction, role ?? "", sid, true)) _pending++;
+            _lastKey = key;
+        }
+
+        /// <summary>
+        /// Queues a session (key: Key of the four texts); false when the statement of the former table changed no row (already queued: still
+        /// waiting, or done and not a Touch). The texts are those the table gave back (UTF-8: a lone surrogate became U+FFFD), k compared as it did.
+        /// </summary>
+        bool Queue(string key, string server, string direction, string role, string sid, bool touch)
+        {
+            if (AsStored(key) != key) { server = AsStored(server); direction = AsStored(direction); role = AsStored(role); sid = AsStored(sid); key = Key(server, direction, role, sid); }
+            int at;
+            if (_queued.TryGetValue(key, out at))
+            {
+                var q = _queue[at];
+                if (!touch || !q.Done) return false;
+                q.Done = false;   // keeps its place (its seq)
+                if (at < _next) _next = at;
+                return true;
+            }
+            _queued[key] = _queue.Count;
+            _queue.Add(new Queued { Server = server, Direction = direction, Role = role, Sid = sid });
+            return true;
+        }
+
+        /// <summary>The text as a TEXT column gives it back: the same string, unless it holds a lone surrogate (U+FFFD in UTF-8).</summary>
+        static string AsStored(string v)
+        {
+            if (v.AsSpan().IndexOfAnyInRange('\uD800', '\uDFFF') < 0) return v;
+            return Encoding.UTF8.GetString(Encoding.UTF8.GetBytes(v));
+        }
+
+        void ClearQueue()
+        {
+            _queue.Clear();
+            _queued.Clear();
+            _next = 0;
         }
 
         /// <summary>Forgets the sessions waiting (the batch is rolled back) and what was left in the scratch file.</summary>
         public void Clear()
         {
             _pending = 0;
+            _lastKey = null;
+            ClearQueue();
             CloseScratch();
         }
 
@@ -1190,12 +1296,12 @@ namespace ExchangeLogReport
         {
             foreach (var c in _mainCommands.Values) c.Dispose();
             _mainCommands.Clear();
+            ClearQueue();
             CloseScratch();
         }
 
         void CloseScratch()
         {
-            foreach (var c in _scratchCommands.Values) c.Dispose();
             _scratchCommands.Clear();
             if (_scratch != null) { _scratch.Dispose(); _scratch = null; }
         }
@@ -1212,48 +1318,49 @@ namespace ExchangeLogReport
                 "CREATE TABLE covraw(scope INTEGER NOT NULL, epoch INTEGER NOT NULL, lo INTEGER NOT NULL, hi INTEGER NOT NULL, PRIMARY KEY(scope, epoch, lo, hi)) WITHOUT ROWID;",
                 "CREATE TABLE cov(scope INTEGER NOT NULL, epoch INTEGER NOT NULL, lo INTEGER NOT NULL, hi INTEGER NOT NULL, PRIMARY KEY(scope, epoch, lo)) WITHOUT ROWID;",
                 "CREATE TABLE mref(scope INTEGER NOT NULL, epoch INTEGER NOT NULL, pos INTEGER NOT NULL, sub INTEGER NOT NULL, frag INTEGER NOT NULL, position INTEGER NOT NULL, PRIMARY KEY(scope, epoch, pos, sub, frag)) WITHOUT ROWID;",
-                "CREATE TABLE principal(scope INTEGER NOT NULL, epoch INTEGER NOT NULL, begin INTEGER NOT NULL, user TEXT, ambiguous INTEGER NOT NULL, conflict INTEGER NOT NULL, ready INTEGER NOT NULL, evidence_end INTEGER NOT NULL, has_proxy INTEGER NOT NULL, proxy_ms INTEGER NOT NULL, PRIMARY KEY(scope,epoch,begin)) WITHOUT ROWID;",
-                "CREATE TABLE queue(seq INTEGER PRIMARY KEY AUTOINCREMENT, k TEXT NOT NULL UNIQUE, server TEXT NOT NULL, direction TEXT NOT NULL, role TEXT NOT NULL, sid TEXT NOT NULL, done INTEGER NOT NULL);" })
+                "CREATE TABLE principal(scope INTEGER NOT NULL, epoch INTEGER NOT NULL, begin INTEGER NOT NULL, user TEXT, ambiguous INTEGER NOT NULL, conflict INTEGER NOT NULL, ready INTEGER NOT NULL, evidence_end INTEGER NOT NULL, has_proxy INTEGER NOT NULL, proxy_ms INTEGER NOT NULL, PRIMARY KEY(scope,epoch,begin)) WITHOUT ROWID;" })
                 Exec(sql);
         }
 
         void Exec(string sql) { using (var c = _scratch.Command(sql)) c.ExecuteNonQuery(); }
 
-        Prepared S(string name, string sql, string types)
+        static SqliteCommand Typed(SqliteCommand c, string types)
         {
-            Prepared c;
+            for (int i = 0; i < types.Length; i++) c.Parameters.Add("@p" + i.ToString(CultureInfo.InvariantCulture), types[i] == 'i' ? SqliteType.Integer : SqliteType.Text);
+            c.Prepare();
+            return c;
+        }
+
+        SqliteCommand S(string name, string sql, string types)
+        {
+            SqliteCommand c;
             if (_scratchCommands.TryGetValue(name, out c)) return c;
             Open();
-            using (var command = _scratch.Command(sql)) c = new Prepared(command, types.Length);
+            c = Typed(_scratch.Own(_scratch.Command(sql)), types);
             _scratchCommands[name] = c;
             return c;
         }
 
-        Prepared M(string name, string sql, string types)
+        SqliteCommand M(string name, string sql, string types)
         {
-            Prepared c;
+            SqliteCommand c;
             if (!_mainCommands.TryGetValue(name, out c))
             {
-                using (var command = _store.Command(sql, _tx)) c = new Prepared(command, types.Length);
+                c = Typed(_store.Command(sql, _tx), types);
                 _mainCommands[name] = c;
             }
+            c.Transaction = _tx;
             return c;
         }
 
-        static Prepared With(Prepared c, params object[] values)
+        static SqliteCommand With(SqliteCommand c, params object[] values)
         {
-            for (int i = 0; i < values.Length; i++) c.Set(i, values[i]);
+            for (int i = 0; i < values.Length; i++) c.Parameters[i].Value = values[i] ?? DBNull.Value;
             return c;
         }
 
-        static Prepared With(Prepared c, long a, long b) { c.Set(0, a); c.Set(1, b); return c; }
-        static Prepared With(Prepared c, long a, long b, long d) { With(c, a, b); c.Set(2, d); return c; }
-        static Prepared With(Prepared c, long a, long b, long d, long e) { With(c, a, b, d); c.Set(3, e); return c; }
-        static Prepared With(Prepared c, long a, long b, long d, long e, long f) { With(c, a, b, d, e); c.Set(4, f); return c; }
-        static Prepared With(Prepared c, long a, long b, long d, long e, long f, long g) { With(c, a, b, d, e, f); c.Set(5, g); return c; }
-
-        static string Str(Prepared.Rows r, int i) { return r.IsDBNull(i) ? null : r.GetString(i); }
-        static long Num(Prepared.Rows r, int i, long fallback) { return r.IsDBNull(i) ? fallback : r.GetInt64(i); }
+        static string Str(SqliteDataReader r, int i) { return Packed.Text(r.GetValue(i)); }
+        static long Num(SqliteDataReader r, int i, long fallback) { return r.IsDBNull(i) ? fallback : r.GetInt64(i); }
 
         void ClearScope(int scope)
         {
@@ -1266,34 +1373,37 @@ namespace ExchangeLogReport
         /// <summary>Evaluates the touched sessions (and the back-end sessions that depend on a touched front-end one) and writes the result.</summary>
         public void Flush(SqliteTransaction tx)
         {
+            _lastKey = null;   // the sessions are evaluated (done=1): a later Touch queues them again
             if (_pending == 0) return;
             _tx = tx;
             Open();
+            bool evaluated = false;
             try
             {
                 while (true)
                 {
-                    string[] scope = null;
-                    long seq = 0;
-                    using (var r = With(S("dequeue", "SELECT seq, server, direction, role, sid FROM queue WHERE done=0 ORDER BY seq LIMIT 1;", ""), new object[0]).ExecuteReader())
-                        if (r.Read()) { seq = r.GetInt64(0); scope = new[] { r.GetString(1), r.GetString(2), r.GetString(3), r.GetString(4) }; }
-                    if (scope == null) break;
-                    With(S("done", "UPDATE queue SET done=1 WHERE seq=@p0;", "i"), seq).ExecuteNonQuery();
-                    Evaluate(scope[0], scope[1], scope[2], scope[3]);
+                    while (_next < _queue.Count && _queue[_next].Done) _next++;
+                    if (_next >= _queue.Count) break;
+                    var q = _queue[_next];
+                    q.Done = true;
+                    Evaluate(q.Server, q.Direction, q.Role, q.Sid);
                 }
+                evaluated = true;
             }
             finally
             {
                 ClearScope(0); ClearScope(1);
-                Exec("DELETE FROM queue;");
+                ClearQueue();
                 _pending = 0;
-                CloseScratch();
+                // Every scratch table is empty again (scopes 0 and 1 are the only ones; all WITHOUT ROWID, read in key order): the next Flush
+                // reads what a new scratch file would give, so the file and its prepared statements are kept. After a failure they are not.
+                if (!evaluated) CloseScratch();
             }
         }
 
         void Enqueue(string server, string direction, string role, string sid)
         {
-            With(S("enqueue", "INSERT OR IGNORE INTO queue(k, server, direction, role, sid, done) VALUES(@p0,@p1,@p2,@p3,@p4,0);", "ttttt"), Key(server, direction, role, sid), server, direction, role, sid).ExecuteNonQuery();
+            Queue(Key(server, direction, role, sid), server, direction, role, sid, false);
         }
 
         void Evaluate(string server, string direction, string role, string sid)
@@ -1393,75 +1503,54 @@ namespace ExchangeLogReport
         void ReadParts(int scope, AuthEpoch e, Origin o, string server, string direction, string role, string sid)
         {
             long after = 0;
-            var observation = new AuthObs();
             string sql = "SELECT id, part, COALESCE(evidence_format,1), coverage, conflicted, conflict_positions, observations FROM smtp_auth_fragment WHERE server=@p0 AND role=@p1 AND direction=@p2 AND session_id=@p3 AND COALESCE(source_key,'')=@p4 AND first_offset=@p5 AND COALESCE(origin_first_ms,first_ms)=@p6 AND id>@p7 ORDER BY id LIMIT " + PartPage.ToString(CultureInfo.InvariantCulture) + ";";
             while (true)
             {
-                int count = 0;
-                // Insertion only touches the separate scratch connection; keep one JSON part live, not a page of strings.
+                var rows = new List<object[]>();
                 using (var r = With(M("parts", sql, "tttttiii"), server, role, direction, sid, o.SourceKey, o.FirstOffset, o.OriginMs, after).ExecuteReader())
+                    while (r.Read()) rows.Add(new object[] { r.GetInt64(0), r.GetInt64(1), r.GetInt64(2), Str(r, 3), r.GetInt64(4) != 0, Str(r, 5), Str(r, 6) });
+                foreach (var row in rows)
                 {
-                    while (r.Read())
+                    long id = (long)row[0];
+                    int format = (int)(long)row[2];
+                    long logical = format >= 2 ? -1L - (long)row[1] : (long)row[1];
+                    after = id;
+                    if (e.SeqLess && format < 2 && o.MaxFormat >= 2) continue;
+                    foreach (var iv in SmtpAuthStore.ReadCoverage((string)row[3]))
+                        With(S("covraw", "INSERT OR IGNORE INTO covraw(scope, epoch, lo, hi) VALUES(@p0,@p1,@p2,@p3);", "iiii"), (long)scope, (long)e.Index, iv[0], iv[1]).ExecuteNonQuery();
+                    HashSet<long> positions = null;
+                    bool partConflict = (bool)row[4];
+                    if (partConflict && row[5] != null)
                     {
-                        count++;
-                        long id = r.GetInt64(0);
-                        int format = (int)r.GetInt64(2);
-                        long logical = format >= 2 ? -1L - r.GetInt64(1) : r.GetInt64(1);
-                        after = id;
-                        if (e.SeqLess && format < 2 && o.MaxFormat >= 2) continue;
-                        foreach (var iv in SmtpAuthStore.ReadCoverage(Str(r, 3)))
-                            With(S("covraw", "INSERT OR IGNORE INTO covraw(scope, epoch, lo, hi) VALUES(@p0,@p1,@p2,@p3);", "iiii"), (long)scope, (long)e.Index, iv[0], iv[1]).ExecuteNonQuery();
-                        HashSet<long> positions = null;
-                        bool partConflict = r.GetInt64(4) != 0;
-                        string conflictPositions = Str(r, 5);
-                        if (partConflict && conflictPositions != null)
-                        {
-                            positions = new HashSet<long>();
-                            foreach (var t in conflictPositions.Split(new[] { ',' }, StringSplitOptions.RemoveEmptyEntries)) { long v; if (long.TryParse(t, NumberStyles.AllowLeadingSign, CultureInfo.InvariantCulture, out v)) positions.Add(v); }
-                        }
-                        if (!r.IsDBNull(6) && r.GetUtf8(6).Length != 0)
-                        {
-                            var json = new Utf8JsonReader(r.GetUtf8(6));
-                            using (var document = JsonDocument.ParseValue(ref json))
-                            {
-                                int index = 0, sub = 0;
-                                long previousPos = long.MinValue;
-                                foreach (var item in document.RootElement.EnumerateArray())
-                                {
-                                    SmtpAuthStore.ReadObservation(item, id, logical, index++, ref previousPos, ref sub, observation);
-                                    // Insert copies every value to SQLite before this observation is filled again.
-                                    Insert(scope, e, observation, partConflict && (positions == null || positions.Contains(observation.Pos)));
-                                }
-                                if (json.Read()) throw new JsonException("Unexpected trailing JSON value.");
-                            }
-                        }
+                        positions = new HashSet<long>();
+                        foreach (var t in ((string)row[5]).Split(new[] { ',' }, StringSplitOptions.RemoveEmptyEntries)) { long v; if (long.TryParse(t, NumberStyles.AllowLeadingSign, CultureInfo.InvariantCulture, out v)) positions.Add(v); }
                     }
+                    foreach (var ob in SmtpAuthStore.Read((string)row[6] ?? "[]", id, logical))
+                        Insert(scope, e, ob, partConflict && (positions == null || positions.Contains(ob.Pos)));
                 }
-                if (count < PartPage) break;
+                if (rows.Count < PartPage) break;
             }
         }
 
         void Insert(int scope, AuthEpoch e, AuthObs o, bool conflict)
         {
-            string kind = o.K == 'M' ? "M" : o.K.ToString();
+            object[] values = { (long)scope, (long)e.Index, o.Pos, (long)o.Sub, o.K.ToString(), o.Ms, o.Seq, o.A, o.B, (long)o.Code, o.Frag, conflict ? 1L : 0L };
             if (o.K == 'M')
             {
                 long position;
                 if (long.TryParse(o.A, NumberStyles.AllowLeadingSign, CultureInfo.InvariantCulture, out position))
                     With(S("mref", "INSERT OR IGNORE INTO mref(scope, epoch, pos, sub, frag, position) VALUES(@p0,@p1,@p2,@p3,@p4,@p5);", "iiiiii"), (long)scope, (long)e.Index, o.Pos, (long)o.Sub, o.Frag, position).ExecuteNonQuery();
             }
-            var insert = conflict
-                ? S("evconflict", "INSERT INTO ev(scope,epoch,pos,sub,k,ms,seq,a,b,code,frag,conflict) VALUES(@p0,@p1,@p2,@p3,@p4,@p5,@p6,@p7,@p8,@p9,@p10,@p11) ON CONFLICT(scope,epoch,pos,sub) DO UPDATE SET conflict=1;", "iiiitiittiii")
-                : S("evinsert", "INSERT OR IGNORE INTO ev(scope,epoch,pos,sub,k,ms,seq,a,b,code,frag,conflict) VALUES(@p0,@p1,@p2,@p3,@p4,@p5,@p6,@p7,@p8,@p9,@p10,@p11);", "iiiitiittiii");
-            insert.Set(0, scope); insert.Set(1, e.Index); insert.Set(2, o.Pos); insert.Set(3, o.Sub);
-            insert.Set(4, kind); insert.Set(5, o.Ms); insert.Set(6, o.Seq); insert.Set(7, o.A);
-            insert.Set(8, o.B); insert.Set(9, o.Code); insert.Set(10, o.Frag); insert.Set(11, conflict ? 1L : 0L);
-            int inserted = insert.ExecuteNonQuery();
-            if (conflict || inserted > 0) return;
+            if (conflict)
+            {
+                With(S("evconflict", "INSERT INTO ev(scope,epoch,pos,sub,k,ms,seq,a,b,code,frag,conflict) VALUES(@p0,@p1,@p2,@p3,@p4,@p5,@p6,@p7,@p8,@p9,@p10,@p11) ON CONFLICT(scope,epoch,pos,sub) DO UPDATE SET conflict=1;", "iiiitiittiii"), values).ExecuteNonQuery();
+                return;
+            }
+            if (With(S("evinsert", "INSERT OR IGNORE INTO ev(scope,epoch,pos,sub,k,ms,seq,a,b,code,frag,conflict) VALUES(@p0,@p1,@p2,@p3,@p4,@p5,@p6,@p7,@p8,@p9,@p10,@p11);", "iiiitiittiii"), values).ExecuteNonQuery() > 0) return;
             // The same position was already read (the part was read again by another file or collection): only a different content is a conflict.
             bool same = false;
             using (var r = With(S("evsame", "SELECT k, ms, a, b, code FROM ev WHERE scope=@p0 AND epoch=@p1 AND pos=@p2 AND sub=@p3;", "iiii"), (long)scope, (long)e.Index, o.Pos, (long)o.Sub).ExecuteReader())
-                if (r.Read()) same = r.GetString(0) == kind && r.GetInt64(1) == o.Ms && Str(r, 2) == o.A && Str(r, 3) == o.B && r.GetInt64(4) == o.Code;
+                if (r.Read()) same = r.GetString(0) == o.K.ToString() && r.GetInt64(1) == o.Ms && Str(r, 2) == o.A && Str(r, 3) == o.B && r.GetInt64(4) == o.Code;
             if (!same) With(S("evmark", "UPDATE ev SET conflict=1 WHERE scope=@p0 AND epoch=@p1 AND pos=@p2 AND sub=@p3;", "iiii"), (long)scope, (long)e.Index, o.Pos, (long)o.Sub).ExecuteNonQuery();
         }
 
@@ -1486,27 +1575,17 @@ namespace ExchangeLogReport
         {
             long pos = long.MinValue;
             long sub = long.MinValue;
-            // Each replay owns its page: a nested front-end replay must not overwrite the back-end page.
-            var page = new AuthObs[EventPage];
+            var page = new List<AuthObs>(EventPage);
             while (true)
             {
-                int count = 0;
+                page.Clear();
                 using (var r = With(S("events", "SELECT pos, sub, k, ms, seq, a, b, code, frag, conflict FROM ev WHERE scope=@p0 AND epoch=@p1 AND (pos, sub) > (@p2, @p3) ORDER BY pos, sub LIMIT " + EventPage.ToString(CultureInfo.InvariantCulture) + ";", "iiii"), (long)scope, (long)e.Index, pos, sub).ExecuteReader())
                     while (r.Read())
-                    {
-                        var o = page[count] ?? (page[count] = new AuthObs());
-                        var kind = r.GetUtf8(2);
-                        o.K = kind.Length == 1 && kind[0] < 128 ? (char)kind[0] : r.GetString(2)[0];
-                        o.Pos = r.GetInt64(0); o.Sub = (int)r.GetInt64(1); o.Ms = r.GetInt64(3); o.Seq = r.GetInt64(4);
-                        // MAIL's physical reference was indexed by Insert; replay only needs its position and time.
-                        o.A = o.K == 'M' ? null : Str(r, 5); o.B = o.K == 'M' ? null : Str(r, 6);
-                        o.Code = (int)r.GetInt64(7); o.Frag = r.GetInt64(8); o.Conflict = r.GetInt64(9) != 0;
-                        count++;
-                    }
-                if (count == 0) break;
-                for (int i = 0; i < count; i++) replay.Feed(page[i]);
-                pos = page[count - 1].Pos; sub = page[count - 1].Sub;
-                if (count < EventPage) break;
+                        page.Add(new AuthObs { Pos = r.GetInt64(0), Sub = (int)r.GetInt64(1), K = r.GetString(2)[0], Ms = r.GetInt64(3), Seq = r.GetInt64(4), A = Str(r, 5), B = Str(r, 6), Code = (int)r.GetInt64(7), Frag = r.GetInt64(8), Conflict = r.GetInt64(9) != 0 });
+                if (page.Count == 0) break;
+                foreach (var o in page) replay.Feed(o);
+                pos = page[page.Count - 1].Pos; sub = page[page.Count - 1].Sub;
+                if (page.Count < EventPage) break;
             }
             replay.Finish();
             Replayed++;
@@ -1526,40 +1605,44 @@ namespace ExchangeLogReport
             long afterRef = 0;
             while (true)
             {
-                int referenceCount = 0;
+                var refs = new List<long[]>();
                 using (var r = With(S("mailrefs", "SELECT frag, position FROM mref WHERE scope=@p0 AND epoch=@p1 AND pos=@p2 AND sub=@p3 AND frag>@p4 ORDER BY frag LIMIT 256;", "iiiii"),
                     (long)scope, (long)e.Index, mail.Pos, (long)mail.Sub, afterRef).ExecuteReader())
-                    while (r.Read()) _mailReferences[referenceCount++] = new MailReference { Fragment = r.GetInt64(0), Position = r.GetInt64(1) };
-                if (referenceCount == 0) break;
-                // Only main replays write MAILs, after Snapshot has finished any nested front-end replay.
-                for (int f = 0; f < referenceCount; f++)
+                    while (r.Read()) refs.Add(new[] { r.GetInt64(0), r.GetInt64(1) });
+                if (refs.Count == 0) break;
+                foreach (var f in refs)
                 {
                     long after = 0;
                     while (true)
                     {
-                        int count = 0;
-                        using (var r = With(M("txlookup", "SELECT id, auth_user, auth_mechanism, auth_result, auth_attempt_result, auth_source, auth_evidence_id FROM smtp_transaction WHERE auth_fragment_id=@p0 AND auth_sequence=@p1 AND id>@p2 ORDER BY id LIMIT 256;", "iii"), _mailReferences[f].Fragment, _mailReferences[f].Position, after).ExecuteReader())
-                            while (r.Read())
-                                _mailUpdates[count++] = new MailUpdate { Id = r.GetInt64(0), Changed =
-                                    !(r.TextEquals(1, s.User) && r.TextEquals(2, s.Mechanism) && r.TextEquals(3, s.Result) &&
-                                      r.TextEquals(4, s.Attempt) && r.TextEquals(5, s.Source) &&
-                                      (r.IsDBNull(6) ? s.Evidence <= 0 : s.Evidence > 0 && r.GetInt64(6) == s.Evidence)) };
-                        for (int i = 0; i < count; i++)
+                        var rows = new List<object[]>();
+                        using (var r = With(M("txlookup", "SELECT id, auth_user, auth_mechanism, auth_result, auth_attempt_result, auth_source, auth_evidence_id, time_ms, client_id, server, direction, role, connector, remote_ep, helo FROM smtp_transaction WHERE auth_fragment_id=@p0 AND auth_sequence=@p1 AND id>@p2 ORDER BY id LIMIT 256;", "iii"), f[0], f[1], after).ExecuteReader())
+                            while (r.Read()) rows.Add(new object[] { r.GetInt64(0), Str(r, 1), Str(r, 2), Str(r, 3), Str(r, 4), Str(r, 5), r.IsDBNull(6) ? (object)null : r.GetInt64(6),
+                                r.GetInt64(7), r.IsDBNull(8) ? (object)null : r.GetInt64(8), Str(r, 9), Str(r, 10), Str(r, 11), Str(r, 12), Str(r, 13), Str(r, 14) });
+                        foreach (var row in rows)
                         {
-                            after = _mailUpdates[i].Id;
-                            if (!_mailUpdates[i].Changed) continue;
+                            after = (long)row[0];
+                            object evidence = s.Evidence > 0 ? (object)s.Evidence : null;
+                            if (Equals(row[1], s.User) && Equals(row[2], s.Mechanism) && Equals(row[3], s.Result) && Equals(row[4], s.Attempt) && Equals(row[5], s.Source) && Equals(row[6], evidence)) continue;
                             var u = _writer.UpdateAuth;
-                            u.Set(0, s.User); u.Set(1, s.Mechanism); u.Set(2, s.Result); u.Set(3, s.Attempt); u.Set(4, s.Source);
-                            if (s.Evidence > 0) u.Set(5, s.Evidence); else u.Set(5, null);
-                            u.Set(6, after);
+                            // The resolved account is part of the SMTP client key: the transaction moves to the client of its account. Without the code-side
+                            // maintenance the client_id stays as read and the update trigger queues the transaction (ReconcileSmtpClients re-keys it).
+                            object client = row[8];
+                            if (_clients != null) client = _clients.Client(row[9], row[10], row[11], row[12], row[13], row[14], s.User, s.Source);
+                            u.Set(0, s.User); u.Set(1, s.Mechanism); u.Set(2, s.Result); u.Set(3, s.Attempt); u.Set(4, s.Source); u.Set(5, evidence); u.Set(6, after); u.Set(7, client);
                             u.Run();
+                            if (_clients != null)
+                            {
+                                _clients.Updated(after, (long)row[7], row[8], client, s.Mechanism, s.Result, s.Attempt, s.Source);
+                                _clients.Left(row[8], client);
+                            }
                             Updated++;
                         }
-                        if (count < 256) break;
+                        if (rows.Count < 256) break;
                     }
                 }
-                afterRef = _mailReferences[referenceCount - 1].Fragment;
-                if (referenceCount < 256) break;
+                afterRef = refs[refs.Count - 1][0];
+                if (refs.Count < 256) break;
             }
         }
 
@@ -1662,7 +1745,6 @@ namespace ExchangeLogReport
             readonly int _scope;
             readonly AuthBind _anchor;
             readonly bool _projection;
-            readonly AuthSnap _snapshot = new AuthSnap();
             Principal _est, _window;
             Principal _atAnchor;
             string _attemptAtAnchor;
@@ -1905,10 +1987,7 @@ namespace ExchangeLogReport
 
             AuthSnap Snapshot(AuthObs m)
             {
-                // Consumed synchronously by WriteMail; retained proof lives in Principal/AuthToken, never in this slot.
-                var s = _snapshot;
-                s.Mechanism = null; s.User = null; s.Evidence = 0; s.Bind = null;
-                s.Result = SmtpAuth.Unknown; s.Attempt = SmtpAuth.Unknown; s.Source = SmtpAuth.Missing;
+                var s = new AuthSnap { Result = SmtpAuth.Unknown, Attempt = SmtpAuth.Unknown, Source = SmtpAuth.Missing };
                 if (_est != null ? _est.Conflict : _stateConflict) { s.Source = SmtpAuth.Ambiguous; return s; }
                 if (_est != null) { if (_est.StartUnknown || _est.Broken) return s; }
                 else if (_unknown) return s;
@@ -1933,7 +2012,7 @@ namespace ExchangeLogReport
                     if (_bind == null) { s.Source = SmtpAuth.NotApplicable; return s; }
                     s.Mechanism = null; s.Result = SmtpAuth.Unknown; s.Attempt = SmtpAuth.Unknown; s.Evidence = 0;
                     if (_bind.Broken || !_bind.Accepted) { s.Source = SmtpAuth.Missing; return s; }
-                    return _r.Handoff(_e, _bind, m, s);
+                    return _r.Handoff(_e, _bind, m);
                 }
                 if (est.TechId || est.Technical) { s.Source = SmtpAuth.NotApplicable; return s; }
                 if (est.User == null) { s.Source = SmtpAuth.Missing; return s; }
@@ -1981,8 +2060,9 @@ namespace ExchangeLogReport
         }
 
         /// <summary>The five values of a transaction of a back end handed over by a front end, from the proof of the handshake.</summary>
-        AuthSnap Handoff(AuthEpoch be, AuthBind bind, AuthObs mail, AuthSnap s)
+        AuthSnap Handoff(AuthEpoch be, AuthBind bind, AuthObs mail)
         {
+            var s = new AuthSnap { Result = SmtpAuth.Unknown, Attempt = SmtpAuth.Unknown, Source = SmtpAuth.Missing };
             var t = bind.Token ?? (bind.Token = ResolveToken(be, bind));
             if (t.Status == SmtpAuth.Ambiguous) { s.Source = SmtpAuth.Ambiguous; return s; }
             if (t.Status != AuthToken.Ok || mail.Ms < t.ReadyMs) return s;

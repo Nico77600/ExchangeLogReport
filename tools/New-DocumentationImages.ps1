@@ -11,7 +11,7 @@
 
         readme-banner     the hero of the guide, with three key figures
         readme-why        the two questions (cards block "Usage" / "Troubleshooting", chapter 1)
-    readme-path       the guided path (path block of the user guide, chapter 1): set up once, then A or B
+        readme-path       the guided path (path block of the user guide, chapter 1): set up once, then A, B or C
         readme-how        the collection pipeline (first flow block, chapter 2) and the two reports
         readme-noise      what is removed before storage (cards block of chapter 3) and the lab figures
         readme-sessions   client session and message correlation (flow blocks of chapter 11)
@@ -32,7 +32,7 @@
 
 .NOTES
     Author  : Nicolas Fabert
-    Version : 2.1.0
+    Version : 3.0.0
     Part of : Exchange Log Report (repository tool, not in the package)
 #>
 [CmdletBinding()]
@@ -208,8 +208,22 @@ function Get-PageHeight([string]$Html, [int]$Width) {
         $m = [regex]::Match($text, 'data-h="(\d+)"')
         if (-not $m.Success) { Start-Sleep -Milliseconds 250 }
     }
-    if (-not $m.Success) { throw "Height not measured: $Html" }
-    return [int]$m.Groups[1].Value
+    if ($m.Success) { return [int]$m.Groups[1].Value }
+    # An Edge build that writes no --dump-dom output: the height is read from a tall screenshot, as the last row that differs from the
+    # page background, plus the bottom padding of the canvas.
+    $probe = Join-Path $work ('height-' + [guid]::NewGuid().ToString('N').Substring(0, 8) + '.png')
+    Save-Screenshot $Html $probe $Width 4000 1
+    Add-Type -AssemblyName System.Drawing
+    $bitmap = [Drawing.Bitmap]::new($probe)
+    try {
+        $background = $bitmap.GetPixel(0, 0).ToArgb()
+        for ($y = $bitmap.Height - 1; $y -ge 0; $y--) {
+            for ($x = 0; $x -lt $bitmap.Width; $x += 2) {
+                if ($bitmap.GetPixel($x, $y).ToArgb() -ne $background) { return $y + 1 + 6 }
+            }
+        }
+    } finally { $bitmap.Dispose() }
+    throw "Height not measured: $Html"
 }
 
 function New-ReadmeGraphic {
@@ -252,7 +266,7 @@ New-ReadmeGraphic -Name 'banner' -Body $banner
 # Why: the two questions of chapter 1.
 New-ReadmeGraphic -Name 'why' -Body (ConvertTo-ReadmeCards (Get-GuideBlock 'cards' 'Usage') 'rb-cards2')
 
-# The guided path of the user guide (chapter 1): set up once, then A or B.
+# The guided path of the user guide (chapter 1): set up once, then A, B or C.
 if (-not $assets.Path) { throw 'Guided path not found in package\docs\ExchangeLogReport-UserGuide.html: run tools\Build-Documentation.ps1 first.' }
 New-ReadmeGraphic -Name 'path' -Body $assets.Path
 

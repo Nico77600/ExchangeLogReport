@@ -46,3 +46,11 @@ The release attestation workflow does not build or execute repository code. It a
 Actions are pinned to full commit IDs. Updates require review of the action source and an explicit pin change. Repository policies may reject unpinned or unapproved actions; never relax them to merge a contribution.
 
 The advisory C# job uses manual compilation through `.github\scripts\Build-CodeQLProduction.ps1` and `.github\codeql\Production.proj`. It compiles every production `package\src\*.cs` recursively against the running PowerShell framework references and the exact shipped SQLite assemblies, without NuGet restore or executing/loading the tool. Outputs stay outside the runtime package; do not distribute them. The build manifest checks source/reference inventories, but only the hosted CodeQL tracer/database diagnostics can establish complete extraction. CodeQL does not analyze PowerShell.
+
+## Documentation and visual publication review
+
+Preserve the approved public/runtime README presentation, author identity, readable exact English disclaimer and SECURITY policy. Review content, section order, theme-aware graphics and navigation, not only file existence. Keep project-specific explanations and cautions; do not substitute another project's business content.
+
+Before publishing, review actual README rendering in light/dark desktop and narrow light layouts, including contrast, spacing, links/images, readable disclaimer and anonymized screenshots. Record the reviewer, immutable source revision, document/image hashes and distinct captures outside the repository. Missing or changed content/evidence blocks publication; automated text checks do not establish visual quality or owner consent.
+
+For Nico77600 publications through the local github-release procedure, the common parent instructions and pinned documentation standard apply. The Prepare/Merge/Release security gate requires its documentation review record and executes the documentation gate in Reviewed mode. Content-only diagnostics never authorize publication. Do not overwrite tracked instructions in existing clones with this template or silently weaken a gate for a different layout.
