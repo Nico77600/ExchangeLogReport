@@ -205,6 +205,12 @@ $html = [regex]::Replace($html, '<p><img src="([^"]+)" alt="([^"]*)" /></p>', {
         $src = if (Test-Path -LiteralPath $path) { 'data:image/png;base64,' + [Convert]::ToBase64String([IO.File]::ReadAllBytes($path)) } else { $m.Groups[1].Value }
         "<figure><img loading=""lazy"" src=""$src"" alt=""$($m.Groups[2].Value)"" title=""Click to enlarge""><figcaption>$($m.Groups[2].Value)</figcaption></figure>"
     })
+# An image written inside a table cell or a sentence is embedded too: the HTML file must not depend on docs\images.
+$html = [regex]::Replace($html, '<img src="([^"#:]+)"', {
+        param($m)
+        $path = Join-Path $docs ([Uri]::UnescapeDataString($m.Groups[1].Value))
+        if (Test-Path -LiteralPath $path) { '<img src="data:image/png;base64,' + [Convert]::ToBase64String([IO.File]::ReadAllBytes($path)) + '"' } else { $m.Value }
+    })
 $html = $html -replace '<a href="(https?://[^"]+)"', '<a href="$1" target="_blank" rel="noopener"'
 # Link to another guide: its HTML file, and the id given to the heading here (GitHub anchors keep the
 # chapter number and turn " — " into "--"; the ids of this page do not).
@@ -212,6 +218,11 @@ $html = [regex]::Replace($html, '<a href="([\w.-]+)\.md(?:#([^"]*))?"', {
         param($m)
         $anchor = ($m.Groups[2].Value -replace '^\d+-', '' -replace '-{2,}', '-')
         '<a href="' + $m.Groups[1].Value + '.html' + $(if ($anchor) { '#' + $anchor } else { '' }) + '"'
+    })
+# Link inside this guide, written with its GitHub anchor (#6-c--investigate-in-the-browser): the same rule gives the id of the heading.
+$html = [regex]::Replace($html, '<a href="#(\d+-[^"]*)"', {
+        param($m)
+        '<a href="#' + ($m.Groups[1].Value -replace '^\d+-', '' -replace '-{2,}', '-') + '"'
     })
 $html = $html -replace '<p class="markdown-alert-title"><svg viewBox="0 0 16 16"', '<p class="markdown-alert-title"><svg class="icon-sm" viewBox="0 0 16 16" fill="currentColor"'
 

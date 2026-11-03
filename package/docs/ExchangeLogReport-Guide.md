@@ -1,9 +1,9 @@
 ---
 title: Exchange Log Report
 subtitle: Developer guide
-version: 2.1.1
+version: 3.0.0
 author: Nicolas Fabert
-updated: 2026-10-14
+updated: 2026-10-30
 ---
 
 # Exchange Log Report — Developer guide
@@ -11,13 +11,13 @@ updated: 2026-10-14
 > A modern Log Parser for **Exchange Server SE on-premises**: it reads the IIS / HTTP Proxy, MAPI, ActiveSync, POP/IMAP, SMTP and message tracking logs of several servers, removes the noise **before** storage, and answers two questions — **is this server really used?** and **what happened to this user, this client or this message?**
 
 > [!IMPORTANT]
-> Files downloaded from the Internet may be blocked by Windows and fail to run. Before using this project, unblock every file in the downloaded folder:
+> Windows marks files downloaded from the Internet. Check the publisher first (right-click a `.ps1`, Properties, Digital Signatures: `Nicolas Fabert`), then unblock the extracted folder once:
 >
 > ```powershell
-> Get-ChildItem "C:\Chemin\Du\Dossier" -Recurse -File -Force | Unblock-File
+> Get-ChildItem "E:\Tools\ExchangeLogReport" -Recurse -File -Force | Unblock-File
 > ```
 >
-> Replace the example path with the folder where you downloaded or extracted this project.
+> Replace the example path with the folder where you extracted the ZIP of the [latest release](https://github.com/Nico77600/ExchangeLogReport/releases/latest).
 
 > [!NOTE]
 > This is the **developer guide**: how the tool works, the configuration in detail, every tab of the report, the correlation rules, the data model and how to modify the tool. For the prerequisites and the everyday commands only, read the [user guide](ExchangeLogReport-UserGuide.md).
@@ -45,9 +45,13 @@ B | search | Troubleshooting on demand
 B | 5 | Run a Detailed report | on the user and the hours of the problem
 B | 6 | Open the client session | HTML report, **Client sessions** tab
 B | 7 | Follow the timeline | each step: what failed, and where its raw log lines are
+C | terminal | Investigate in the browser
+C | 5 | Start the portal | `Start-Portal.cmd` opens it in your browser
+C | 6 | Read one day | the newest day first; **Previous day** / **Next day**, 1, 3 or 7 days, **Jump to day**
+C | 7 | Open a session, a message or an SMTP client | its timeline, its route or its transcript
 ```
 
-Every step with its exact command, on one example (EXCH01 to EXCH04, contoso.com, alice): [user guide, chapters 3 to 5](ExchangeLogReport-UserGuide.md#1-start-here). The account and the prerequisites: chapter 4; the scheduled tasks: chapter 7; the e-mail: 8.1.
+Every step with its exact command, on one example (EXCH01 to EXCH04, contoso.com, alice): [user guide, chapters 3 to 6](ExchangeLogReport-UserGuide.md#1-start-here). The account and the prerequisites: chapter 4; the scheduled tasks: chapter 7; the e-mail: 8.1.
 
 > [!IMPORTANT]
 > The tool is **read-only** for Exchange: it reads log files and, with `-Mode Discover`, settings (`Get-*` cmdlets and IIS `applicationHost.config`). It never changes a setting. Reports stay on the local disk, unless the `Mail` section sends them by e-mail (chapter 8.1).
@@ -147,7 +151,7 @@ key | Authentication challenges | The anonymous `401` that precedes every NTLM /
 
 | Item | Requirement |
 |---|---|
-| PowerShell | **7.4 or later** (`pwsh`) for the tool. A portable zip is enough: no installation on the Exchange servers. **Windows PowerShell 5.1** (`powershell.exe`, part of Windows Server) for `-Mode Discover` only: the Exchange cmdlets are not supported in PowerShell 7, so the tool runs them in a Windows PowerShell 5.1 process. |
+| PowerShell | **7.4 or later** (`pwsh`) for the tool. The release package carries PowerShell 7 (`powershell\`) and the launchers start it: no installation on the Exchange servers. **Windows PowerShell 5.1** (`powershell.exe`, part of Windows Server) for `-Mode Discover` only: the Exchange cmdlets are not supported in PowerShell 7, so the tool runs them in a Windows PowerShell 5.1 process. |
 | Account | SYSTEM on an Exchange server, or a domain account that is local administrator of every Exchange server (4.1). Edge Transport server: on the Edge itself, SYSTEM or a local administrator (4.2). |
 | Network | SMB (445) from the collector to every Exchange server. On a collector that is not an Exchange server, also HTTP (80) to one Exchange server for `-Mode Discover` (remote PowerShell `http://<server>/PowerShell/`, Kerberos). |
 | Protocol logging | SMTP: `ProtocolLoggingLevel Verbose` on the receive and send connectors whose traffic must be analysed (`Get-ReceiveConnector | ft Name,ProtocolLoggingLevel`). Verbose is also what the authenticated user of SMTP clients is read from. POP/IMAP (optional): `Set-PopSettings` / `Set-ImapSettings -ProtocolLogEnabled $true`, then restart the POP3/IMAP4 services. HttpProxy, IIS (front and back end), MAPI over HTTP and message tracking are on by default. `-Mode Discover` lists the connectors and services whose logging is off. |
@@ -205,22 +209,21 @@ The Edge gets its own tool folder and database. Seen from a mailbox server, a su
 ## 5. Installation
 
 ```steps
-Copy the package | Copy the package folder to the collector, for example `E:\Tools\ExchangeLogReport` (no installer, no module to register).
+Extract the package | Extract `ExchangeLogReport-3.0.0-win-x64.zip` to the collector, for example `E:\Tools\ExchangeLogReport` (no installer, no module to register; PowerShell 7 is inside the package). The scripts alone, from the `package` folder of the repository, run on an installed PowerShell 7.4 or later.
 List the servers | Edit `config\ExchangeLogReport.config.psd1`: the server names are enough (chapter 6).
-Check the configuration and the engine | `pwsh -File .\Invoke-ExchangeLogReport.ps1 -Mode Status` — a new installation answers **Ready for the first collection**.
-Find the log folders | `pwsh -File .\Invoke-ExchangeLogReport.ps1 -Mode Discover` with an account of *View-Only Organization Management* (6.1). Check the warnings: folder not readable, logging off.
-Run the first collection | `pwsh -File .\Invoke-ExchangeLogReport.ps1 -Mode Collect` (with the account of the scheduled task) reads `Collection.BackfillDays` days of logs.
+Check the configuration and the engine | `.\Run-Collector.cmd -Mode Status` — a new installation answers **Ready for the first collection**.
+Find the log folders | `.\Run-Collector.cmd -Mode Discover` with an account of *View-Only Organization Management* (6.1). Check the warnings: folder not readable, logging off.
+Run the first collection | `.\Run-Collector.cmd -Mode Collect` (with the account of the scheduled task) reads `Collection.BackfillDays` days of logs.
 Schedule it | Hourly scheduled task (chapter 7), then build the first report (chapter 8).
 ```
 
 ### 5.1 Package integrity
 
-Every release is protected end to end. The owner signs (Authenticode with a timestamp) the five PowerShell files of the package and a manifest, `PackageIntegrity.psd1`, which stays at the package root and lists the raw SHA256 of all 29 protected files (28 required, plus `CHANGELOG.md` in a distribution). Before anything runs, `Invoke-ExchangeLogReport.ps1`, the module (at import and at every engine initialization) and the package builder call `src\Test-PackageIntegrity.ps1`. The verifier authenticates the whole parent package, not only `src`, and is included once through the package builder's recursive `src` copy. It requires a valid, timestamped signature of the owner on itself, on the manifest and on every PowerShell file, then checks all 12 C# sources (`src\*.cs`), all six SQLite DLLs (`lib\sqlite`, including both native architectures), `templates\Report.template.html`, both HTML guides, `README.md`, `THIRD-PARTY-NOTICES.md` and, in a distribution, `CHANGELOG.md`. C# and DLLs are protected by their hashes in the separately owner-signed manifest, not individually Authenticode-signed. A missing, changed, duplicate or unknown file in the package, or a link (reparse point) in the package tree, stops the tool before the module, the SQLite libraries or the engine are loaded. Generate the final manifest hashes only after the five approved script signatures and their real timestamps have been finalized; sign and timestamp the manifest separately last.
-
-- **Not protected, on purpose:** `config\ExchangeLogReport.config.psd1`, `config\ExchangeLogReport.paths.psd1` and `config\ExchangeLogReport.mail.credential` (you edit or generate them: they are data, never executed), and the folders `bin\`, `data\`, `logs\` and `reports\` at the package root. Any other file in `config\` is refused. Repository-only files (`LICENSE`, the Markdown guides, `docs\images\`) are allowed by exact name and are not part of a distribution. The integrity check does not claim that every byte of the folder is immutable.
+Every release is protected end to end. The owner signs (Authenticode with a timestamp) the six PowerShell files of the package (`Invoke-ExchangeLogReport.ps1`, `Database-Storage.ps1`, `ExchangeLogReport.psm1`, `ExchangeLogReport.psd1`, `src\Test-PackageIntegrity.ps1`, `src\Get-ExlExchangeSettings.ps1`) and a manifest, `PackageIntegrity.psd1`, which stays at the package root. The manifest has two lists. `Files` holds the raw SHA256 of the protected files that exist in the repository and in the package: the C# sources of the engine (`src\Engine.*.cs`) and of the storage tool (`src\Storage.*.cs`), all six SQLite DLLs (`lib\sqlite`, including both native architectures), `templates\Report.template.html` and its script `templates\Report.template.js`, both HTML guides, the three launchers (`.cmd` files cannot be signed, so they are hashed), `README.md`, `THIRD-PARTY-NOTICES.md` and, in a distribution, `CHANGELOG.md`, `LICENSE`, `SECURITY.md`, `product.json` and the notices of the bundled components. `DistributionFiles` holds the SHA256 of every file of the built folders `powershell\` (PowerShell 7) and `sqlite-tools\`; they exist in the package only. Before anything runs, the launchers, `Invoke-ExchangeLogReport.ps1`, `Database-Storage.ps1`, the module (at import and at every engine initialization) and the package builder call `src\Test-PackageIntegrity.ps1`. The verifier authenticates the whole parent package, not only `src`. It requires a valid, timestamped signature of the owner on itself, on the manifest and on every PowerShell file, then checks every file of the manifest. C# sources, libraries and binaries are protected by their hashes in the separately owner-signed manifest, not individually Authenticode-signed. A missing, changed, duplicate or unknown file in the package, or a link (reparse point) in the package tree, stops the tool before the module, the SQLite libraries or the engine are loaded. The launchers and the entry scripts use `-Distribution`, which hashes `DistributionFiles` too and checks that `powershell\pwsh.exe` carries a Microsoft signature and that `sqlite-tools\sqlite3.exe` is the pinned SQLite tool. The module itself verifies `Files` only. `-DevelopmentMode` (unsigned continuous-integration builds) still enforces `Files` and the signatures, and reports that the binaries were not verified; it cannot be combined with `-Distribution`. A tree without `PackageIntegrity.psd1` is an unverified source checkout: the entry scripts accept it only with `-DevelopmentMode`. The launchers start a signed release only; an unsigned build (CI artifact, `Build-Standalone.ps1 -Unsigned`, a source checkout) is started with `powershell\pwsh.exe -NoLogo -NoProfile -File Invoke-ExchangeLogReport.ps1 -Mode Serve -DevelopmentMode` (or another `-Mode`; `Database-Storage.ps1 -DevelopmentMode <arguments>` for the storage tool). A launcher that refuses the package prints the reason, what to do and *The package could not be verified. Read the message above.*; `Start-Portal.cmd`, and `Run-Collector.cmd` started without arguments, then wait for a key so that the message can be read (a scheduled task, which passes arguments, does not wait). Generate the final manifest hashes only after the six script signatures and their real timestamps have been finalized; sign and timestamp the manifest separately last.
+- **Not protected, on purpose:** `config\ExchangeLogReport.config.psd1`, `config\ExchangeLogReport.paths.psd1` and `config\ExchangeLogReport.mail.credential` (you edit or generate them: they are data, never executed), and the folders `bin\`, `data\`, `logs\` and `reports\` at the package root. Any other file in `config\` is refused. Repository-only files (the Markdown guides and `docs\images\`) are allowed by exact name and are not part of a distribution. The integrity check does not claim that every byte of the folder is immutable.
 - **No compiled cache.** The engine is compiled in memory from the verified sources at every start (a few seconds more than before). A DLL in `bin\` is never loaded: no unsigned checksum next to it could prove where it came from. An existing `bin\` is ignored and can be deleted.
 - **Residual limits.** The check protects the files, not the account: an attacker who can change the package files can also replace the verifier. The files are verified, then read; an administrator who can write to the package folder during that interval is outside this protection. The check needs the owner certificate to be trusted on the server (the certificate chain and timestamp of Windows).
-- Developers: after any change of a protected file, rebuild the guides (`tools\Build-Documentation.ps1`), then regenerate and sign the scripts and the manifest. `tools\New-ExchangeLogReportPackage.ps1` never regenerates a protected file; it fails if the package does not pass the check.
+- Developers: after any change of a protected file, rebuild the guides (`tools\Build-Documentation.ps1`), sign the six scripts, then build in three steps: `tools\Build-Standalone.ps1` (builds the folder and refuses unsigned scripts), `tools\Build-Standalone.ps1 -Manifest <folder>` (writes the unsigned manifest; sign it, then copy it to `package\PackageIntegrity.psd1`) and `tools\Build-Standalone.ps1 -Seal <folder>` (verifies the signed package and the repository, then writes the ZIP). The builder never regenerates a protected file and never reads key material.
 
 <!-- icon: settings -->
 ## 6. Configuration
@@ -344,29 +347,41 @@ Built-in rules that need no configuration:
 | `Collection.StaleSourceHours` | 24 | HttpProxy, IIS front end or back end whose newest file is older than this is **stale** (warning, exit code 2). 0 = no check. SMTP and message tracking are not checked: a server without mail flow writes nothing there. |
 | `Collection.Parallelism` | 0 | Log files read at the same time (one thread each, every server and source together); one more thread writes the database. 0 = one per processor, 2 to 16. The read threads run at below-normal priority (the write thread at normal priority): on an Exchange server, Exchange keeps the processors it needs. Lower it on a collector that does other work (chapter 12). |
 | `Collection.MaxFilesPerServer` | 4 | Files of one server read at the same time (0 = no limit). Whatever the number of servers, at most `Parallelism` files are read at once; this spreads them over the servers, so that no server - nor the local disk when the tool runs on an Exchange server - serves all of them. |
+| `Collection.ResolveSids` | `$true` | Exchange logs token (OAuth) requests under the security identifier (SID) of the account. `$true`: the collector pairs each SID with the account from the logs themselves and merges its rows with the account's (9.3). `$false`: the SIDs stay as logged, nothing is gathered or renamed. No directory is queried in either case. |
+| `Collection.IdentityMapFile` | `''` | Optional PowerShell data file naming the SIDs the logs cannot name: `@{ 'S-1-5-21-...-1105' = 'CONTOSO\erin' }` (suggested name `config\ExchangeLogReport.identities.psd1`; a relative path is relative to the tool folder). Used only for a SID without evidence in the logs; an entry the logs contradict is ignored and named by the log and `-Mode Status`. A key that is not a SID, or a value that is not an account name, stops the configuration with the key named. |
+| `Collection.InternalDomains` | `@()` | Domains that are yours although the logs may not show them yet, e.g. `@('contoso.com')`: a domain and its sub-domains. A recipient of one of these domains is never *Sent to external* (9.5, 11.1). The collector also learns your domains from the logs on its own; `-Mode Status` lists them. |
+| `Collection.InternalConnectors` | `@()` | Send connectors that hand mail to a system inside your company (journaling, archiving, an internal relay): regular expressions on the connector name, e.g. `@('^Journal')`. Added to Exchange's own internal connectors (`Intra-Organization SMTP Send Connector`, `EdgeSync - Inbound to …`, `Inbound Proxy …`, and `Outbound to Office 365 - …`, the connector of the Hybrid Configuration Wizard to your mailboxes in Exchange Online). Mail through them stays *Handed off outside collection*. A change takes effect at the next collection, which reconciles the messages it changes. |
+| `Collection.EvidenceRescanMBPerRun` | 2048 | When SIDs were stored as logged while no evidence was gathered (`ResolveSids = $false`, or a database collected by a build without it), the ActiveSync, OWA and ECP HttpProxy lines already collected are read again for their evidence: at most this many MB per collection (the file that crosses the limit is read whole), continued by the next collections until done (9.3). 1 to 1048576. |
 | `Storage.RetentionDays` | **60** | Daily usage, operations, clients and devices, SMTP transactions, message tracking. |
 | `Storage.DetailRetentionDays` | **14** | Failed and slow requests, client sessions and their timeline, SMTP session transcripts. |
 | `Report.DefaultType` | `Usage` | `Usage` or `Detailed`. |
 | `Report.MaxDataAgeMinutes` | 90 | A report reads the new log lines first only when the last collection is older than this **and** the period ends after it. 0 = never on its own (`-Collect` only). See chapter 8. |
 | `Report.IncludeRoutingDetails` | `$true` | Message route and SMTP transcripts **in the CSV files** (always available behind a click in HTML). |
 | `Report.IncludeSessionDetails` | `$true` | Timeline of each client session **in the CSV files** (always available behind a click in HTML). |
-| `Report.MaxHtmlRows` | 200,000 | Per table in the HTML file; the CSV files are always complete. |
+| `Report.MaxHtmlRows` | 0 | Rows per table in the HTML file. 0 = every row of every table; 1,000 to 2,000,000 caps each table (a warning names the capped tables). The CSV files are always complete. A configuration written by 2.x still says 200,000 until you change it. |
+| `Report.HtmlLayout` | `Auto` | `Auto`, `SingleFile` or `Folder`. `Auto` writes one self-contained `ExchangeLogs.html` up to `Report.SingleFileMaxMB`, else a small page plus an `ExchangeLogs_data` folder next to it (keep the two together; zip both to send them). `-HtmlLayout` overrides it for one report. |
+| `Report.SingleFileMaxMB` | 200 | Largest single-file HTML report for `Auto`, 1 to 4,096 MB. A single file opens more slowly than a page with its data folder. |
+| `Report.ScratchFolder` | empty | Folder of the report work file (a few GB for a very large report); empty = the report folder, never the system temporary folder. Choose a local folder with enough free space; paths longer than 260 characters are supported (SQLite accepts 1,040 bytes for the full name). A folder that cannot be created, has less than 256 MB free or is too long stops the report with a message that names this setting. |
+| `Collection.DeferRollups` | `Never` | When the message rollups (the portal message list) are reconciled: `Never` = with every batch, `Auto` = the same except for an initial import of more than 5 GB into an empty database, `Always` = once at the end. Rollups left deferred by a stopped import make the portal answer 503 until the next collection drains them. |
 | `Report.MemoryBudgetMB` | 512 | Estimated report buffers and SQLite caches, 64 to 16,384 MB. Retained datasets spill to disk as the shared budget fills; this is not a hard process RAM limit. |
 | `Report.TimeZone` | Romance Standard Time | Native Windows Paris zone, with winter/summer rules; also used when this setting is absent. Explicit IANA IDs remain supported. On Windows without ICU/IANA lookup, `Europe/Paris` falls back to `Romance Standard Time`. |
 | `Report.Parallelism` | 0 | Independent report CPU workers, 0 to 16. 0 uses up to four workers, leaving one processor when possible; 1 is sequential. Does not change collection parallelism or multiply database connections. |
 | `Logging.RetentionDays` | **14** | Daily execution log files. |
 
+**Very large reports.** Large Detailed reports keep rows in a shared memory allowance and temporarily spool them to disk when it fills. `Report.MemoryBudgetMB` defaults to 512 MB for report buffers and SQLite caches; it is not a hard limit on the PowerShell process. `Report.Parallelism` controls report CPU workers (0 = automatic, up to four; 1 = sequential). On an Exchange server, start with one or two workers and leave memory available for Exchange. These settings do not change collection.
+
+Allow extra free space in the report folder (or on the drive of `Report.ScratchFolder` when it is set) for the temporary work file, and in the report folder for the report itself; slower disks may take longer when rows spill. HTML transcripts are loaded only for the rows shown, while the complete SMTP CSV is streamed separately. The temporary file is removed when the report finishes or reports an error. CSV files remain complete, even when the HTML row limit is reached. A `.partial` file indicates an interrupted export, not a ready report. `-NoCollect` skips collection, but still builds these details from one consistent database snapshot.
+
 <!-- icon: clock -->
 ## 7. Scheduled collection
 
-Run the collection every hour (Exchange closes HttpProxy files every hour), with the account of chapter 4.1.
+Run the collection every hour (Exchange closes HttpProxy files every hour), with the account of chapter 4.1. The task starts `Run-Collector.cmd`: it verifies the package, then starts the PowerShell of the package with the server garbage collector (`DOTNET_gcServer=1`, `DOTNET_GCHeapCount=4`, `DOTNET_GCNoAffinitize=1`) that the collection was measured with. A task that starts `powershell\pwsh.exe -File Invoke-ExchangeLogReport.ps1` directly works too, with the workstation garbage collector: a large collection is slower and uses less memory (a large first collection needs several GB).
 
 **A. On an Exchange server**, as SYSTEM:
 
 ```powershell
-$action  = New-ScheduledTaskAction -Execute 'E:\Tools\pwsh\pwsh.exe' `
-           -Argument '-NoProfile -ExecutionPolicy Bypass -File E:\Tools\ExchangeLogReport\Invoke-ExchangeLogReport.ps1 -Mode Collect' `
-           -WorkingDirectory 'E:\Tools\ExchangeLogReport'
+$action  = New-ScheduledTaskAction -Execute 'E:\Tools\ExchangeLogReport\Run-Collector.cmd' `
+           -Argument '-Mode Collect' -WorkingDirectory 'E:\Tools\ExchangeLogReport'
 $trigger = New-ScheduledTaskTrigger -Once -At (Get-Date).Date.AddHours(1) -RepetitionInterval (New-TimeSpan -Hours 1)
 Register-ScheduledTask -TaskName 'Exchange Log Report - collect' -Action $action -Trigger $trigger -User 'SYSTEM' -RunLevel Highest
 ```
@@ -386,9 +401,7 @@ The account needs the **Log on as a batch job** right on the administration serv
 **C. Scheduled reports (recurring reporting)**, with the account of the collection:
 
 ```powershell
-$pwsh = 'E:\Tools\pwsh\pwsh.exe'
-$tool = 'E:\Tools\ExchangeLogReport\Invoke-ExchangeLogReport.ps1'
-$run  = "$pwsh -NoProfile -ExecutionPolicy Bypass -File $tool"
+$run = 'E:\Tools\ExchangeLogReport\Run-Collector.cmd'
 
 # Every day at 07:00: the last 24 hours (Detailed report)
 schtasks /Create /F /RU SYSTEM /RL HIGHEST /TN "Exchange Log Report - daily report" `
@@ -463,7 +476,7 @@ server | -Server | One or more servers of the configuration (report and collecti
 | Case | The report |
 |---|---|
 | No collection in the database | Stops: *run -Mode Collect first* (exit code 1). The first collection (`BackfillDays` days) is never started by a report on its own. |
-| `-NoCollect` | Reads the database. |
+| `-NoCollect` | Reads the database, without reading any log. After an update of the tool, the first report (with or without `-NoCollect`) or `-Mode Status` upgrades an older database once, as the next collection would: it waits for a running collection (2 minutes at most), and stops with a message if the collection is still running. Measure that first upgrade on a copy of a large database (11.2). |
 | The period ends before the last collection | Reads the database: the data of the period is complete, whatever its age (`-Month`, `PreviousMonth`, a past incident). |
 | Last collection younger than `Report.MaxDataAgeMinutes` (90) | Reads the database: the hourly collection keeps it fresh. |
 | Older (the scheduled task is not running) | Reads the lines written since the last collection, then builds the report. When a collection is running (lock), it does not wait: it uses the data as it is. |
@@ -542,7 +555,7 @@ Mail = @{
 - **Activity by day**: client requests and messages per day.
 - **Tabs**: search box, filters, sortable columns, virtual scrolling (hundreds of thousands of rows), *Export view to CSV*. Click a row for all its details.
 
-### 9.1 The six tabs
+### 9.1 The seven tabs
 
 | Tab | One row per | Click a row |
 |---|---|---|
@@ -550,6 +563,7 @@ Mail = @{
 | **Failed and slow requests** (Detailed) | failed or slow request (all users of one server at one time: server incident) | every field |
 | **Users** | real user | protocols, clients and devices, client sessions (open one from there) |
 | **Operations** | protocol × operation, server-wide | every field |
+| **Authentication** | protocol × authentication type: users, clients, devices | its users and devices |
 | **Messages** (Detailed) | message, or mail refused during the SMTP conversation | recipients, route, SMTP transcripts |
 | **SMTP clients** | SMTP client (address + HELO) | its transactions (refusals first) with their transcript |
 
@@ -566,6 +580,8 @@ One line per session: user, protocol, client, address, front-end and back-end se
 > [!NOTE]
 > The paths are those seen by the collector: run the command from the collector (or adapt the path). Exchange deletes its logs after its own retention: an old file may be gone.
 
+**Known limit.** A client behind a network that gives it a new public address for each connection shows one EWS session per address (OWA and Autodiscover too), because those sessions are keyed by address and client; its ActiveSync and Outlook (MAPI) sessions stay one session.
+
 ### 9.3 Users, operations and SMTP clients
 
 The detail of a **user** lists its clients and devices (which Outlook builds and mobile devices are still used) and its client sessions. **Operations** shows which operation is slow or fails, with its share of the protocol. **SMTP clients** answers "which applications, devices and servers still send mail through these servers?" before a decommissioning: address, HELO name, connectors, volume, refusals, TLS and authentication; the detail lists the transactions with their SMTP transcript. Hops between the collected Exchange servers are not listed.
@@ -573,11 +589,51 @@ The detail of a **user** lists its clients and devices (which Outlook builds and
 The **authenticated user** is the account that Exchange logged for a successful SMTP `AUTH` of the session. It is shown beside the authentication mechanism and result, and it is not the envelope sender (`MAIL FROM`, which a client can set freely). The HELO name, the client address and the AUTH payload are never used to find it. Technical and machine identities (internal or service accounts) are not presented as human users. When the account is missing, ambiguous or cannot be proven, the report shows *Not available*; for a front-end submission, the account is matched to its back-end session by SID (11.1).
 ![SMTP clients](images/report-smtp-clients.png)
 
+**Authentication types.** The **Authentication** tab answers *are the ActiveSync, EWS and Outlook clients on OAuth, and who still uses Basic or Windows authentication?* The front end (HttpProxy) logs, for every request, the authentication module that accepted it (`AuthenticationType`), successful requests included; the collector keeps it as Exchange wrote it and the report maps it to a type when it is read. One row per protocol and type: users, clients (user × user agent × device), devices, requests, failures, active days, first and last seen, servers, and whether the protocol supports OAuth at all; click a row for its users and devices. The same type is in the **Authentication** column of the Users, Clients and Client sessions tables (a session that used two types shows both, most requests first; a user or a client shows its types in a fixed order: OAuth, Negotiate, Kerberos, NTLM, Basic, Forms, Certificate, ADFS, Anonymous, a token shown as logged, Unknown last), in the clients and devices of a user, and in the overview tile **Users on OAuth**: the share of the users with a recorded type that used OAuth at least once, with the users still seen on Basic and on Negotiate, NTLM or Kerberos in its note. The e-mail of a report has the same figures (`Authentication: 62 % of users on OAuth, 120 on Basic, 410 on Negotiate/NTLM/Kerberos`, the share rounded as the tile rounds it); the Detailed report lists **Users on Basic authentication** among its main problems, one row per protocol.
+
+Seen in production captures and public samples: `Negotiate`, `Basic`, `FBA`, `OAuth`. The other spellings of the table are accepted in case Exchange writes them; a token the table does not name is shown as logged and counted as not OAuth.
+
+| Logged token | Type | Meaning |
+|---|---|---|
+| `OAuth`, `Bearer`, `OAuth2` | **OAuth** | A token: hybrid modern authentication, or on-premises modern authentication with AD FS. |
+| `Negotiate` | **Negotiate** | Windows authentication, Kerberos or NTLM: the log does not say which. |
+| `Kerberos` | **Kerberos** | Windows authentication, Kerberos named by Exchange. |
+| `NTLM` | **NTLM** | Windows authentication, NTLM named by Exchange. |
+| `Basic`, `LiveIdBasic` | **Basic** | User name and password with every request. |
+| `FBA`, `Forms` | **Forms** | The OWA/ECP logon page (forms-based authentication). |
+| `Certificate`, `CertificateAuth`, `ClientCertificate` | **Certificate** | Certificate-based authentication. |
+| `Adfs` | **ADFS** | Claims-based authentication through AD FS (OWA, ECP). |
+| `Anonymous` | **Anonymous** | No user authenticated. |
+| *(empty)* | **Unknown** | No type recorded: rows aggregated before 3.0, IMAP4 and POP3 (no HTTP authentication), logons rejected by IIS, or a HttpProxy line whose column was empty. |
+| any other | *as logged* | A token Exchange wrote that the table above does not name: shown as it is, counted as not OAuth. |
+
+**Accounts logged as a SID.** When someone signs in with a token (OAuth), Exchange writes the account in its logs as a security identifier (SID, `S-1-5-21-...`) instead of a name. The same person signing in with a password, or to OWA, is written as `DOMAIN\sam`. Without help, one person would be two users: in the Users table, in the client sessions and in the **Users on OAuth** tile. The collector puts the two together using the logs alone (no directory, LDAP or Exchange cmdlet is used). It looks for log lines that show which name goes with a SID; such a line is called *evidence*:
+
+| Evidence | Where | What it shows | When it is enough |
+|---|---|---|---|
+| **anchor** | HttpProxy lines of ActiveSync, OWA and ECP | A signed-in name (`IsAuthenticated`) whose own mailbox is given as `Sid~<sid>`. On these protocols that mailbox is always the caller's own (OWA and ECP opening another mailbox, `/owa/<address>/`, are left out). | At once. |
+| **mapi-backend** | MAPI back end (`Logging\MapiHttp\Mailbox`) | The `UPN` the back end logs for the same Outlook window (same day, address, mailbox and client instance) that the front end logged under the SID. | When it is seen on two different days, or when `Collection.IdentityMapFile` names the same account. Lines without a client instance or a mailbox are not used. |
+| **file** | `Collection.IdentityMapFile` | A name you write for a SID. | Only when no log line names the SID. |
+
+Three rules keep this safe:
+
+1. **Everything must agree.** All the evidence of a SID must name the same account (same name, and same domain when both have one). If two lines name two people, of the same kind or of two kinds, the SID is **ambiguous**: nothing is merged and its requests stay under the SID. The mapping file never overrides the logs; an entry they contradict is ignored and reported.
+2. **A collection decides at its end.** During a collection, only the SIDs that were already resolved when it started are written under their account. The evidence it reads takes effect when every file has been read: the requests it wrote under a SID are then renamed. So the result does not depend on the order in which the files are read or on the number of threads.
+3. **A merge is final.** Merging adds the SID's rows to the account's, by the collector's own rules (daily figures added, client rows merged, client sessions that overlap joined into one), together with the `sam` and `sam@suffix` rows of that account. If a later collection makes the SID ambiguous, the rows already merged stay with the account; the new requests stay under the SID; the log and `-Mode Status` name the account so that you can check it.
+
+A SID resolved to a system account (`Noise.SystemUserPatterns`) has its requests removed as noise. A SID named before any of its token requests is **paired in advance**: nothing needs renaming, its later requests are written under the account directly, and its row in the **Identifiers** table reads *resolved (paired in advance)*. ActiveSync gives two **hints**, shown in the **Identifiers** table of the user but never used to merge: the account the device reports (`User=`), and the account the ActiveSync back end (`W3SVC2`) logs for a device seen under the SID (`eas-backend:`; the back end logs a token request under the SID itself, so that name comes from password requests of the same device, which may be another person's).
+
+When SIDs were stored before any evidence was gathered (`ResolveSids = $false`, or a database collected by a build without it), the collector reads the ActiveSync, OWA and ECP HttpProxy lines already collected once more, for their evidence only: at most `Collection.EvidenceRescanMBPerRun` per collection, continued by the next ones until every file is done or every stored SID is resolved. Only the files of configured servers are read, and the files of a server whose log folder the listing did not find wait for a collection that finds it. A database that never had a SID marks this as done at its first collection.
+
+A SID that nothing names stays a SID, marked **unresolved SID** in the tables. The **Identifiers** table of the user shows its status, its evidence and its hints; one line of `Collection.IdentityMapFile` names it. In practice, an account that only ever signs in with a token (OAuth) stays a SID until it signs in once to OWA, ECP or ActiveSync with a password (that gives anchor evidence), or until you name it in `Collection.IdentityMapFile`. `-Mode Status` counts the resolved SIDs, the SIDs paired in advance, and lists the unresolved and ambiguous ones with their hints, the back-end name that waits for a second day, and the account a SID no longer resolved was merged with.
+
+**OAuth possible** follows Microsoft's table of the protocols that support (hybrid) modern authentication ([Configure Exchange Server to use Hybrid Modern Authentication](https://learn.microsoft.com/en-us/microsoft-365/enterprise/configure-exchange-server-for-hybrid-modern-authentication)): *Yes* for MAPI over HTTP (`Mapi`), EWS, ActiveSync (`Eas`), OWA, ECP and OAB (the table) and for Autodiscover (the same page configures OAuth on its virtual directory); *No* for Outlook Anywhere (`RpcHttp`: move those clients to MAPI over HTTP), IMAP4 and POP3; blank for the protocols the table does not name (REST, remote PowerShell). A user or a device that used two types in the period is counted once under each (the Users table shows both types on one row, so nobody is listed twice there). Rows aggregated before 3.0 have no type and stay *Unknown* until the retention removes them; nothing is back-filled.
+
 ### 9.4 Messages
 
 ![Message route](images/report-message-route.png)
 
-The **Messages** tab keeps one line per message; the dialog shows the recipients with their own status, the **route** (every tracking event and SMTP session, in order, on every server, each SMTP session with its authenticated user, distinct from its sender) and the SMTP transcripts. Mail refused during the SMTP conversation (relay denied, unknown recipient: no Message-ID) has its own line.
+The **Messages** tab keeps one line per message; the dialog shows the recipients with their own status, the **route** (every tracking event and SMTP session, in order, on every server, each SMTP session with its authenticated user, distinct from its sender) and the SMTP transcripts. Mail refused during the SMTP conversation (relay denied, unknown recipient: no Message-ID) has its own line. A message that a Send connector handed to a mail server outside your organization, and that this server accepted, is *Sent to external* (9.5; 11.1 explains what the logs must show).
 
 ### 9.5 Statuses
 
@@ -597,15 +653,23 @@ The **Messages** tab keeps one line per message; the dialog shows the recipients
 | Failed at end | The last request of the session failed. |
 | Failed | No success at all. |
 
+**Known limit.** HttpProxy does not log which EWS operation a request is, so the long waits of EWS streaming notifications cannot be told apart: they count as slow requests and can make a session *OK (slow)*.
+
 | Message | Meaning |
 |---|---|
-| Delivered | Every recipient has a `DELIVER` event. |
-| Relayed / Delivered and relayed | Handed over (`SEND`, or `SENDEXTERNAL` from an Edge) to a server outside the collected servers (Edge, internet, other organisation, the mailbox servers seen from an Edge). |
+| Delivered | Every recipient has a `DELIVER` event in a collected mailbox server. |
+| Sent to external | Every recipient that was not suppressed was handed to a mail server outside your organization (internet, partner), which accepted it. What happens next is not in your logs. Not a failure. |
+| Delivered and sent to external | Some recipients have a `DELIVER` event; every other one was accepted by a mail server outside your organization. |
+| Delivered and handed off | Some recipients have a `DELIVER` event; the others were handed over (`SEND`, or `SENDEXTERNAL`) to a server the tool does not collect, or to a server the logs do not prove to be outside your organization (some may be *Sent to external*). |
+| Handed off outside collection | Every recipient was handed over to a server whose logs are not collected (another Exchange server, an Edge, Exchange Online in a hybrid setup through the `Outbound to Office 365 - …` connector, an internal relay) or that the logs do not prove to be outside your organization; the end of the route is not visible. A recipient marked *(Sent to external)* in the same message was accepted outside. Not a failure. |
+| Suppressed (by design) | Exchange chose not to deliver: out-of-office and automatic replies or forwards that must not leave the organization, suppressed recipients, a distribution list that expanded to nobody. |
 | Failed / Partially failed | `FAIL` for all / some recipients (see their status and the NDR reason). |
 | Deferred | Last event `DEFER`: still in a queue. |
-| Dropped | `DROP` (transport rule, malware…). |
+| Dropped | `DROP` (transport rule, malware…); a distribution list replaced by its members (`EXPAND` then `DROP` with `RESOLVER.GRP.Expanded`) is not a drop: its recipients show *(Expanded)* and are not counted. |
 | In transit | Received, nothing final yet (or the next server is not collected). |
 | Rejected (SMTP) / Deferred (SMTP) / Not completed (SMTP) | Refused (`5xx` / `4xx`) during the SMTP conversation, or the client left before the data: no Message-ID, no tracking event (relay denied, unknown recipient, size limit...). |
+
+After a recipient: *(Handed off)*, *(Sent to external)*, *(Suppressed)*, *(Expanded)*. Versions before 3.0 wrote *Relayed*, *Delivered and relayed* and *(Sent)*: update a saved CSV filter on those words. The route is in travel order, grouped by **submission** (a message entering the organization from a client, a rule, a forward or a list expansion starts one; the CSV shows `| submission n`), with milliseconds; agent steps are folded, a `SEND` then `DELIVER` of the same hop is one step, repeated `DEFER` events are one step `×n`. A stored SMTP transcript is the one transaction with the opening and closing of its session; earlier transactions of the session are a one-line marker.
 
 | SMTP transaction | Meaning |
 |---|---|
@@ -620,7 +684,7 @@ The **Messages** tab keeps one line per message; the dialog shows the recipients
 | Not applicable | No `AUTH` in the session: the mechanism shows *None*. |
 | Missing | No account proven for this session: shown as *Not available*. |
 | Ambiguous | Conflicting or several candidate accounts: none shown. |
-| Legacy | Stored before this version: not back-filled, shown as *Not available*. |
+| Legacy | Stored before the authenticated user was collected: not back-filled, shown as *Not available*. |
 
 ### 9.6 Edge Transport report
 
@@ -628,7 +692,7 @@ When **every server of the report is an Edge Transport server** (an Edge's own t
 
 ```cards
 chart | Overview | Edge servers with mail flow, inbound SMTP (and refused during the SMTP conversation), outbound SMTP (deferred or failed), messages; server cards and daily chart in SMTP received / sent.
-mail | Messages (Detailed) | One row per message through the Edge, inbound and outbound, with its route; handed over to the organization or to the internet = *Relayed* (green). Relay denied, blocked sender or recipient: *Rejected (SMTP)*.
+mail | Messages (Detailed) | One row per message through the Edge, inbound and outbound, with its route; handed to the internet = *Sent to external* (green), handed over to the organization = *Handed off outside collection* (green). Relay denied, blocked sender or recipient: *Rejected (SMTP)*.
 people | SMTP clients | Who sends mail to the Edge: internet servers and partners, and the mailbox servers of the organization (outbound mail handed over to the Edge).
 server | SMTP destinations | Where the Edge sends mail: Exchange Online, the MX of the internet domains, the mailbox servers of the organization (EdgeSync). Remote host (name of its 220 banner), connector, sent, deferred, failed, TLS, last error; transactions and transcripts behind a click.
 ```
@@ -645,17 +709,18 @@ Each execution writes a new folder `<FilePrefix>_<Type>_<period>[_<users>]_<time
 | `….html` | ✓ | ✓ | Self-contained dashboard (no internet access needed). |
 | `…-Servers.csv` | ✓ | ✓ | One row per configured server: verdict, real users, requests, failures, protocols, SMTP, messages. |
 | `…-Daily.csv` | ✓ | ✓ | Per day and server. |
-| `…-Users.csv` | ✓ | ✓ | One row per real user: protocols, clients, servers, failures, last IP and client. |
-| `…-Clients.csv` | ✓ | ✓ | One row per user × protocol × client (user agent or ActiveSync device): versions, devices, addresses, servers. |
+| `…-Users.csv` | ✓ | ✓ | One row per real user: protocols, clients, servers, failures, last IP and client, authentication types (last column). |
+| `…-Clients.csv` | ✓ | ✓ | One row per user × protocol × client (user agent or ActiveSync device): versions, devices, addresses, servers, authentication types (last column). |
 | `…-Operations.csv` | ✓ | ✓ | One row per protocol × operation: volume, failure rate, slow requests, average and maximum latency. |
+| `…-Authentication.csv` | ✓ | ✓ | One row per protocol × authentication type (9.3): users, clients, devices, requests, failures, active days, servers, OAuth possible. |
 | `…-SmtpClients.csv` | ✓ | ✓ | One row per SMTP client (address + HELO): volume, refusals, TLS, authentication, authenticated users, senders. |
 | `…-ClientAccess-Daily.csv` | ✓ | ✓ | Per day × server × user × protocol (the detail behind the usage views). |
-| `…-ClientSessions.csv` |  | ✓ | **One row per client session** with its outcome (`Timeline` column if `IncludeSessionDetails`). |
+| `…-ClientSessions.csv` |  | ✓ | **One row per client session** with its outcome and its authentication types (`Authentication`, before the `Timeline` column if `IncludeSessionDetails`). |
 | `…-ClientAccess-Requests.csv` |  | ✓ | Every failed request with its **resolution**, every **slow** success, every request of `FullDetailUsers`. |
 | `…-Messages.csv` |  | ✓ | **One row per message** with status and route (`Route` column if `IncludeRoutingDetails`), plus the mail refused during the SMTP conversation. |
 | `…-SmtpSessions.csv` |  | ✓ | One row per SMTP transaction, every hop included, with its authentication mechanism, result, authenticated user and identity evidence (`Transcript` column if `IncludeRoutingDetails`). |
 
-Edge report (9.6): `Servers` and `Daily` without the client access columns, `SmtpClients`, **`SmtpDestinations`** (one row per destination: remote address, remote host, send connector, sent, deferred, failed, TLS, last error) and, Detailed, `Messages` and `SmtpSessions`. No `Users`, `Clients`, `Operations`, `ClientSessions` or `ClientAccess-*` file.
+Edge report (9.6): `Servers` and `Daily` without the client access columns, `SmtpClients`, **`SmtpDestinations`** (one row per destination: remote address, remote host, send connector, sent, deferred, failed, TLS, last error) and, Detailed, `Messages` and `SmtpSessions`. No `Users`, `Clients`, `Operations`, `Authentication`, `ClientSessions` or `ClientAccess-*` file.
 
 > [!TIP]
 > The CSV files are always complete; the HTML file shows up to `MaxHtmlRows` rows per tab. `SmtpSessions.csv` has every SMTP hop: in the HTML report, these transactions are in the route of their message and in the detail of their SMTP client.
@@ -698,7 +763,8 @@ file | One row per message | status, recipients, route, transcripts
 - **IMAP/POP front end ↔ back end**: the back end only knows the front-end server: its connections are attached, at the end of the collection, to the session of the same user and protocol whose proxy target is that back end, at the same time; otherwise they get their own session *via* the front end.
 - **SMTP submission (587)**: the real client of a session proxied by a front end is read from `XPROXY` on the mailbox server. The authenticated user of such a session is matched between the front-end and the mailbox server by SID, and shown only when that match is unambiguous.
 - **SMTP authenticated user**: the account that Exchange logged for a successful `AUTH` of the same session (`* data=<account> context=authenticated`). It is never decoded from the AUTH payload and never derived from `MAIL FROM`, HELO or the client address.
-- **Identities**: `sam` or `sam@upn-suffix` (IMAP, POP, back-end logs) becomes `domain\sam` when that account is already known (and not ambiguous between two domains).
+- **External delivery**: a recipient is *Sent to external* when one `SENDEXTERNAL` event (Exchange's own word for a hand-off by a Send connector outside its transport services) proves it on its own: its next host (`server-hostname`, else `server-ip`) is not a collected server (a configured server, a server of the same message, or an address the logs show for a collected server: the `server-ip` of an event whose `server-hostname` names one), its connector is not internal (`Intra-Organization SMTP Send Connector`, `EdgeSync - Inbound to …`, `Inbound Proxy …`, `Outbound to Office 365 - …` and `Collection.InternalConnectors`; an event without a connector counts as internal), the remote server accepted the recipient (its `recipient-status` is a `2xx` reply), and the recipient's domain is known and is neither one of yours nor a sub-domain of one. Your domains are learnt from the logs, the strongest sources first: the recipients of `DELIVER` events (a mailbox here received the mail) and of `Incoming` `RECEIVE` events (mail from outside addressed to you, the only source of an Edge) and the sender of `STOREDRIVER` `SUBMIT` and `RECEIVE` events (a mailbox here sent it), at most 4,096 domains; then the sender of any other `Originating` event (an application relay is *Originating* too), only while fewer than 1,024 are known; plus `Collection.InternalDomains`. When a domain of the first sources arrives and 4,096 are known, the list may miss one of yours: the status is turned off for the database (no recipient is *Sent to external*), the collection log warns and `-Mode Status` says so. Anything less, a `SEND`, a recipient without a usable domain, or a database where no domain is known yet, stays *Handed off*. A hybrid remote mailbox is resolved to its routing address in the tenant (`user@tenant.mail.onmicrosoft.com`) and handed to Exchange Online through the connector of the Hybrid Configuration Wizard: it stays *Handed off* because of that connector, not because of its domain (any company's tenant uses `onmicrosoft.com`). The rules a row was written with are stored with the data, and every reader (report, portal, verification) gives the same status. Other configured lists, the first known domain or a full list rewrite the rules with the next commit and reconcile again every message with a `SENDEXTERNAL` event. A domain or a server address learnt later can only turn *Sent to external* into *Handed off* for its own recipients: the collection keeps them in `metadata` (`mailflow_pending`) with each commit and applies them once, at its end, with one read of the `SENDEXTERNAL` events that reconciles only the messages with a recipient in those domains or their sub-domains, or sent to those addresses; an interrupted collection leaves them to the next one, and the stored rows always match the stored rules. The result does not depend on the order in which the logs are collected (below the bound of the `Originating` senders). A connector of your company that Exchange treats as external (journaling, archiving, a relay inside the network) shows *Sent to external* until you list it in `Collection.InternalConnectors`; the route names the connector.
+- **Identities**: `sam` or `sam@upn-suffix` (IMAP, POP, back-end logs) becomes `domain\sam` when that account is already known (and not ambiguous between two domains). A SID (the account of a token request) becomes its account when the evidence of 9.3 agrees (`identity_map`). A collection writes under the account only the SIDs resolved when it started; the evidence it reads is applied at its end, so the result does not depend on the order of the files. The rows stored under a SID are then renamed and merged by the same rules as one collection: the daily upsert, the client merge (the SID's device type, else the account's; the account's software, else the SID's), the merge of sessions a request bridges; one transaction per SID, at the start and at the end of each collection, then the `sam` and `sam@...` rows of that account. A MAPI back-end address whose name differs from the account's `sam` still joins no front-end session. When a later collection makes a merged SID ambiguous, its new rows stay under the SID and the rows already merged stay with the account: a merge is never split again, and the log and `-Mode Status` name that account.
 
 ### 11.2 Data model
 
@@ -707,16 +773,23 @@ file | One row per message | status, recipients, route, transcripts
 | `access_usage` | Day × server × user × protocol: requests, successes, errors, slow, bytes, durations, first/last time, last IP and client | `RetentionDays` |
 | `access_event` | Failed and slow requests (and watched users): every field useful for troubleshooting, recovery time | `DetailRetentionDays` |
 | `access_action` | Day × server × protocol × operation: requests, failures, slow, total and maximum duration | `RetentionDays` |
-| `access_client` | Day × user × protocol × address × user agent × device: requests, failures, servers | `RetentionDays` |
-| `client_session` | One row per client session: counters, servers, client, errors, back-end information | `DetailRetentionDays` |
+| `access_client` | Day × user × protocol × address × user agent × device × authentication type as logged (`auth_type`, `''` when none): requests, failures, servers | `RetentionDays` |
+| `client_session` | One row per client session: counters, servers, client, errors, back-end information, the authentication types seen with their request counts (`auth_modes`, `Negotiate=57;OAuth=3`) | `DetailRetentionDays` |
 | `session_step` | Timeline of a session: one JSON row per session and log file read (with the log file of each step) | `DetailRetentionDays` |
 | `iis_status` | IIS sub-status / Win32 status of failed proxied requests | `DetailRetentionDays` |
 | `smtp_transaction` | SMTP transactions with their authentication mechanism, result, authenticated user and identity evidence; `transcript` (compressed, 2.0.0) | `RetentionDays` (identity kept after the transcript expires); transcript `DetailRetentionDays` |
 | `message_event` | Tracking events of real messages | `RetentionDays` |
+| `smtp_auth_fragment` | Bounded, disk-backed evidence parts of long SMTP connections (never an AUTH payload, challenge or token) | `DetailRetentionDays` |
+| `message_rollup`, `message_rollup_value`, `message_rollup_dirty` | One consolidated row per message identity (status, recipients, servers, events, route counters) for the portal lists, with its dictionary of exact texts and the queue of identities to reconcile (schemas 7 to 13; schema 12 reads the handed-off and suppressed recipient rules, schema 13 the external status) | as the source rows |
+| `smtp_client`, `smtp_client_value`, `smtp_client_hour`, `smtp_client_pending`, `smtp_client_dirty` | SMTP clients pre-aggregated per client and hour for the portal, their dictionary of exact texts and the two queues of transactions to reconcile (schema 11) | as the source rows |
+| `mail_flow_hour`, `mail_flow_dirty` | Mail flow per UTC hour and server for the portal overview: tracking events, deliveries, failures, distinct messages of the hour, SMTP received, sent and rejected, first and last times (counters and server names only), and the queue of hours to recompute (schema 12) | as the source rows |
+| `source_fields` | Dictionary of the `#Fields` header text of the log files (schema 10) | as long as the file exists |
 | `source_file` | Read position of every log file, by file identity: its path on its own server, case ignored (`\\EXCH01\D$\Logs\x.log` and `D:\Logs\x.log` are the same file, read once) | as long as the file exists |
+| `identity_map` | One row per security identifier logged as the user of token requests: status (`resolved`, `unresolved`, `ambiguous`), the account (when resolved, or the account its rows were merged with before it stopped being resolved), the evidence (`anchor:contoso\erin=312;mapi-backend:erin@contoso.com=40`, then the first and last day of the back-end evidence, `days:mapi-backend=20390-20391`), the hints (the account the device reported, `eas-backend:` the account the ActiveSync back end logged for its device), the requests seen, first and last seen (requests or evidence) (3.0.0, a source dictionary of the collector; a database of an earlier 3.0 build gets it at its next writable open) | `RetentionDays` after it was last seen |
+| `metadata` | Schema version, hash algorithm, span bounds, and (schema 13) the rules of the external status: `mailflow_accepted_domains` (the domains learnt from the logs, `;` between them, sorted), `mailflow_rules` (JSON: rule version, Exchange's internal connectors, `Collection.InternalConnectors`, `Collection.InternalDomains`, the collected servers and their addresses, `saturated` when the list of learnt domains is full) and, while a collection runs or after an interrupted one, `mailflow_pending` (JSON: the domains and server addresses learnt and not applied yet) | kept |
 | `noise`, `run` | Removed lines per reason and execution | `RetentionDays` |
 
-Raw log lines are **never** stored. A database of an older version is upgraded automatically (new tables and columns only). Since 2.0.0, the SMTP transcripts and the session timelines are written compressed (Deflate, about 6 times smaller); those of an older version stay readable as they are. The schema 5 to 6 upgrade (SMTP authenticated user) only adds columns and indexes: no reset, no rebuild, and the log read positions are kept, so earlier SMTP rows stay *Not available* (*Legacy*) and are not back-filled. New AUTH payloads, challenges and tokens are redacted before storage. Transcripts stored by an earlier version may still hold AUTH data: reports and CSV exports redact them when written, but the existing database content is not rewritten.
+Raw log lines are **never** stored. A database of an older version is upgraded automatically (new tables and columns only). Version 3.0 upgrades a schema 6 database to 13 (the first collection or report with 3.0; about 3 to 5 minutes of exclusive write access for a 20 GB database; each schema step is one transaction, so an interrupted upgrade starts again from the last committed schema). The step from 12 to 13 watches three more columns in the rollup triggers, then reads every stored tracking event once (it learns your domains and the addresses of the collected servers, and lists the messages with a `SENDEXTERNAL` event) and reconciles again only those messages (ids kept), in the same transaction: its time is bounded by the size of `message_event` and by the number of messages with a `SENDEXTERNAL` event, and the WAL grows by about their rollup rows; on a large database, measure it on a copy first. The first report, `-Mode Status` or collection with 3.0 runs it; a report or `-Mode Status` takes the collector lock for it, waits up to 2 minutes for a running collection and otherwise stops with *run this command again when the collection has finished*. A 3.0 database cannot be opened by 2.x again; the portal never upgrades a database. Since 2.0.0, the SMTP transcripts and the session timelines are written compressed (Deflate, about 6 times smaller); those of an older version stay readable as they are. The schema 5 to 6 upgrade (SMTP authenticated user) only adds columns and indexes: no reset, no rebuild, and the log read positions are kept, so earlier SMTP rows stay *Not available* (*Legacy*) and are not back-filled. New AUTH payloads, challenges and tokens are redacted before storage. Transcripts stored by an earlier version may still hold AUTH data: reports and CSV exports redact them when written, but the existing database content is not rewritten.
 
 <!-- icon: database -->
 ## 12. Volumes and performance
@@ -737,10 +810,12 @@ Main noise found: Managed Availability probes (1.5 million lines), back-end traf
 
 > [!NOTE]
 > In production (1–3 GB of logs per day and server) the database grows with the number of **real users** and **messages**, not with the log volume: about one `access_usage` row per user, protocol, server and day, one `message_event` row per tracking event of a real message. For very large mail volumes, lower `RetentionDays` or run one database per site.
+>
+> The authentication type (3.0) adds about 0.6 % to `access_client` for its key column and 3 to 5 % with real types (a client that changes type during a day has one row per type), and 3.1 % (11 bytes a row) to `client_session` (measured on a synthetic store of 420,000 client rows and 200,000 sessions).
 
 ### 12.1 Collection performance (2.0.0)
 
-With 1.6.1, the first collection in a production environment took hours. A customer capture, per server and for 14 days of logs: HttpProxy 4 GB in 15 to 23 minutes, message tracking 1 GB in **45 minutes (409 KB/s)**. Reading was not the problem: the IIS front-end logs, 99 % noise, were read at 74 MB/s. The time was spent in SQLite for each **kept** line, on one thread: an index lookup and a write per row, one transaction per file, the client sessions read again and rewritten for each file, and a 2 MB page cache.
+With 1.6.1, the first collection in a production environment took hours. A production capture, per server and for 14 days of logs: HttpProxy 4 GB in 15 to 23 minutes, message tracking 1 GB in **45 minutes (409 KB/s)**. Reading was not the problem: the IIS front-end logs, 99 % noise, were read at 74 MB/s. The time was spent in SQLite for each **kept** line, on one thread: an index lookup and a write per row, one transaction per file, the client sessions read again and rewritten for each file, and a 2 MB page cache.
 
 What 2.0.0 changes:
 
@@ -754,9 +829,9 @@ What 2.0.0 changes:
 |---|---|---|
 | Load test (12.2), 2 servers × 14 days: 14.8 GB, 9,596 files, 33.1 million lines, 7.0 million kept. PC with 8 logical processors and an SSD | **29 min 45 s**, database 2,562 MB | **3 min 51 s to 4 min 21 s** (7 to 8 times faster), database 2,116 MB, peak memory 2.3 GB |
 | Lab, EXCH01 (4 vCPU, 16 GB, Standard HDD): the same logs of EXCH01 and EXCH02 through `\\<server>\E$`, 14.6 GB (14.4) | **4 h 55 min 49 s**, database 2,522 MB | **6 min 02 s** (49 times faster), database 2,212 MB |
-| Lab, EXCH01 only (its logs, 7.4 GB) | HttpProxy **1 h 04 min to 1 h 11 min**, MAPI 14 to 15 min, message tracking **44 to 46 min (259 to 273 KB/s)**: the customer capture, reproduced | read with EXCH02 in the line above |
+| Lab, EXCH01 only (its logs, 7.4 GB) | HttpProxy **1 h 04 min to 1 h 11 min**, MAPI 14 to 15 min, message tracking **44 to 46 min (259 to 273 KB/s)**: the production capture, reproduced | read with EXCH02 in the line above |
 | Lab, EXCH02 only, on EXCH02 (local disk, 7.2 GB) | — | **2 min 28 s** with 16 KB pages, 3 min 06 s with 4 KB pages (end-of-run WAL copy: 22 s instead of 58 s) |
-| The volume of a second customer capture: 4 servers × 14 days, 33.3 GB, 19,196 files, 76.2 million lines, 16.3 million kept (12.2, `-Scale 1.15`). PC with 8 logical processors and an SSD | the customer collection took **6 h 36 min** on this volume (31.6 GB, 69.3 million lines, 4 servers) | **13 min 18 s**, database 4.6 GB, peak memory 2.9 GB |
+| The volume of a second production capture: 4 servers × 14 days, 33.3 GB, 19,196 files, 76.2 million lines, 16.3 million kept (12.2, `-Scale 1.15`). PC with 8 logical processors and an SSD | the production collection took **6 h 36 min** on this volume (31.6 GB, 69.3 million lines, 4 servers) | **13 min 18 s**, database 4.6 GB, peak memory 2.9 GB |
 | Next collection, nothing new (4,799 files) | — | **under 1 s** |
 
 The hourly collection reads one hour of logs: a few seconds per server.
@@ -766,14 +841,14 @@ The hourly collection reads one hour of logs: a few seconds per server.
 Two tools in `tools\` measure the collection without an Exchange server:
 
 ```powershell
-# Logs with the volumes of the customer capture (about 7 GB per server for 14 days); deterministic content
-.\tools\New-ExlSyntheticLogs.ps1 -Path D:\ElrSim -Server SIM01,SIM02 -Days 14
+# Logs with the volumes of the production capture (about 7 GB per server for 14 days); deterministic content
+.\tests\support\New-ExlSyntheticLogs.ps1 -Path D:\ElrSim -Server SIM01,SIM02 -Days 14
 
 # A month where EXCH03 is barely used and EXCH04 not at all (decommissioning review, screenshots of chapter 9)
-.\tools\New-ExlSyntheticLogs.ps1 -Path D:\ElrDemo -Server EXCH01,EXCH02,EXCH03,EXCH04 -Days 30 -Scale 0.05 -Users 800 -Profile Decommission
+.\tests\support\New-ExlSyntheticLogs.ps1 -Path D:\ElrDemo -Server EXCH01,EXCH02,EXCH03,EXCH04 -Days 30 -Scale 0.05 -Users 800 -Profile Decommission
 
 # On every Exchange server of a lab, its own logs only (identical to a full run), then read through E$
-.\tools\New-ExlSyntheticLogs.ps1 -Path E:\ElrSim -Server EXCH01,EXCH02 -Only EXCH01 -Days 14
+.\tests\support\New-ExlSyntheticLogs.ps1 -Path E:\ElrSim -Server EXCH01,EXCH02 -Only EXCH01 -Days 14
 
 # First collection (-Fresh), the same console table as -Mode Collect, then duration, rate, database size and statistics
 .\tools\Measure-ExlCollection.ps1 -LogPath D:\ElrSim -WorkPath D:\ElrWork -Fresh -Set 'Collection.BackfillDays=15'
@@ -824,7 +899,7 @@ What 2.0.0 changes:
 
 The first opening of a 1.x database by 2.0.0 builds `ix_msg_flow` and `ix_smtp_flow`: about 10 s for 3.4 million tracking events on the load-test PC, a few minutes for a large database on a slow disk.
 
-**Large Detailed reports (local, unreleased correction).** `-NoCollect` skips log collection, not the reconstruction of report details. Session JSON and timelines are reconstructed in batches bounded by count (128) and estimated bytes; tracking and SMTP are correlated one message at a time. Datasets share a memory allowance: the largest retained dataset is spooled to `.report-<id>.tmp` in the new report folder when that allowance fills. HTML is written progressively in chunks of at most 5,000 rows, normally about 1 MB of estimated row memory (smaller with a low budget and many workers); a single larger row remains complete. CSV files are never truncated, and `MaxHtmlRows` still applies only to HTML.
+**Large Detailed reports.** `-NoCollect` skips log collection, not the reconstruction of report details. Session JSON and timelines are reconstructed in batches bounded by count (128) and estimated bytes; tracking and SMTP are correlated one message at a time. Datasets share a memory allowance: the largest retained dataset is spooled to `.report-<id>.tmp` in the new report folder when that allowance fills. HTML is written progressively in chunks of at most 5,000 rows, normally about 1 MB of estimated row memory (smaller with a low budget and many workers); a single larger row remains complete. CSV files are never truncated, and `MaxHtmlRows` still applies only to HTML.
 
 `Report.MemoryBudgetMB` defaults to **512 MB**. One quarter is reserved for the source SQLite cache (at most 256 MB), 8 MB for the temporary SQLite cache, half less 8 MB for retained row estimates, and one quarter for ordered in-flight CPU work. This is a budget for these components, **not a ceiling for the PowerShell process**: runtime/GC overhead, identity aggregates, loader lookahead and an individually oversized row/session can require more memory. The caller's SQLite cache setting is restored after a report.
 
@@ -848,7 +923,7 @@ Keep enough free disk space for both the final exports and the temporary dataset
 
 SQLite connections normalize Windows drive and UNC paths to extended form internally, including the report-local scratch database and collector worker connections. Deeply nested database and report folders can exceed the legacy 260-character path boundary; configured locations, displayed paths and access controls are unchanged.
 
-Initial comparison of the **disk-only** correction on an unchanged synthetic database (2 servers, 7 days, 1.8 GB of source logs, 118,275 sessions): peak working set **1,567 -> 619 MiB**, generation **28 -> 80 s**. The complete CSV contents and decoded HTML details were unchanged (messages with the same timestamp can have a different tie order). The actual `-Range Last7Days -ReportType Detailed -NoCollect` entry command then completed at **546 MiB** peak, without changing the database. These are PC measurements of the previous disk-only candidate, not measurements of the configurable hybrid/parallel engine or a universal RAM/time guarantee.
+Initial comparison of the **disk-only** correction on an unchanged synthetic database (2 servers, 7 days, 1.8 GB of source logs, 118,275 sessions): peak working set **1,567 -> 619 MiB**, generation **28 -> 80 s**. The complete CSV contents and decoded HTML details were unchanged (messages with the same timestamp can have a different tie order). The actual `-Range Last7Days -ReportType Detailed -NoCollect` entry command then completed at **546 MiB** peak, without changing the database (a database already of the current version: on an older one, the first report upgrades it once, see 11.2). These are PC measurements of the previous disk-only candidate, not measurements of the configurable hybrid/parallel engine or a universal RAM/time guarantee.
 
 <!-- icon: wrench -->
 ## 13. Modifying the tool
@@ -870,7 +945,7 @@ Initial comparison of the **disk-only** correction on an unchanged synthetic dat
 ```steps
 Test | `Invoke-Pester -Path .\tests\ExchangeLogReport.Tests.ps1 -Output Detailed` — no Exchange needed: the logs are generated with the exact Exchange formats.
 Build the guides | Before the integrity manifest is generated and signed: `.\tools\Build-Documentation.ps1` writes `package\docs\ExchangeLogReport-Guide.html` and `package\docs\ExchangeLogReport-UserGuide.html` (self-contained: images inline).
-Build the package | `.\tools\New-ExchangeLogReportPackage.ps1` — checks the signed source, copies the protected files unchanged (it does not rebuild the guides), checks the copy; no database, no reports, no logs.
+Build the package | `.\tools\Build-Standalone.ps1` — builds the folder from the signed sources (it does not rebuild the guides), then `-Manifest` and `-Seal` after the owner signs the manifest; no database, no reports, no logs.
 ```
 
 <!-- icon: beaker -->
@@ -942,7 +1017,7 @@ Both versions ran on the same collector, with the same logs (9,597 files, 14.6 G
 | Detailed report, 7 days, warm | 52 s | 45 s | × 1.2 |
 | Database | 2,522 MB | 2,212 MB | − 12 % |
 
-1.6.1 reproduced the customer capture: on EXCH01, HttpProxy took 1 h 04 min (1.1 MB/s) and message tracking **43 min 58 s (273 KB/s)**, the 45 minutes of the capture. On EXCH02, they took 1 h 27 min and 54 min. In 2.0.0, every source of both servers is read at the same time. A report is mostly disk reads (cold) or processor (warm): on a hard disk, keep the database on the fastest disk of the collector.
+1.6.1 reproduced the production capture: on EXCH01, HttpProxy took 1 h 04 min (1.1 MB/s) and message tracking **43 min 58 s (273 KB/s)**, the 45 minutes of the capture. On EXCH02, they took 1 h 27 min and 54 min. In 2.0.0, every source of both servers is read at the same time. A report is mostly disk reads (cold) or processor (warm): on a hard disk, keep the database on the fastest disk of the collector.
 
 Run on its own, EXCH02 collected its logs in 2 min 03 s to 2 min 23 s (4 or 3 parse threads), plus 23 s to copy the WAL at the end. With 4 KB pages, that copy took 58 s.
 
@@ -960,6 +1035,121 @@ E-mail, from EXCH02 to the receive connectors of EXCH01 (Exchange Server SE, sel
 | Usage report, 7 days, `-NoCollect -SendMail`, Basic | Sent in 6.9 s, `ExchangeLogs.html` (1.2 MB) attached. |
 | Detailed report, 24 hours, `Mail.Enabled`, Kerberos | Sent in 14.3 s, HTML (3.3 MB) attached. |
 | Detailed report, 7 days, `Attach = 'Zip'`, `MaxAttachmentMB = 1` | Sent in 34 s without attachment: the zip of the report (73.2 MB) is larger than the limit. The console and the message say so, and the message gives the folder of the report. |
+# Part V · The portal
+
+<!-- icon: layers -->
+## 15. The portal
+
+The portal (`Start-Portal.cmd`, `-Mode Serve`) is a local, on-demand consumer of the retained SQLite evidence. This chapter supplements the Usage and Detailed explanations: the collector still owns ingestion, reconciliation and retention. The illustrated operator procedure is [chapter 6 of the user guide](ExchangeLogReport-UserGuide.md#6-c--investigate-in-the-browser).
+
+### 15.1 The lifecycle and the two consumers
+
+| Operation | Reads | Writes / boundary |
+|---|---|---|
+| Explicit `Discover` | The designated Exchange configuration and log paths, under the existing permissions | Collector discovery state; never started by the portal |
+| Scheduled or explicit `Collect` | The new log lines of the configured sources | SQLite source evidence, correlation and derived structures, collector state, through the one writer |
+| `Report … -NoCollect` | The collected database | Static Usage or Detailed HTML and CSV files; mail only when configured or requested. An older database is upgraded once first, under the collector lock (11.2) |
+| `Serve` | Retained SQLite evidence, through bounded read-only requests | HTTP responses and deliberate browser CSV downloads: no new source rows, no migration, no report snapshot |
+
+In short: **Exchange logs → collector → SQLite commits → either static reports or the local API → the portal views.** No static report must exist before the first page. Noise removal is not anonymisation, and a different presentation does not restore evidence that retention removed.
+
+### 15.2 Entry points and database identity
+
+Use the whole package. `Run-Collector.cmd` verifies it and starts the PowerShell of the package with the collection garbage collector settings. `Start-Portal.cmd` verifies it and runs `Invoke-ExchangeLogReport.ps1 -Mode Serve`; `-DatabasePath <absolute path>` selects a compatible copy, `-Port` an exact local port (the portal shows the Detailed report's own page, built from `templates\`; the days of the portal are days of `Report.TimeZone` of the configuration), `-DevelopmentMode` allows an unverified source checkout. The launchers start a signed release only; an unsigned build (CI artifact, `Build-Standalone.ps1 -Unsigned`, a source checkout) is started with `powershell\pwsh.exe -NoLogo -NoProfile -File Invoke-ExchangeLogReport.ps1 -Mode Serve -DevelopmentMode` (chapter 5.1). `Database-Storage.cmd` is the storage tool, separate from the portal: it has no web endpoint.
+
+The configuration is still `config\ExchangeLogReport.config.psd1`. A portal `-DatabasePath` selects the database of the portal only; it does not change `Storage.DatabasePath` of the scheduled collection, and a copy does not show the later writes to the original. A live database in WAL mode needs a consistent SQLite backup, not a copy of its main file alone.
+
+The portal accepts the current schema (13) and never migrates a source. Schema 12 or older is refused until a writable collection or a verified copy migration (`Database-Storage.cmd --storage-copy --migrate`) has run. The migration to 11 rewrites the message rollups and the client of every SMTP transaction in one all-or-nothing transaction: plan on the order of 3 to 5 minutes of exclusive write access and about 6 GB of free disk space for a database of about 20 GB (5.5 million rollup rows, 1.9 million SMTP transactions; an estimate from prototypes, measure it on a copy first); schema 12 reconciles every message rollup again in one transaction, schema 13 only the messages with a `SENDEXTERNAL` event. SMTP rows written, changed or deleted by a program that is not the collector, and the retention, wait in two queues until the collection, the retention or an explicit `RefreshServeRollups` reconciles them: until then the portal answers 503 `SmtpClientsPending` or `RollupPending` rather than an out-of-date list.
+
+Schema 12 also has covering indexes for the period reads: `ix_rollup_last(member_last_ms,member_first_ms,status,events_count,kind,direction,servers)`, `ix_rollup_status_last(status,member_last_ms,member_first_ms,events_count,kind,direction,servers)` and `ix_session_time(start_ms,end_ms,requests)`, the indexes of the overview and of the unresolved failures (`ix_msg_noid_flow`, `ix_event_resolution`, `ix_usage_day_success`), and two upper bounds of the journey and session spans in `metadata` (`rollup_max_span_ms`, `session_max_span_ms`, raised by triggers on any write, never lowered). A list, a count or a detail of a period reads the index range `[from, to + span)` of the rollup and `[from - span, to)` of the sessions, whatever lies after the period; the result is exactly the same rows. A database that lacks one of these objects answers 422 `ShapeRequired` in the portal until its next writable open (one collection; a few minutes on a 20 GB file) or `--storage-copy --migrate` adds it.
+
+The authentication types are two columns of the same schema: `access_client.auth_type`, the seventh key column of the table, and `client_session.auth_modes`. A database that lacks them is folded at its next writable open (`access_client` rebuilt with every row copied with `auth_type` `''`, the row counts compared before the old table is dropped; `client_session` gets a nullable column); a report, `-Mode Status` or any other read-only open folds it once first. The columns are checked on the table (`pragma_table_info`). Until then the portal refuses it (422 `MigrationRequired`: such a database is of schema 12), `VerifyServeRollups` fails, and `Database-Storage.cmd --storage-copy --migrate` folds a copy (its report names the rebuilt table among the exclusions; a copy without `--migrate` keeps the source shape).
+
+The overview of the portal (`/api/overview/servers`) reads the mail flow of the whole hours of a period from `mail_flow_hour` (one row per UTC hour and server) and that of the partial hours at its two ends from the rows; the messages of each server come from the rollup index (a journey inside the period counts for each server of its route, a journey crossing a bound of the period for the servers of its events inside it, a tracking event without Message-ID by its internal id). The figures are those of the static report. The table is derived data: the collector maintains it in the batch transaction, triggers queue the hours of every other write (and the retention) in `mail_flow_dirty`, the next collection or `RefreshServeRollups` recomputes them, and until then the portal answers 503 `MailFlowPending`. It is built from the rows and proved by recomputation in the same transaction by the migration to schema 12 or by the next writable open of a schema-12 database written before it (two grouped scans of the tracking events and SMTP transactions; on a synthetic store of 7.35 million tracking events and 2.94 million SMTP transactions the whole upgrade, index rebuilds included, took about 90 s on a fast PC: measure it on a copy of a large database first), and verified by recomputation by `VerifyServeRollups` (`MailFlowVerified`, `MailFlowRows`) and by the storage copy (`mailFlow` in the report). A user filter selects mail by address text, which the table does not hold: the overview then reads the rows of the whole period. Serve keeps the complete answers of `/api/overview/servers`, `/api/users` and `/api/operations` in a result cache (64 MB, `"cached": true` in the answer) until another connection commits to the database (`PRAGMA data_version`), and admits at most `MaxConcurrency - 2` (at least one) of these aggregate requests and exports at once, of which one export (an export has no total deadline: with the default four workers, the overview keeps an admission while an export streams), and at most `MaxConcurrency - 1` of the requests of the list layer that may scan (the counts, the value lists and the filtered list pages), both classes together below `MaxConcurrency` (429 `Busy` otherwise; an answer of the result cache and `/api/report-meta`, which keeps the aggregate deadline, are not counted): with the default four workers, one always serves the unfiltered pages, the details and the report description. A count, value lists or a filtered page whose client has gone (the page cancels what a newer filter supersedes) ends at once instead of reading to its budget; a filtered page has a budget of 500 ms (the page continues it from `scannedTo`), the counts and the value lists that of `-ScanBudgetMs`. A server that appears only in the mail flow (no client access in the period) is named by the smallest (binary) spelling of its name in the period; the static report names it by the first spelling it reads, which differs only in the casing of a server written in two spellings.
+
+`Store.VerifyServeRollups()` (and the storage copy, on the source and on the staged file) recomputes every message rollup by a merge scan: the tracking events and the SMTP transactions are each read once, sorted by their exact Message-ID, and compared with the rollup rows read in the same order, so the run is bound by the disk bandwidth, not by its random reads. The sort files (`etilqs_*`) are written next to the verified database (about 15 % of its size free there, checked before the run); SQLite deletes them when the run ends, and files left after a power cut or a crash can be deleted. The sort folder is a process-wide SQLite setting: the verification runs alone in its process (the portal never calls it). A default run has no row budget: it stops when it makes no progress for 600 s (no SQLite step and no verified message), and at 24 h; `VerifyServeRollupsWithDeadline` sets an explicit deadline. The receipt reports `Method`, `EstimatedSeconds` (3 × the file at 20 MB/s), `FileBytes`, `StallSeconds`, `CacheMissPages`, the sort folder and its free space (`TempDirectory`, `TempFreeBytes`), the largest total size of the sort files seen during the run (`SortPeakBytes`, sampled every 5 s), the longest time between two heartbeats (`MaxProgressGapMs`, the margin left to the 600 s) and the recomputation of the mail flow per hour (`MailFlowVerified`, `MailFlowRows`).
+
+### 15.3 Components and the request boundary
+
+| Surface | Responsibility |
+|---|---|
+| `src\Engine.Serve.cs` | The loopback `HttpListener`, the launch and readiness lifecycle and the authenticated API boundary |
+| `src\Engine.ServeQuery.cs`, `src\Engine.ServeAggregates.cs` and the Serve rollup and verification files | Bounded queries, exact-evidence semantics and derived-state readiness; never browser-side SQL |
+| `src\Engine.ServeUsage.cs` | The datasets of the Detailed report in the portal: `/api/report-meta`, `/api/overview/servers`, `/api/requests`, `/api/users`, `/api/operations` and `/api/authentication` (with `/api/authentication/{id}`), with the report's own columns and row builders |
+| `src\Engine.ServeScan.cs`, `src\Engine.ServeFilterExpression.cs` | The list layer of the portal: keyset pages, exact counts with their histogram (`/count`) and value lists (`/facets`) of the client sessions, failed and slow requests and messages, with the filters of the report page (its expressions and search syntax, compiled on the server and tested on the cells of the list), read chunk by chunk under a time budget |
+| `templates\Report.template.html`, `templates\Report.template.js` | The page of the portal: the Detailed report's own page in served mode (`{"served":true}`), built by Serve at start and served as `/` and `/report.js` only. Its requests carry the selected bounds and the per-start token; the fragment token is removed from the address bar and kept in the session storage of the tab. No build step, development server, Node.js or CDN |
+
+The listener binds only to `127.0.0.1`. There is no remote endpoint, CORS, arbitrary SQL, process execution or web maintenance API. Windows HTTP.sys permissions or a port conflict can prevent the start: the error is reported and no URL reservation, firewall rule or service is changed; a required reservation is reviewed and granted by the administrator. Readiness files and launch tokens are private: never commit, package or paste them into a ticket.
+
+### 15.4 Selection, concurrency and freshness
+
+**The day bar.** The page of the portal is the Detailed report page; Serve adds the day bar above the overview, and the From/To pair under the tabs of the static report is not shown. The days are days of `Report.TimeZone` (the page reads its IANA name, `timeZoneIana` of `/api/meta`, and falls back to the zone of the browser): a day is `[D 00:00, D+1 00:00)` of that wall clock, 23 or 25 hours on a daylight-saving change. **1 day**, **3 days** and **7 days** keep the end day; **Previous day** and **Next day** shift both bounds by one day (a bound on a day boundary stays on one); **Jump to day** keeps the length; **From** and **To** (wall clock of the report zone; **From is inclusive, To is exclusive**) with **Apply** choose any period of at most 31 days; **Server** and **User** (a contains selection on the account or the mailbox, matched on the server) narrow every request of the page. The portal opens on the day of the newest collected data (`coveredTo` of `/api/meta`). The selection is kept in the address (`day=YYYY-MM-DD&days=n`, or `start` and `end`, then `server`, `user`, `tab`, `open=` and the filters of the open list), so an address can hold private account names and servers; a new selection reloads the page and cancels the requests of the view it replaces (the browser closes them and the server stops reading). The caption under the bar names the days, the zone, the newest collected data, and the size and schema of the database.
+
+**Loading.** `/api/report-meta` describes the datasets of the selection: their columns, their list and detail routes, and one pack per day for the lists sliced by day. The page then loads in three lanes, with at most three background requests at once so that a worker stays free for what the reader opens: the overview (`/api/overview/servers`), the period tables (users, operations, authentication, SMTP clients) and the lists, the open tab first; the value lists take the slots the lanes leave. The lists of messages, client sessions and failed and slow requests pass a window on their sort key (`orderFrom`, `orderTo`: the last event of a message, the start of a session, the time of a request): day k is `[day start, day end)`, without the upper bound on the newest day and without the lower bound on the oldest one, so each row is in exactly one day and the days concatenated newest first are the whole-period list in the same order.
+
+**Loaded or Remote.** For each list, the page reads the first page (500 rows) of the newest day at once, then the exact count of each day (`/count`, with its histogram). A list of at most `ClientRowsMax` rows (`-ClientRowsMax`, 10,000 to 1,000,000, default 50,000; fewer when the memory guard of the page leaves less room) is loaded whole, in keyset pages of 2,000 rows, two days at a time, and its tab works as in the static report: the pill of the tab says **Loaded**. A larger list is browsed on the server and says **Remote**: the scrollbar takes the exact total, and a scroll position becomes a rank, located from the day counts and histograms (refined to 1 s) and read in pages of 500 ranks (64 pages kept, the next one read ahead). A Remote list is sorted by its time key (**Start**, **Time**, **Last event**) in both directions; every filter, value list (`/facets`), the search and **Export view** run on the server over the whole selection. A filter that leaves at most `ClientRowsMax` rows loads them in the page under a **Server selection** chip; removing the chip browses every row again. The day buttons of the bar show the rows of each day of the open list and, on a Remote list, scroll to the first row of that day (their tooltip says *Scroll to* the day there, *Read* the day *alone* elsewhere). The caption of a Remote tab names the rows of the selection (*Browsing the 250,633 rows of the selection on the server*) and, once the filters are counted, the filtered count too (*Browsing 107,188 of the 250,633 rows of the selection*); while counting or after **Stop** it keeps the first wording.
+
+**Filters on the server.** The filter language is the one of the report page (numbers, times in the wall clock of the report zone, text, value lists, `m.`, `x.`, the free search), compiled on the server (`Engine.ServeFilterExpression.cs`). A filter on the status, direction or servers codes, an exact Message-ID (`=<id>`) or `m.User` seeks an index; any other filter is a scan of the list, read in chunks bounded by the sort key under a time budget: 500 ms for a filtered page (the page continues it from `scannedTo`), `-ScanBudgetMs` (100 to 120,000, default 2,000, never more than the request deadline) for a count or value lists. While a scan counts, the result line of the page shows the matches so far and the days searched, with a **Stop** button.
+
+**Admission classes.** Serve runs at most `MaxConcurrency` requests at once (four workers). Each request belongs to one class:
+
+| Class | Requests | At once (four workers) | Deadline |
+|---|---|---|---|
+| Aggregate | `/api/overview`, `/api/overview/counts`, `/api/overview/servers`, `/api/users`, `/api/operations`, `/api/authentication`, `/api/authentication/{id}` | `MaxConcurrency - 2`, at least 1 (2) | `-AggregateTimeoutSeconds` (1 to 120, default 60 s) |
+| Exports | the download of an export ticket and `/api/export.csv`, counted among the aggregates too | 1 | an export ticket: no total deadline (below); `/api/export.csv`: `-RequestTimeoutSeconds` |
+| Lists | `/count` and `/facets` of `/api/sessions`, `/api/requests` and `/api/messages`, and their pages with a filter (`q`, `w`, `f.`, `m.`, `x.`) | `MaxConcurrency - 1` (3) | `-RequestTimeoutSeconds` (1 to 120, default 15 s) |
+| Light | every other request: `/api/meta`, `/api/report-meta`, the unfiltered pages, the details, the SMTP clients and their transactions, the export ticket request, `/api/shutdown` | not counted | `-RequestTimeoutSeconds`; `/api/report-meta`: `-AggregateTimeoutSeconds` |
+
+Aggregates and lists together stay below `MaxConcurrency` (three of four), so one worker always answers the unfiltered pages, the details and the report description; a request beyond its class answers 429 `Busy`, and an answer of the result cache is not counted. The page sends a request turned away as busy again up to three times (after 1 to 10 s); a loading request or the counts of a filter keep waiting, up to the aggregate deadline, while the page shows *Waiting for the server: other requests are in progress...*; a request still refused shows *The server is busy with other requests: try again in a moment.* A request stopped by its deadline answers 504 `Deadline` with `retryable: true` and `Retry-After: 2`: the pages it read are cached by then, so the page retries once before showing the message (*The request exceeded its deadline of 15 s. The pages it read are now cached: retry once, then narrow the period or the server.*), and the console prints one line per 504: `Serve: 504 /api/overview/servers after 60,012 ms (deadline 60 s)`. A 503 marked `retryable` (database busy, collection not reconciled yet) is sent again up to three times.
+
+**The routes of the page.**
+
+| Route | Answers |
+|---|---|
+| `GET /`, `GET /report.js` | The page and its script (no token; every other route needs `X-Portal-Token`) |
+| `GET /api/meta` | The database: schema, size, newest collected data (`coveredTo`), servers, time zone |
+| `GET /api/report-meta` | The description of the selection: datasets, columns, routes, day packs, `clientRowsMax`, `scanBudgetMs` |
+| `GET /api/overview/servers` | The tiles, the server cards and the activity by day of the selection |
+| `GET /api/users`, `/api/users/{id}` | The users of the period; one user with its clients, devices and client sessions |
+| `GET /api/operations` | The operations of the period |
+| `GET /api/authentication`, `/api/authentication/{id}` | One row per protocol and authentication type; one row with its users and devices |
+| `GET /api/sessions`, `/api/requests`, `/api/messages` | Keyset pages of a list (`cursor`, `dir`, `size` up to 2,000, the order window, the filters); `/count` and `/facets` under each |
+| `GET /api/sessions/{id}`, `/api/messages/{id}`, `/api/requests/{id}` | A session with its timeline, a message with its route, the request and source evidence of a step |
+| `GET /api/smtp/clients`, `/api/smtp/clients/{id}/transactions`, `/api/smtp/transactions/{id}` | The SMTP clients of the selection, the transactions of one client, one transaction with its transcript |
+| `POST /api/export/ticket`, `GET /api/export/<ticket>.csv` | The Export view of a Remote list (below) |
+| `POST /api/shutdown` | **Stop portal** |
+
+`/api/overview`, `/api/overview/counts`, `/api/export.csv` and the offset lists (`page`) remain for automation and measurement; the page does not call them.
+
+**Export view of a list browsed on the server (export ticket).** A list loaded in the page (**Loaded**) is exported by the page itself. For a list browsed on the server (**Remote**), the page asks Serve for an export ticket and the browser downloads the file from the address of the ticket, so that its download list shows the progress and can cancel it, whatever the size:
+
+| Route | Request | Answers |
+|---|---|---|
+| `POST /api/export/ticket` | `X-Portal-Token`, `Content-Type: application/json`, no query string, a body of at most 16 KiB: `{"view": "<list>", "query": "<the query of the list>"}`, where the list is `sessions`, `issues` or `messages`. The query takes `from` and `to` (both required), `server`, `user`, `status`, `dir` (`asc`: oldest first), `q`, `w`, `anyCase` and the `f.`, `m.` and `x.` filters of the view, validated as the list validates them; no paging and no order window | 200 `{"ticket": "<64 hexadecimal characters>", "expiresInSeconds": 60, "url": "/api/export/<ticket>.csv"}`. 400 `InvalidTicketRequest`, `InvalidView`, `InvalidPeriod`, `InvalidFilter` or `InvalidParameter`; 401 without the token; 413 for a larger body; 415 for another content type; 429 `Busy` *16 exports are waiting to be downloaded: export the view again in a minute.* |
+| `GET /api/export/<ticket>.csv` | No token, no parameter, no body: the ticket is the only credential, valid for one download within 60 s of its issue, from this computer, for the exact address of the portal and from its own pages | 200 `text/csv; charset=utf-8`, chunked, `Content-Disposition: attachment; filename="<view>-<first day>-<last day>.csv"`. 404 *This export ticket is unknown, used or expired: export the view again from the page.* 405 for another method (`HEAD` included), 400 for a parameter or a body, 403 for another address, authority or origin, 429 `Busy` *The export waited for the other requests of the portal: export the view again in a moment.*: none of these four spends the ticket |
+
+The ticket is a 256-bit random name, never a token of the API, taken away by the first download that is answered (the same address answers 404 afterwards); at most 16 tickets wait at once. The file has the columns and the cells of the Export view of the page (a byte order mark, `;` between the cells, CRLF after each line, times in the wall clock of `Report.TimeZone`, numbers and the formula guard as the page writes them) and every row of the selection with the filters of the list, day by day (the newest day first, or the oldest first with `dir=asc`), in keyset pages of 2,000 rows read on one read-only connection per day. The lines are those of the export of the same rows by the page; their order is that of the list on the server (by instant, then by id). The page that holds the rows sorts them by the time it shows and keeps the order it loaded them in for equal times, so the same lines come in another order inside the repeated hour of a daylight-saving change and, in a sort oldest first, among rows of the same millisecond (the page keeps the newest id first, the server the oldest); elsewhere the two files are equal byte for byte. Serve admits one export at a time (the download of a ticket or the CSV export `/api/export.csv`), counted among the aggregate requests: the download of a ticket waits up to `-RequestTimeoutSeconds` for its admission and a worker before its 429 (`/api/export.csv` is answered 429 `Busy` at once), while a download refused for its address, its method, its parameters or its ticket is answered at once, without a worker. A client that stops reading or leaves ends the stream, as **Stop portal** does; the file is then incomplete and the download list of the browser shows it failed. The console never prints the name of a ticket (`/api/export/<ticket>.csv`).
+
+Every API request uses its own short read-only SQLite connection and snapshot (`query_only`, bounded cache and memory map). The portal does not take the maintenance guard or the collector lock, so it coexists with a collection; CPU, disk and WAL checkpoint contention remain possible. There is no snapshot frozen across pages, details and exports, and no timer that advances a window. The page does not refresh itself: after a later collection, reload it (F5) or click **Apply** to read the same period again, or **Next day** once a new day has data. A rollup or SMTP client structure that is not ready, a timeout and an unsupported schema are explicit errors, never a successful empty list.
+
+### 15.5 Read each view at its real scope
+
+| View | Interpretation and drill-down |
+|---|---|
+| Overview | The overview of the Detailed report for the selection (`/api/overview/servers`): the tiles (with **Users on OAuth** once the users and the authentication table are in), the server cards and the activity by day, with the figures of the static report (15.2). |
+| Client sessions, Failed and slow requests | The rows of the selection, **Loaded** or **Remote** (15.4). Opening a session reads its cross-server timeline (`/api/sessions/{id}`); a step reads its retained request and source evidence (`/api/requests/{id}`). |
+| Messages | Consolidated message identities, **Loaded** or **Remote**; the route and the SMTP and tracking evidence load on demand (`/api/messages/{id}`). Message hashes accelerate lookups: the exact Message-ID text governs identity. |
+| Users, Operations | The daily tables of the period, loaded whole. A user opens its clients and devices, its **Identifiers** (the security identifiers of its token requests, with their evidence; a user still logged as a SID carries the **unresolved SID** pill) and its client sessions (`/api/users/{id}`: the first 200, newest first). |
+| Authentication | One row per protocol and authentication type of the selection, from the daily client table; a row opens its users and devices. The user filter matches account names for this view (the client table has no mailbox column), and the Authentication column of the users is empty for a user matched by its mailbox name only. |
+| CSV | **Export view to CSV** writes the whole filtered list, not the visible rows; none from the overview or from the transactions of one client. The page writes a **Loaded** list itself; the Export view of a **Remote** list is written by Serve through an export ticket (15.4). An interrupted download is not a complete export. |
+
+Shadow-event exclusions configured in the collector are preserved: extra tracking events are not dropped silently. The collected range comes from source-file metadata; it does not prove that every detail in that range survived the retention. An Edge collection has SMTP and tracking evidence without the IIS and client evidence of the Mailbox servers.
+
+### 15.6 Automation and diagnosis
+
+For local automation only: `-NoBrowser -ReadyFile <unused private path> -ReadyFileWithToken`. The readiness file belongs to the current Windows identity; success has `status` `ready`, a bind failure has `status` `blocked` and a diagnostic code but no token, and an existing file is never replaced. The token travels as the `X-Portal-Token` header. **Stop portal** or Ctrl+C stops the listener, not the scheduled collection; closing the browser tab alone leaves it running.
+
+For a view that fails, check in this order: the console message, `-Mode Status`, the selected database and schema, the retained coverage, the filters and the end bound. An access error needs the private link of this instance. An unsupported schema needs the new-copy procedure (user guide, chapter 11). A timeout or a row bound needs a narrower selection, never a higher limit. Results measured on a small synthetic database do not prove the latency of a database of tens of GB or of an operating system cache that is cold: record the size, the row counts, the exact filters, the query plans and the timings of the real database.
 # Annexes
 
 <!-- icon: lifebuoy -->
@@ -992,8 +1182,8 @@ E-mail, from EXCH02 to the receive connectors of EXCH01 (Exchange Server SE, sel
 | `Another execution is already collecting` | A collection is running (lock `…sqlite.lock`): `-Mode Collect` or `-Collect` waited 30 s. Wait for it to finish; a report without `-Collect` never waits (it uses the data already collected). |
 | `No collection in the database yet` | A report never starts the first collection on its own: run `-Mode Collect` once, then schedule it (chapter 7). |
 | Every report says *more than 90 min (Report.MaxDataAgeMinutes)* | The hourly scheduled collection is not running: last result of the task (`Get-ScheduledTaskInfo`), *Log on as a batch job*, lock left by a stopped execution. |
-| `Unable to load the engine` / compilation error after an edit | Fix the C# error shown. `bin\` is not used any more (a compiled copy is never loaded); an old `bin\` can be deleted. |
-| `Package integrity: …` | A protected file is missing, changed or unknown, or a signature is not valid: see "Package integrity" in chapter 5. Restore the package from the release; do not edit protected files. |
+| `Unable to load the engine` / compilation error after an edit | Fix the C# error shown. The engine is compiled in memory at each start: a compiled copy in `bin\` is never loaded, and such a folder can be deleted. |
+| `Package integrity: …` | A protected file is missing, changed or unknown, or a signature is not valid: see "Package integrity" in chapter 5. Extract the release ZIP again and unblock it; do not edit protected files. An unsigned build (CI artifact, `-Unsigned`, a source checkout) is refused by the launchers by design: start it with `powershell\pwsh.exe -File Invoke-ExchangeLogReport.ps1 … -DevelopmentMode` (5.1). |
 | The report is slow to open | More than ~200,000 rows: lower `MaxHtmlRows` and use the CSV, or narrow the period / users. |
 | Collection slow | The statistics line of the execution log says what limits it (chapter 12.3): processors, write thread or disk. Administrative shares are slower than local disks: run one collector per site, and schedule hourly so that each run reads one hour only. |
 
@@ -1002,17 +1192,17 @@ E-mail, from EXCH02 to the receive connectors of EXCH01 (Exchange Server SE, sel
 
 | Source | Fields |
 |---|---|
-| HttpProxy | DateTime, RequestId, ClientRequestId (`RT:` MAPI request type, `CI:` Outlook client instance), Protocol, UrlStem, UrlQuery (`Cmd`, `DeviceId`, `DeviceType` of ActiveSync), ProtocolAction, AuthenticationType, AuthenticatedUser, AnchorMailbox, UserAgent, ClientIpAddress, HttpStatus, BackEndStatus, ErrorCode, Method, TargetServer, RoutingType, RequestBytes, ResponseBytes, TotalRequestTime, GenericErrors |
+| HttpProxy | DateTime, RequestId, ClientRequestId (`RT:` MAPI request type, `CI:` Outlook client instance), Protocol, UrlStem, UrlQuery (`Cmd`, `DeviceId`, `DeviceType` of ActiveSync; `User`, the account the device reported, kept as a hint for a SID), ProtocolAction, AuthenticationType (the authentication type of every request), IsAuthenticated (read for the anchor evidence of a SID), AuthenticatedUser, AnchorMailbox (`Sid~` of the anchor evidence), UserAgent, ClientIpAddress, HttpStatus, BackEndStatus, ErrorCode, Method, TargetServer, RoutingType, RequestBytes, ResponseBytes, TotalRequestTime, GenericErrors |
 | IIS (W3C) | date, time, cs-method, cs-uri-stem, cs-uri-query (`cafeReqId`), cs-username, c-ip, cs(User-Agent), sc-status, sc-substatus, sc-win32-status, sc-bytes, cs-bytes, time-taken |
-| MapiHttp (back end) | DateTime, RequestId, RequestType, HttpStatusCode, ResponseCode, StatusCode, ReturnCode, TotalRequestLatency, AuthenticatedUserEmail, MailboxId, ClientIP, SourceCafeServer, MapiClientInfo, ClientSoftware, ClientSoftwareVersion, ClientMode, OperationSpecific, GenericErrors |
-| IIS back end (`W3SVC2`) | ActiveSync lines only: cs-uri-query (`Cmd`, `DeviceId`, `Log=` tokens `Error`, `As`, `Ver1`), cs-username, cs(User-Agent), sc-status, time-taken |
+| MapiHttp (back end) | DateTime, RequestId, RequestType, HttpStatusCode, ResponseCode, StatusCode, ReturnCode, TotalRequestLatency, AuthenticatedUserEmail, UPN (the evidence of a SID), MailboxId, ClientIP, SourceCafeServer, MapiClientInfo, ClientSoftware, ClientSoftwareVersion, ClientMode, OperationSpecific, GenericErrors |
+| IIS back end (`W3SVC2`) | ActiveSync lines only: cs-uri-query (`Cmd`, `DeviceId`, `Log=` tokens `Error`, `As`, `Ver1`), cs-username (for a device seen under a SID, kept as a hint), cs(User-Agent), sc-status, time-taken |
 | POP3 / IMAP4 | dateTime, sessionId, cIp, user, duration, rqsize, rpsize, command, parameters, context (`R=` result, `Proxy:` back-end server) |
 | SMTP protocol | date-time, connector-id, session-id, local-endpoint, remote-endpoint, event (`+ - > < *`), data (`XPROXY` of proxied submissions; `* data=<account> context=authenticated` for the authenticated user, AUTH payloads never decoded), context |
-| Message tracking | date-time, client-ip, client-hostname, server-ip, server-hostname, source-context, connector-id, source, event-id, internal-message-id, message-id, network-message-id, recipient-address, recipient-status, total-bytes, recipient-count, related-recipient-address, reference, message-subject, sender-address, return-path, message-info, directionality, log-id |
+| Message tracking (`connector-id`, `server-hostname`, `server-ip` and `recipient-status` also decide *Sent to external*; event-id, source, sender-address, recipient-address and directionality teach the accepted domains) | date-time, client-ip, client-hostname, server-ip, server-hostname, source-context, connector-id, source, event-id, internal-message-id, message-id, network-message-id, recipient-address, recipient-status, total-bytes, recipient-count, related-recipient-address, reference, message-subject, sender-address, return-path, message-info, directionality, log-id |
 
 The columns are found by name in the `#Fields:` header of each file: a different column order or an Exchange update adding columns does not break the parsing.
 
 <!-- icon: tag -->
 ## Annex C — Versioning
 
-MAJOR.MINOR.PATCH: MAJOR for a database or configuration change that needs action, MINOR for a new feature, PATCH for a fix. Every change is listed in `CHANGELOG.md`.
+MAJOR.MINOR.PATCH: MAJOR for a database or configuration change that needs action, MINOR for a new feature, PATCH for a fix. Every change is listed in `CHANGELOG.md`. Version 3.0.0 (database schema 13, the portal, the launchers, the storage tool in the bundled PowerShell) follows 2.1.1 directly: a MAJOR change because the database schema upgrades once, the status words changed and the package layout gained the launchers and the built folders.

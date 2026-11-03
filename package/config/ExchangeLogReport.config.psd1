@@ -2,7 +2,7 @@
 #  Exchange Log Report - configuration file
 #  --------------------------------------------------------------------------
 #  Author  : Nicolas Fabert
-#  Version : 2.1.1
+#  Version : 3.0.0
 #
 #  This file is read by Invoke-ExchangeLogReport.ps1. It is a PowerShell data
 #  file: text between quotes, $true / $false, numbers, and @( ) for lists.
@@ -29,7 +29,8 @@
     # -Mode Discover run on the Edge): only their SMTP protocol logs and message tracking are read, no
     # IIS, HttpProxy, MAPI, ActiveSync, POP3 or IMAP4. Role = 'Edge' (or 'Mailbox') forces the role.
     # Account: SYSTEM on an Exchange server, or a domain account that is local administrator of
-    # every Exchange server, plus View-Only Organization Management for -Mode Discover (user guide, chapter 1).
+    # every Exchange server, plus View-Only Organization Management for -Mode Discover (user guide, chapter 2).
+    # Replace the two example lines by your servers, one line each; delete the lines of servers you do not have.
     # ---------------------------------------------------------------------
     Servers = @(
         @{ Name = 'EXCH01' }
@@ -109,6 +110,27 @@
         # Files of one server read at the same time (0 = no limit): the threads spread over the servers, and no
         # server - nor the local disk when the tool runs on an Exchange server - serves all of them.
         MaxFilesPerServer      = 4
+        # Message rollups (the Serve message list) of a collection. Never = reconciled with every batch (default: the work runs
+        # while the next files are read). Auto = the same, except for an initial import of more than 5 GB into an empty database,
+        # which reconciles them once at the end. Always = once at the end. Deferred rollups of a stopped import leave Serve
+        # answering 503 until the next collection drains them (with Never or Auto, before its first batch).
+        DeferRollups           = 'Never'
+        # Exchange logs token (OAuth) requests under the security identifier (SID) of the account. $true: the SID is paired with the account
+        # from the logs themselves (the account's own ActiveSync, OWA and Outlook lines) and its rows are merged with the account's; no directory is queried.
+        ResolveSids            = $true
+        # Optional data file naming the SIDs the logs cannot name, e.g. '.\config\ExchangeLogReport.identities.psd1' holding
+        # @{ 'S-1-5-21-...-1105' = 'CONTOSO\erin' }. Used only for SIDs without evidence in the logs ('' = none).
+        IdentityMapFile        = ''
+        # SIDs stored as logged while no evidence was gathered (ResolveSids $false, or a database collected before): the ActiveSync, OWA and ECP
+        # HttpProxy lines already collected are read again for their evidence, at most this many MB per collection, until done.
+        EvidenceRescanMBPerRun = 2048
+        # A message that a Send connector handed to a mail server outside your organization (internet, partner) shows 'Sent to external' when
+        # the logs prove it: the recipient's domain is not one of yours (learnt from the mail your servers deliver and send) and that server
+        # accepted it. Domains that are yours although the logs may not show them yet (a domain and its sub-domains), e.g. @('contoso.com').
+        InternalDomains        = @()
+        # Send connectors that hand mail to a system inside your company (journaling, archiving, an internal relay): regular expressions on
+        # the connector name, e.g. @('^Journal'). Exchange's own internal connectors are always included (also Outbound to Office 365, hybrid).
+        InternalConnectors     = @()
     }
 
     # ---------------------------------------------------------------------
@@ -135,7 +157,11 @@
         IncludeRoutingDetails = $true            # message route and SMTP transcripts in the CSV files (always behind a click in HTML)
         IncludeSessionDetails = $true            # timeline of each client session in the CSV files (always behind a click in HTML)
         CsvDelimiter          = ';'              # ';' opens directly in Excel with French regional settings
-        MaxHtmlRows           = 200000           # per table in the HTML file; the CSV files are always complete
+        HtmlLayout            = 'Auto'           # Auto: one HTML file up to SingleFileMaxMB of data, else a small page + a <FilePrefix>_data folder
+                                                 # (keep the page and the folder together) | SingleFile: always one file | Folder: always page + folder
+        SingleFileMaxMB       = 200              # Auto: size of the data above which the report becomes page + folder (1 to 4096)
+        MaxHtmlRows           = 0                # 0 = every row of every table in the HTML report; 1000 to 2000000 caps each table (the CSV files are always complete)
+        ScratchFolder         = ''               # report work file (a few GB for a very large report); empty = the report folder. Choose a local folder with enough free space; paths longer than 260 characters are supported
         MemoryBudgetMB        = 512              # SQLite caches + estimated row/worker buffers; not a process RAM ceiling
         Parallelism           = 0                # report CPU workers: 0 = up to 4, leaving one processor; 1 = sequential
         # A report reads the database. It reads the new log lines first only when the last collection is older
@@ -181,6 +207,7 @@
         CredentialScope       = 'User'             # User: readable by the account that wrote it only | Computer: by any account of this computer
         TargetName            = ''                 # Kerberos SPN when it is not SMTPSVC/<SmtpServer> (load balancer)
         CertificateThumbprint = ''                 # pin the certificate of the server instead of checking its chain
+        HeloName              = ''                 # EHLO name; empty: the computer name
         From                  = ''                 # e.g. 'exchange-log-report@contoso.com'
         FromName              = 'Exchange Log Report'
         To                    = @()                # e.g. @('messaging-team@contoso.com')

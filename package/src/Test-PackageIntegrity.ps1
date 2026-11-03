@@ -4,11 +4,15 @@
     Verifies the authenticated Exchange Log Report package before any of its code runs.
 
 .DESCRIPTION
-    Invoked by Invoke-ExchangeLogReport.ps1, by the module (import and engine initialization) and by the
-    package builder. It requires a valid, timestamped owner signature on this script, on PackageIntegrity.psd1
-    and on every PowerShell file of the inventory, then compares the SHA256 of every inventory file (C# sources,
-    SQLite binaries, report template, HTML guides, README, notices) with the signed manifest. Missing, changed,
-    unknown or reparse-point files fail closed.
+    Invoked by the launchers, by Invoke-ExchangeLogReport.ps1, by Database-Storage.ps1, by the module (import and
+    engine initialization) and by the package builder. It requires a valid, timestamped owner signature on this
+    script, on PackageIntegrity.psd1 and on every PowerShell file of the inventory, then compares the SHA256 of every
+    inventory file (C# sources, SQLite libraries, report template, HTML guides, README, notices, launchers) with the
+    signed manifest. Missing, changed, unknown or reparse-point files fail closed.
+
+    The manifest has two lists. Files are present in the source tree and in the package. DistributionFiles are the
+    built binaries (powershell\, sqlite-tools\) that exist in the package only; they are hash-protected by the
+    signed manifest, not signed by the owner.
 
     Not protected, by design: config\ExchangeLogReport.config.psd1, config\ExchangeLogReport.paths.psd1 and
     config\ExchangeLogReport.mail.credential (edited or written by the administrator), and the generated
@@ -18,33 +22,69 @@
     Package folder to verify, not its src subfolder. This script must belong to that package's src folder.
 
 .PARAMETER Distribution
-    Also requires CHANGELOG.md, which the package builder copies from the repository root.
+    Verifies a release package: the files copied by the package builder are required and every file of
+    DistributionFiles is hashed. A file under powershell\ or sqlite-tools\ that the manifest does not list is
+    refused. Refused together with -DevelopmentMode.
+
+.PARAMETER DevelopmentMode
+    For an unsigned continuous-integration build or a developer package: the files and the six PowerShell
+    signatures are still enforced, the built binaries are not verified (a warning says so).
+    Without -Distribution and -DevelopmentMode only Files are verified; the built binaries are not examined.
+
+.NOTES
+    Author  : Nicolas Fabert
+    Version : 3.0.0
 #>
 [CmdletBinding()]
-param([Parameter(Mandatory)][string]$Root, [switch]$Distribution)
+param([Parameter(Mandatory)][string]$Root, [switch]$Distribution, [switch]$DevelopmentMode)
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
+if ($Distribution -and $DevelopmentMode) { throw 'Package integrity: -Distribution and -DevelopmentMode cannot be combined.' }
 $signer = '0F28E442889F17B5F4D251E8F96E7CC6E2C9C6D6'
+# What to do, at the end of the two refusals an unsigned or re-saved package meets first.
+$releaseHint = 'Use the complete release ZIP (https://github.com/Nico77600/ExchangeLogReport/releases/latest): extract it again and unblock it. A modified, re-saved or unsigned file cannot be started by the launchers. A development or CI build is started from its folder with powershell\pwsh.exe -NoLogo -NoProfile -File Invoke-ExchangeLogReport.ps1 <parameters> -DevelopmentMode (or Database-Storage.ps1 -DevelopmentMode <arguments>).'
 $rootPath = [IO.Path]::GetFullPath($Root).TrimEnd('\')
-$required = @(
+$signed = @(
     'Invoke-ExchangeLogReport.ps1'
+    'Database-Storage.ps1'
     'ExchangeLogReport.psm1'
     'ExchangeLogReport.psd1'
     'src\Test-PackageIntegrity.ps1'
     'src\Get-ExlExchangeSettings.ps1'
+)
+$required = @($signed) + @(
     'src\Engine.Collector.cs'
     'src\Engine.Mail.cs'
     'src\Engine.Pipeline.cs'
     'src\Engine.Report.cs'
     'src\Engine.ReportExecution.cs'
+    'src\Engine.ReportHtml.cs'
+    'src\Engine.ReportRoute.cs'
     'src\Engine.ReportRows.cs'
     'src\Engine.ReportSessions.cs'
     'src\Engine.ReportTranscripts.cs'
+    'src\Engine.Serve.cs'
+    'src\Engine.ServeAggregates.cs'
+    'src\Engine.ServeDiagnostics.cs'
+    'src\Engine.ServeFilterExpression.cs'
+    'src\Engine.ServeQuery.cs'
+    'src\Engine.ServeRollup.cs'
+    'src\Engine.ServeScan.cs'
+    'src\Engine.ServeUsage.cs'
+    'src\Engine.ServeVerification.cs'
     'src\Engine.Sessions.cs'
     'src\Engine.SmtpAuth.cs'
+    'src\Engine.SmtpClients.cs'
     'src\Engine.Store.cs'
     'src\Engine.Text.cs'
+    'src\Storage.Audit.cs'
+    'src\Storage.Cli.cs'
+    'src\Storage.Fingerprint.cs'
+    'src\Storage.LegacyRollup.cs'
+    'src\Storage.Maintenance.cs'
+    'src\Storage.RollupVerification.cs'
+    'src\Storage.Safety.cs'
     'lib\sqlite\Microsoft.Data.Sqlite.dll'
     'lib\sqlite\SQLitePCLRaw.core.dll'
     'lib\sqlite\SQLitePCLRaw.provider.e_sqlite3.dll'
@@ -52,23 +92,44 @@ $required = @(
     'lib\sqlite\runtimes\win-x64\e_sqlite3.dll'
     'lib\sqlite\runtimes\win-arm64\e_sqlite3.dll'
     'templates\Report.template.html'
+    'templates\Report.template.js'
     'docs\ExchangeLogReport-Guide.html'
     'docs\ExchangeLogReport-UserGuide.html'
     'README.md'
     'THIRD-PARTY-NOTICES.md'
+    'Run-Collector.cmd'
+    'Start-Portal.cmd'
+    'Database-Storage.cmd'
 )
-# Copied from the repository root by the package builder: hashed, required only in a distribution.
-$distributionOnly = @('CHANGELOG.md')
+# Copied from the repository root or produced by the package build: hashed, required only in a distribution.
+$distributionOnly = @(
+    'CHANGELOG.md'
+    'LICENSE'
+    'SECURITY.md'
+    'product.json'
+    'sqlite-tools\NOTICE.txt'
+)
+# Folders that exist in a built package only; their files are listed in DistributionFiles.
+$binaryFolders = @('powershell', 'sqlite-tools')
+$binaryRequired = @('powershell\pwsh.exe', 'sqlite-tools\sqlite3.exe')
 # Repository-only documents are not loaded by the engine or copied into the distribution.
 # These exact names (not an extension or directory wildcard) are the only unhashed source extras.
 $sourceDocuments = @(
-    'LICENSE'
     'docs\ExchangeLogReport-Guide.md'
     'docs\ExchangeLogReport-UserGuide.md'
     'docs\images\console-report.png'
     'docs\images\mail-daily-problems.png'
-    'docs\images\readme-banner-dark.png'
-    'docs\images\readme-banner-light.png'
+    'docs\images\portal-authentication.png'
+    'docs\images\portal-authentication-row.png'
+    'docs\images\portal-export.png'
+    'docs\images\portal-message-route.png'
+    'docs\images\portal-overview.png'
+    'docs\images\portal-overview-dark.png'
+    'docs\images\portal-server-selection.png'
+    'docs\images\portal-session-timeline.png'
+    'docs\images\portal-sessions-remote.png'
+    'docs\images\readme-banner-dark.svg'
+    'docs\images\readme-banner-light.svg'
     'docs\images\readme-console-report.png'
     'docs\images\readme-how-dark.png'
     'docs\images\readme-how-light.png'
@@ -85,6 +146,7 @@ $sourceDocuments = @(
     'docs\images\readme-sessions-light.png'
     'docs\images\readme-why-dark.png'
     'docs\images\readme-why-light.png'
+    'docs\images\report-client-sessions.png'
     'docs\images\report-message-route.png'
     'docs\images\report-overview.png'
     'docs\images\report-session-step.png'
@@ -94,7 +156,6 @@ $sourceDocuments = @(
 )
 # Written or edited by the administrator; they are data, never executed.
 $editableFiles = @(
-    'PackageIntegrity.psd1'
     'config\ExchangeLogReport.config.psd1'
     'config\ExchangeLogReport.paths.psd1'
     'config\ExchangeLogReport.mail.credential'
@@ -118,8 +179,12 @@ function Assert-OwnerSignature([string]$Path) {
     $signature = Microsoft.PowerShell.Security\Get-AuthenticodeSignature -LiteralPath $Path -ErrorAction Stop
     if ([string]$signature.Status -cne 'Valid' -or $null -eq $signature.SignerCertificate -or
         $signature.SignerCertificate.Thumbprint -cne $signer -or $null -eq $signature.TimeStamperCertificate) {
-        throw "Package integrity: expected trusted, timestamped owner signature: $Path"
+        throw "Package integrity: expected trusted, timestamped owner signature: $Path. $releaseHint"
     }
+}
+function Test-Entry($Entry) {
+    $Entry -is [hashtable] -and $Entry.Count -eq 2 -and $Entry.ContainsKey('Path') -and $Entry.ContainsKey('Sha256') -and
+        $Entry.Path -is [string] -and $Entry.Sha256 -is [string] -and $Entry.Sha256 -cmatch '^[0-9A-F]{64}$'
 }
 Assert-PlainPath $rootPath $true
 if (-not [string]::Equals([IO.Path]::GetFullPath($PSCommandPath),
@@ -129,25 +194,26 @@ if (-not [string]::Equals([IO.Path]::GetFullPath($PSCommandPath),
 Assert-PlainPath $PSCommandPath
 Assert-OwnerSignature $PSCommandPath
 $manifestPath = [IO.Path]::Combine($rootPath, 'PackageIntegrity.psd1')
+if (-not [IO.File]::Exists($manifestPath)) { throw "Package integrity: PackageIntegrity.psd1 is missing. $releaseHint" }
 Assert-PlainPath $manifestPath
 Assert-OwnerSignature $manifestPath
 # Authenticate the raw PSD1 before parsing its restricted data language.
 $manifest = Microsoft.PowerShell.Utility\Import-PowerShellDataFile -LiteralPath $manifestPath -ErrorAction Stop
-if ($manifest.Count -ne 4 -or -not $manifest.ContainsKey('SchemaVersion') -or
+if ($manifest.Count -ne 6 -or -not $manifest.ContainsKey('SchemaVersion') -or
     -not $manifest.ContainsKey('Algorithm') -or -not $manifest.ContainsKey('SignerThumbprint') -or
-    -not $manifest.ContainsKey('Files') -or $manifest.SchemaVersion -isnot [int] -or
+    -not $manifest.ContainsKey('Version') -or -not $manifest.ContainsKey('Files') -or
+    -not $manifest.ContainsKey('DistributionFiles') -or $manifest.SchemaVersion -isnot [int] -or
     $manifest.SchemaVersion -ne 1 -or $manifest.Algorithm -cne 'SHA256' -or
-    $manifest.SignerThumbprint -cne $signer -or $manifest.Files -isnot [array] -or
-    $manifest.Files.Count -ne $inventory.Count) {
+    $manifest.SignerThumbprint -cne $signer -or $manifest.Version -isnot [string] -or
+    $manifest.Files -isnot [array] -or $manifest.DistributionFiles -isnot [array]) {
     throw 'Package integrity: unsupported or incomplete manifest schema.'
+}
+if ($manifest.Files.Count -ne $inventory.Count) {
+    throw "Package integrity: the manifest lists $($manifest.Files.Count) files, $($inventory.Count) expected."
 }
 $seen = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
 foreach ($entry in $manifest.Files) {
-    if ($entry -isnot [hashtable] -or $entry.Count -ne 2 -or
-        -not $entry.ContainsKey('Path') -or -not $entry.ContainsKey('Sha256') -or
-        $entry.Path -isnot [string] -or $entry.Sha256 -isnot [string] -or
-        $entry.Path -cnotin $inventory -or $entry.Sha256 -cnotmatch '^[0-9A-F]{64}$' -or
-        -not $seen.Add($entry.Path)) {
+    if (-not (Test-Entry $entry) -or $entry.Path -cnotin $inventory -or -not $seen.Add($entry.Path)) {
         throw 'Package integrity: invalid, duplicate or unapproved inventory path/hash.'
     }
     $path = [IO.Path]::Combine($rootPath, $entry.Path)
@@ -161,6 +227,41 @@ foreach ($entry in $manifest.Files) {
 foreach ($path in $inventory) {
     if (-not $seen.Contains($path)) { throw "Package integrity: missing inventory path: $path" }
 }
+# Built binaries: validated as a list in every mode, hashed only in a distribution.
+$binary = [Collections.Generic.Dictionary[string, string]]::new([StringComparer]::OrdinalIgnoreCase)
+foreach ($entry in $manifest.DistributionFiles) {
+    if (-not (Test-Entry $entry)) { throw 'Package integrity: invalid binary inventory entry.' }
+    $parts = $entry.Path.Split('\')
+    if ($parts.Count -lt 2 -or $parts[0] -cnotin $binaryFolders -or $entry.Path.StartsWith('\') -or $entry.Path.Contains('/') -or
+        $entry.Path.Contains(':') -or ($parts | Where-Object { $_ -eq '' -or $_ -eq '.' -or $_ -eq '..' })) {
+        throw "Package integrity: binary path outside powershell and sqlite-tools: $($entry.Path)"
+    }
+    if (-not $binary.TryAdd($entry.Path, $entry.Sha256)) { throw "Package integrity: duplicate binary inventory path: $($entry.Path)" }
+}
+foreach ($path in $binaryRequired) {
+    if (-not $binary.ContainsKey($path)) { throw "Package integrity: missing binary inventory path: $path" }
+}
+$status = 'Valid (files only)'
+if ($Distribution) {
+    foreach ($pair in $binary.GetEnumerator()) {
+        $path = [IO.Path]::Combine($rootPath, $pair.Key)
+        Assert-PlainPath $path
+        $hash = (Microsoft.PowerShell.Utility\Get-FileHash -LiteralPath $path -Algorithm SHA256 -ErrorAction Stop).Hash
+        if ($hash -cne $pair.Value) { throw "Package integrity: SHA256 mismatch: $($pair.Key)" }
+    }
+    $runtime = Microsoft.PowerShell.Security\Get-AuthenticodeSignature -LiteralPath ([IO.Path]::Combine($rootPath, 'powershell', 'pwsh.exe')) -ErrorAction Stop
+    if ([string]$runtime.Status -cne 'Valid' -or $null -eq $runtime.SignerCertificate -or $runtime.SignerCertificate.Subject -notmatch '(^|, )O=Microsoft Corporation(,|$)') {
+        throw 'Package integrity: powershell\pwsh.exe must carry a valid Microsoft signature.'
+    }
+    $product = Microsoft.PowerShell.Management\Get-Content -LiteralPath ([IO.Path]::Combine($rootPath, 'product.json')) -Raw | Microsoft.PowerShell.Utility\ConvertFrom-Json
+    if (($binary['sqlite-tools\sqlite3.exe']) -cne ([string]$product.sqliteTools.executableSha256).ToUpperInvariant()) {
+        throw 'Package integrity: sqlite-tools\sqlite3.exe is not the pinned SQLite command-line tool.'
+    }
+    $status = 'Valid'
+} elseif ($DevelopmentMode) {
+    Write-Warning 'Package integrity: DevelopmentMode: the built binaries (powershell, sqlite-tools) are not verified; the files and the PowerShell signatures are.'
+    $status = 'Valid (binaries not verified: DevelopmentMode)'
+}
 $queue = [Collections.Generic.Queue[string]]::new()
 $queue.Enqueue($rootPath)
 while ($queue.Count) {
@@ -170,20 +271,36 @@ while ($queue.Count) {
         if ($directory -ceq $rootPath -and $item.PSIsContainer -and $item.Name -cin @('bin', 'data', 'logs', 'reports')) {
             continue
         }
+        if ($directory -ceq $rootPath -and $item.PSIsContainer -and $item.Name -cin $binaryFolders -and -not $Distribution) {
+            # Built binaries are listed in DistributionFiles; they are examined only by -Distribution.
+            if ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) { throw "Package integrity: protected reparse point: $relative" }
+            continue
+        }
         if ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) {
             throw "Package integrity: protected reparse point: $relative"
         }
         if ($item.PSIsContainer) { $queue.Enqueue($item.FullName); continue }
+        # The owner-signed manifest itself (authenticated above, before it was parsed).
+        if ($relative -ceq 'PackageIntegrity.psd1') { continue }
         if ($relative -cin $editableFiles -or $relative -cin $sourceDocuments) { continue }
-        if ($relative -cnotin $inventory) { throw "Package integrity: unexpected stable file: $relative" }
+        if ($relative -cin $inventory) { continue }
+        if ($Distribution -and $binary.ContainsKey($relative)) { continue }
+        throw "Package integrity: unexpected stable file: $relative"
     }
 }
-
+[pscustomobject]@{
+    Name              = 'ExchangeLogReport'
+    Version           = $manifest.Version
+    Files             = $manifest.Files.Count
+    DistributionFiles = $manifest.DistributionFiles.Count
+    Status            = $status
+    Signer            = $signer
+}
 # SIG # Begin signature block
-# MIIghQYJKoZIhvcNAQcCoIIgdjCCIHICAQExDzANBglghkgBZQMEAgEFADB5Bgor
+# MIImIQYJKoZIhvcNAQcCoIImEjCCJg4CAQExDzANBglghkgBZQMEAgEFADB5Bgor
 # BgEEAYI3AgEEoGswaTA0BgorBgEEAYI3AgEeMCYCAwEAAAQQH8w7YFlLCE63JNLG
-# KX7zUQIBAAIBAAIBAAIBAAIBADAxMA0GCWCGSAFlAwQCAQUABCDvNWQpah2ATwq0
-# dGRjjf/XYhOPHvLfYzZbA3VICCA4i6CCDW8wggZyMIIEWqADAgECAghkM1HTxzif
+# KX7zUQIBAAIBAAIBAAIBAAIBADAxMA0GCWCGSAFlAwQCAQUABCCLObRNQWx7HFZS
+# zX/4vMOSiulBY6JTBJoTsEB25/Z+mqCCDW8wggZyMIIEWqADAgECAghkM1HTxzif
 # CDANBgkqhkiG9w0BAQsFADB8MQswCQYDVQQGEwJVUzEOMAwGA1UECAwFVGV4YXMx
 # EDAOBgNVBAcMB0hvdXN0b24xGDAWBgNVBAoMD1NTTCBDb3Jwb3JhdGlvbjExMC8G
 # A1UEAwwoU1NMLmNvbSBSb290IENlcnRpZmljYXRpb24gQXV0aG9yaXR5IFJTQTAe
@@ -255,103 +372,133 @@ while ($queue.Count) {
 # ULeH38N0Vr83psiJVuBSxQyt5nRVrpYz7FACq5gtXELkyViq/rGOlJKaRrgQ6WWq
 # eoIXqKhVFAdP/jAEm2M8ezoVYsUgPyKY2OcuecV9coulAcxUIUydx6qYiOfsGj5u
 # Dy7l4aYjvB771wkUMzUQwxzcDYXJtMMTaWRe6n9EemR67jc73u5CJyFg3PfA5WR1
-# wZislcdCZuS6MYISbDCCEmgCAQEwgYwweDELMAkGA1UEBhMCVVMxDjAMBgNVBAgM
+# wZislcdCZuS6MYIYCDCCGAQCAQEwgYwweDELMAkGA1UEBhMCVVMxDjAMBgNVBAgM
 # BVRleGFzMRAwDgYDVQQHDAdIb3VzdG9uMREwDwYDVQQKDAhTU0wgQ29ycDE0MDIG
 # A1UEAwwrU1NMLmNvbSBDb2RlIFNpZ25pbmcgSW50ZXJtZWRpYXRlIENBIFJTQSBS
 # MQIQBof4ljXihJpmCqqt2mhAWzANBglghkgBZQMEAgEFAKCBhDAYBgorBgEEAYI3
 # AgEMMQowCKACgAChAoAAMBkGCSqGSIb3DQEJAzEMBgorBgEEAYI3AgEEMBwGCisG
-# AQQBgjcCAQsxDjAMBgorBgEEAYI3AgEVMC8GCSqGSIb3DQEJBDEiBCCjcdtfIL/D
-# pMgkeqNiCvZbinKwXLQyy1GkRq1FlXth6TANBgkqhkiG9w0BAQEFAASCAgCdpxRg
-# 69cwHhPj53RUDAlf4FeDpL0X9/a9YtT4+Xo/LmbUwu5grxh4w1D4J2VUoWOwkPnu
-# cZqW+dPEPZHEGvxkJwvXNGZpVWh/za0x2OzbJZX4etxA8pV2b42w8TbYc9bbE4R7
-# 7tIgJRAwblMAnt/HBE0T+e66qFMRZW28fHQbeIY41ritIaot6v+2Y2kKBpktOLOA
-# M/SwvBLexn8cYeqbsYqpBdFswXPOZJPLDw96Y7Vakz8TH5JbNZqFYJarj08l60hN
-# +0+L1tPJwWH6asKBG9NlSDDrSOwwR901hatc4CxcUxZ7uqDALJnbiS877N2yaEIz
-# cJZUS5m9VRKlC8de2tMNoYuKwZCyQP0DuTdbolJEtFUz2x0/3E7AnubYSPjnEWdD
-# 6+EKvPYV1WrRqqQZO2KKQjR+ePbJJg8Njpnx0XFB/qAS0rHey2XcjM2KsGSdVeVl
-# uASjmn3uNSO4ceveIgNB0kNwEOhKLW5hZYWvPObvCzH19gDsPsqNIZhJXTCdwapr
-# fFgRuG/poIVw2QHp9UWzIwVSYAs9AIIoVz6CdY7qCLT4wYxkK+9NXWRtqRFn0trR
-# SLay1qENyM3baK5GTVIqqR/1Jxgamjlb5DI0dTV1D5IkvVE2oc/d+gHtRfgH+lPa
-# 6HWrJgoQrIuwGmpjjpLmirHCH+KQn0jC1umkWqGCDykwgg8lBgorBgEEAYI3AwMB
-# MYIPFTCCDxEGCSqGSIb3DQEHAqCCDwIwgg7+AgEDMQ0wCwYJYIZIAWUDBAIBMIGJ
-# BgsqhkiG9w0BCRABBKB6BHgwdgIBAQYMKwYBBAGCqTABAwYBMDEwDQYJYIZIAWUD
-# BAIBBQAEIBuq81kI76GVSf3QlpEmNtuNS6TCFmf+2Pw7aS7VGp1FAghEsq34XDG3
-# 7hgPMjAyNjEwMTQwMjQxMjRaMAMCAQECEBkXk7USxQXX1abPzrAPDX6gggwAMIIE
-# /DCCAuSgAwIBAgIQH2sWYtIuG2xd8cDBoGAOODANBgkqhkiG9w0BAQsFADBzMQsw
-# CQYDVQQGEwJVUzEOMAwGA1UECAwFVGV4YXMxEDAOBgNVBAcMB0hvdXN0b24xETAP
-# BgNVBAoMCFNTTCBDb3JwMS8wLQYDVQQDDCZTU0wuY29tIFRpbWVzdGFtcGluZyBJ
-# c3N1aW5nIFJTQSBDQSBSMTAeFw0yNTAyMTgxNjMyMDJaFw0zNDExMTIxODUwMDVa
-# MG4xCzAJBgNVBAYTAlVTMQ4wDAYDVQQIDAVUZXhhczEQMA4GA1UEBwwHSG91c3Rv
-# bjERMA8GA1UECgwIU1NMIENvcnAxKjAoBgNVBAMMIVNTTC5jb20gVGltZXN0YW1w
-# aW5nIFVuaXQgMjAyNSBFMTBZMBMGByqGSM49AgEGCCqGSM49AwEHA0IABBv7UVHH
-# b+ZVluxPXlfE3M6tg0Xnq8dic+O3vPOCRpalUM1vO9A+GRzSVVjyygHhYrBw62XL
-# Fh1kv7e+yRd/aTajggFaMIIBVjAfBgNVHSMEGDAWgBQMnRAljpqnG5mHQ88IfuG9
-# gZD0zzBRBggrBgEFBQcBAQRFMEMwQQYIKwYBBQUHMAKGNWh0dHA6Ly9jZXJ0LnNz
-# bC5jb20vU1NMLmNvbS10aW1lU3RhbXBpbmctSS1SU0EtUjEuY2VyMFEGA1UdIARK
-# MEgwPAYMKwYBBAGCqTABAwYBMCwwKgYIKwYBBQUHAgEWHmh0dHBzOi8vd3d3LnNz
-# bC5jb20vcmVwb3NpdG9yeTAIBgZngQwBBAIwFgYDVR0lAQH/BAwwCgYIKwYBBQUH
-# AwgwRgYDVR0fBD8wPTA7oDmgN4Y1aHR0cDovL2NybHMuc3NsLmNvbS9TU0wuY29t
-# LXRpbWVTdGFtcGluZy1JLVJTQS1SMS5jcmwwHQYDVR0OBBYEFM582cAEgMUkEGoJ
-# 6hyrJT0R/ajSMA4GA1UdDwEB/wQEAwIHgDANBgkqhkiG9w0BAQsFAAOCAgEAgHN1
-# JIW9ZlNip07FfY9r1LJwLKTl1h/y9r1BjDgHMEz7U7J7mAy32JxA1KLyjCCJqNku
-# RfhDHGFEfZtjTOru7AQMDSDiUDvCCc3jaz5py9jGvwIe5npkLbXqXhA+SqCzG719
-# USigwhHkYr7v8NiXoaY0Xu03p0BiZZreZlpngmGB9+86N94FqIFx2I5Z5iuu7d4j
-# 7aAOZBNxfU9jFDIIGDtWfWeCpF0Q8rLE/3DHDlzJKs5Il3i/VoOl7rTU938oSrxM
-# www6GDBlKX8rGHxvkjgIb9MXkVglJSDHsNAZDeCS/inaxKHA+ChuB8K4OxIxa6k1
-# e+eHBypakAY3wuN7w7PlPmhN6k5IdqZn3HZHs2VjoR841Z9wmVPFdGDdkBZ7XOmb
-# 5OZUaKufsvtER0VbY2DkzaqAaItt1kc+I+FUz7PiVz2PUzpegkftRRxvrPyIL08b
-# lJTnbMQ0XrqDN0rEfuTLv4XhhnKyJaXhxCUdjO/cRumMzZ35QTUMItBWy1xGp0iy
-# oFVnAya2pPsVMuAI+sy1zxlOS9l5iSxvKJ8gpnpOgjqYTa7u1eyZo+4JlcGoiiR1
-# 7LthMTrF1q62tO5xOpI8txUZ6gtKGtkJV6wdj+vZLcwKZ2M93GqVpOo6UBlGjx1s
-# KsVZ7AIUzJZli4NJ0M2KYcrfNnlebkYKpDnSqWwwggb8MIIE5KADAgECAhBtUhhw
-# h+gjTYVgANCAj5NWMA0GCSqGSIb3DQEBCwUAMHwxCzAJBgNVBAYTAlVTMQ4wDAYD
+# AQQBgjcCAQsxDjAMBgorBgEEAYI3AgEVMC8GCSqGSIb3DQEJBDEiBCBuh0JZZUYH
+# /MVqtFo9iov2/EWFqCGW9io//X89HZGO6DANBgkqhkiG9w0BAQEFAASCAgBy2Nfm
+# 9WAjj9GebhNpgeqeS2j6KEpRRB1LsMRQpApntBPPtfsYBy0c6QK8Oi+JOFnBaahN
+# yD4VqSRelk8d8MDPNfCQzFgqTxcu9mp46IcGubU77KmwZdtTtYyALCegUodcg2Lo
+# vXROREgpITMmHwB44lnMtewfRmXmSWgcq4Z+b7v3w1OaVJjherQkehDR69Poxeek
+# U8J2lfbvqr5ttii3QWhoJ0qx5NtfkVBDKVy+0c5N0fmALGn0sKpi02tR7Wja9KAc
+# Uv1s+FpJQjzVN/NiEqFwG3jaYOzn/Qf8UltajIaNhsHKiJPkVUnwboC1MC6liLUX
+# TmT7zjz28/HYa9mA8wpfYeTbSR9Z4NZl9+rW7Oc2JkCbfgrZ5uJsECUyqXKQzNwe
+# uMZwapNNV9n89j+DfSYGxQShtIBwOKi02s+Sdefm8AtLExUBqKOOVDl+oHVYyEAt
+# k3n9UI2jeC3n7YBeT8iKn3xIjXHK2PrclWD8Bh0r+1ZA7MVfDOHvQVGZs+vFDuK0
+# I2NElaR1tmmzYfqxryhwFIXOii6SEFtK11TgLD7t5Orstwii9aI0EGLWmMLV7wy2
+# BN9Xx/OIb95RGxFvb5stP61PCiVTbpCmecsRstBtzD6r37yiC92V4O9Wvmbcqjx2
+# tQcm3P8il+arzxJBvODH59nPz58V+BCgFN4oHqGCFMUwghTBBgorBgEEAYI3AwMB
+# MYIUsTCCFK0GCSqGSIb3DQEHAqCCFJ4wghSaAgEDMQ0wCwYJYIZIAWUDBAIBMIGB
+# BgsqhkiG9w0BCRABBKByBHAwbgIBAQYMKwYBBAGCqTABAwYBMDEwDQYJYIZIAWUD
+# BAIBBQAEIDlmobZP0s2LHIzD/h3dX54zkt0E4iul5g0E9rFnYAWaAgg4FAU8UsYi
+# LRgPMjAyNjExMDMwOTM4MDJaMAMCAQECCD55shEuh+VdoIIRpzCCBPMwggLboAMC
+# AQICEFRD+De9Wu4YAYRyuFzajuMwDQYJKoZIhvcNAQELBQAwcjELMAkGA1UEBhMC
+# VVMxDjAMBgNVBAgMBVRleGFzMRAwDgYDVQQHDAdIb3VzdG9uMREwDwYDVQQKDAhT
+# U0wgQ29ycDEuMCwGA1UEAwwlU1NMLmNvbSBUaW1lc3RhbXBpbmcgSXNzdWluZyBS
+# U0EgQ0EgMjAeFw0yNjA2MTIxNzIyNDZaFw0zNjA2MDkxNzIyNDVaMG4xCzAJBgNV
+# BAYTAlVTMQ4wDAYDVQQIDAVUZXhhczEQMA4GA1UEBwwHSG91c3RvbjERMA8GA1UE
+# CgwIU1NMIENvcnAxKjAoBgNVBAMMIVNTTC5jb20gVGltZXN0YW1waW5nIFVuaXQg
+# MjAyNiBFMTBZMBMGByqGSM49AgEGCCqGSM49AwEHA0IABOgli7hmEy5IkjjzCzbJ
+# DgbYV7CIUUgOOn3jkML0i3A2jYer8VMwShMdSnRQURbOzh65x/ytFQOjGw0CBaVI
+# ND2jggFSMIIBTjAfBgNVHSMEGDAWgBRwmmXBQ4Cj/OmxZIlu8TCcCSHJfDBNBggr
+# BgEFBQcBAQRBMD8wPQYIKwYBBQUHMAKGMWh0dHA6Ly9jZXJ0LnNzbC5jb20vU1NM
+# LmNvbS10aW1lU3RhbXBpbmctSS1SMi5jZXIwUQYDVR0gBEowSDA8BgwrBgEEAYKp
+# MAEDBgEwLDAqBggrBgEFBQcCARYeaHR0cHM6Ly93d3cuc3NsLmNvbS9yZXBvc2l0
+# b3J5MAgGBmeBDAEEAjAWBgNVHSUBAf8EDDAKBggrBgEFBQcDCDBCBgNVHR8EOzA5
+# MDegNaAzhjFodHRwOi8vY3Jscy5zc2wuY29tL1NTTC5jb20tdGltZVN0YW1waW5n
+# LUktUjIuY3JsMB0GA1UdDgQWBBQnrANWuihquhc7gz1Af3moJOzDPDAOBgNVHQ8B
+# Af8EBAMCB4AwDQYJKoZIhvcNAQELBQADggIBAE92bs78A57CGU1wZ/oY5rgV4Mwd
+# dn22MU/bmHumb4b6W2VinMg0IGnBE5D8PJOsnqp2AmMhWdOt5TDxKgIQA9pzBute
+# GYez7R1vQ1qn7IIr8Wz2AXjfre1MYJGE93saW1jHTxKgbVlchzry3CrzMYCVnyYw
+# DcFZMFQ35Mv4+3H9vPoopjfDynO0v7vPy3p0UZ1dltmH53EZ5M/Qn7OZ0Q82mYLo
+# h666dhscIJzUEh+BgYxzpdz8y7J1WxqGSouGRI4F7qbOJhhjiu/hgdhwJUJ/jkve
+# OHB6pZB9IBJbdlns6AjUaRC6YfamsbgZ40hKl1ln4BOshgcDtLsSjaqVlUx5gMK+
+# krwT6H8bm1yLhJ/Yr0eAizrgMVEqyeNWQYP6qhtKCYxehpESm8au3MlkpBGWCYZi
+# goNh4OX1x2oDsYsG5p+ST2db4Vgq25N7/3U8doL0yufnqwuR/f603JY1CO++sndq
+# 34Y35Kb8gLG7V7OA+5658PIvcKK+fn3bUUiQVcasy5spBX7aC9FKdkPvrciglHa4
+# m3XJ6weBykt7PrdwI3XGwNOgwi/Bon0IvXy9MkQUTZQOKOgT/kq++eTGgjY1EWGQ
+# 7w8sSRwQU+3Ko2SMLIkfLPuvOtJ6BWwQbXYHtiMOwjwv9UN9SNu4VaJUuwdMmqN7
+# /F9jLVst5rGZV03BMIIF3TCCA8WgAwIBAgIIeyyb0xaAMpkwDQYJKoZIhvcNAQEL
+# BQAwfDELMAkGA1UEBhMCVVMxDjAMBgNVBAgMBVRleGFzMRAwDgYDVQQHDAdIb3Vz
+# dG9uMRgwFgYDVQQKDA9TU0wgQ29ycG9yYXRpb24xMTAvBgNVBAMMKFNTTC5jb20g
+# Um9vdCBDZXJ0aWZpY2F0aW9uIEF1dGhvcml0eSBSU0EwHhcNMTYwMjEyMTczOTM5
+# WhcNNDEwMjEyMTczOTM5WjB8MQswCQYDVQQGEwJVUzEOMAwGA1UECAwFVGV4YXMx
+# EDAOBgNVBAcMB0hvdXN0b24xGDAWBgNVBAoMD1NTTCBDb3Jwb3JhdGlvbjExMC8G
+# A1UEAwwoU1NMLmNvbSBSb290IENlcnRpZmljYXRpb24gQXV0aG9yaXR5IFJTQTCC
+# AiIwDQYJKoZIhvcNAQEBBQADggIPADCCAgoCggIBAPkP3aMrfcvQKv7sZ4Wm5y4b
+# unfh4/WvpOz6Sl2RxFdHaxh3a3by/ZPkPQ/CFp4LZsNWlJ4Xg4XOVu/yFv0AYvUi
+# CVToZRdOQbngT0aXqhvIuG5iXmmxX9sqAn78bMrzQdjt0Oj8P2FI7bADFB0QDksZ
+# 4LtO7IZl/zbzXmcCC52GVWH9ejjt/uIZALdvoVBidXQ8oPrIJZK0bnoix/geoeOy
+# 3ZExqysdBP+lSgQ36YWkMyv94tZVNHwZpEpox7Ko07fKoZOI68GXvIz5HdkihCR0
+# xwQ9aqkpk8zruFvh/l8lqjRYyMEjVJ0bmBHDOJx+PYZspQ9AhnwC9FwCTyjLrnGf
+# DzrIM/4RJTXq/LrFYD3ZfBjVsqnTdXgDciLKOsMf7yzlLqn6niy2UUb9rwPW6mBo
+# 6oUWNmuF6R7As93EJNyAKoFBbZQ+yODJgUEAnl6/f8UImKIYLEJAs/lvOCdLToD0
+# PYFH4Ih86hzOtXVcUS4cK38acijnALXRdMbX5J+tB5O2UzU1/Dfkw/ZdFr4hc96S
+# CvigY2q8lpJqPvi8ZVWb3vUNiSYE/CUapiVpy8JtynziWV+XrOvvLsi81xtZPCvM
+# 8hnIk2snYxnP/Okm+Mpxm3+T/jRnhE6Z6/yzeAkzcLpmpnbtG3PrGqUNxCITIJRW
+# Ck4sbE6x/c+cCbqiM+2HAgMBAAGjYzBhMB0GA1UdDgQWBBTdBAkHovV6fVJTEpKV
+# 7jiAJQ2mWTAPBgNVHRMBAf8EBTADAQH/MB8GA1UdIwQYMBaAFN0ECQei9Xp9UlMS
+# kpXuOIAlDaZZMA4GA1UdDwEB/wQEAwIBhjANBgkqhkiG9w0BAQsFAAOCAgEAIBgR
+# lCn7Jp0cHh5wYfGVcpNxJK1ok1iOMq8bs3AD/CUrdIWQPXhq9LmLpZc7tRiRux6n
+# +UBbkflVma8eEdBcHadm47GUBwwyOabqG7B52B2ccETjit3E+ZUfijhDPwGFpUen
+# PUayvOUiaPd7nNgsPgohyC0zrL/FgZkxdMF1ccW+sfAjRfSda/wZY52jvATGGAsl
+# u1OJD7OAUN5F7kR/q5R4ZJjT9ijdh9hwZXT7DrkT66cPYakylszeu+1jTBi7qUD3
+# oFRuIIhxdRjqerQ0cuAjJ3dctpDqhiVAq+8zD8ufgr6iIPv2tS0a5sKFsXQP+8hl
+# AqRSAUfdSSLBv9jra6x+3uxjMxW3IwiPxg+NQVrdjsW5j+VFP3jbutIbQLH+cU0/
+# 4IGiul607BXgk90IH37hVZkLId6Tngr75qNJvTYw/ud3sqB1l7UtgYgXZSD32pAA
+# n8lSzDLKNXz1PQ/YK9f1JmzJBjSWFupwWRoyeXkLtoh/D1JIPb9s2KJELtFOt3JY
+# 04kTlf5Eq/jXixtunLwsoFvVagCvXzfh1foQC5ichucmj87w7G6KVwuA406ywKBj
+# YZC6VWg3dGq2ktufoYYitmUnDuy2n0Jg5GfCtdpBC8TTi2EbvPofkSvXRAdeuims
+# 2cXp71NIWuuA8ShYIc2wBlX7Jz9TkHCpBB5XJ7kwggbLMIIEs6ADAgECAhBSnbvC
+# uImH9YOA4LDrogY2MA0GCSqGSIb3DQEBCwUAMHwxCzAJBgNVBAYTAlVTMQ4wDAYD
 # VQQIDAVUZXhhczEQMA4GA1UEBwwHSG91c3RvbjEYMBYGA1UECgwPU1NMIENvcnBv
 # cmF0aW9uMTEwLwYDVQQDDChTU0wuY29tIFJvb3QgQ2VydGlmaWNhdGlvbiBBdXRo
-# b3JpdHkgUlNBMB4XDTE5MTExMzE4NTAwNVoXDTM0MTExMjE4NTAwNVowczELMAkG
+# b3JpdHkgUlNBMB4XDTI2MDYxMjE2NDIxNVoXDTQxMDIxMjE3MzkzOVowcjELMAkG
 # A1UEBhMCVVMxDjAMBgNVBAgMBVRleGFzMRAwDgYDVQQHDAdIb3VzdG9uMREwDwYD
-# VQQKDAhTU0wgQ29ycDEvMC0GA1UEAwwmU1NMLmNvbSBUaW1lc3RhbXBpbmcgSXNz
-# dWluZyBSU0EgQ0EgUjEwggIiMA0GCSqGSIb3DQEBAQUAA4ICDwAwggIKAoICAQCu
-# URAT0vk8IKAghd7JUBxkyeH9xek0/wp/MUjoclrFXqhh/fGH91Fc+7fm0MHCE7A+
-# wmOiqBj9ODrJAYGq3rm33jCnHSsCBNWAQYyoauLq8IjqsS1JlXL29qDNMMdwZ8UN
-# zQS7vWZMDJ40JSGNphMGTIA2qn2bohGtgRc4p1395ESypUOaGvJ3t0FNL3BuKmb6
-# YctMcQUF2sqooMzd89h0E6ujdvBDo6ZwNnWoxj7YmfWjSXg33A5GuY9ym4QZM5OE
-# Vgo8ebz/B+gyhyCLNNhh4Mb/4xvCTCMVmNYrBviGgdPZYrym8Zb84TQCmSuX0JlL
-# La6WK1aO6qlwISbb9bVGh866ekKblC/XRP20gAu1CjvcYciUgNTrGFg8f8AJgQPO
-# Cc1/CCdaJSYwhJpSdheKOnQgESgNmYZPhFOC6IKaMAUXk5U1tjTcFCgFvvArXtK4
-# azAWUOO1Y3fdldIBL6LjkzLUCYJNkFXqhsBVcPMuB0nUDWvLJfPimstjJ8lF4S6E
-# CxWnlWi7OElVwTnt1GtRqeY9ydvvGLntU+FecK7DbqHDUd366UreMkSBtzevAc9a
-# qoZPnjVMjvFqV1pYOjzmTiVHZtAc80bAfFe5LLfJzPI6DntNyqobpwTevQpHqPDN
-# 9qqNO83r3kaw8A9j+HZiSw2AX5cGdQP0kG0vhzfgBwIDAQABo4IBgTCCAX0wEgYD
-# VR0TAQH/BAgwBgEB/wIBADAfBgNVHSMEGDAWgBTdBAkHovV6fVJTEpKV7jiAJQ2m
-# WTCBgwYIKwYBBQUHAQEEdzB1MFEGCCsGAQUFBzAChkVodHRwOi8vd3d3LnNzbC5j
-# b20vcmVwb3NpdG9yeS9TU0xjb21Sb290Q2VydGlmaWNhdGlvbkF1dGhvcml0eVJT
-# QS5jcnQwIAYIKwYBBQUHMAGGFGh0dHA6Ly9vY3Nwcy5zc2wuY29tMD8GA1UdIAQ4
-# MDYwNAYEVR0gADAsMCoGCCsGAQUFBwIBFh5odHRwczovL3d3dy5zc2wuY29tL3Jl
-# cG9zaXRvcnkwEwYDVR0lBAwwCgYIKwYBBQUHAwgwOwYDVR0fBDQwMjAwoC6gLIYq
-# aHR0cDovL2NybHMuc3NsLmNvbS9zc2wuY29tLXJzYS1Sb290Q0EuY3JsMB0GA1Ud
-# DgQWBBQMnRAljpqnG5mHQ88IfuG9gZD0zzAOBgNVHQ8BAf8EBAMCAYYwDQYJKoZI
-# hvcNAQELBQADggIBAJIZdQ2mWkLPGQfZ8vyU+sCb8BXpRJZaL3Ez3VDlE3uZk3cP
-# xPtybVfLuqaci0W6SB22JTMttCiQMnIVOsXWnIuAbD/aFTcUkTLBI3xys+wEajzX
-# aXJYWACDS47BRjDtYlDW14gLJxf8W6DQoH3jHDGGy8kGJFOlDKG7/YrK7UGfHtBA
-# EDVe6lyZ+FtCsrk7dD/IiL/+Q3Q6SFASJLQ2XI89ihFugdYL77CiDNXrI2MFspQG
-# swXEAGpHuaQDTHUp/LdR3TyrIsLlnzoLskUGswF/KF8+kpWUiKJNC4rPWtNrxlbX
-# YRGgdEdx8SMjUTDClldcrknlFxbqHsVmr9xkT2QtFmG+dEq1v5fsIK0vHaHrWjMM
-# maJ9i+4qGJSD0stYfQ6v0PddT7EpGxGd867Ada6FZyHwbuQSadMb0K0P0OC2r7rw
-# qBUe0BaMqTa6LWzWItgBjGcObXeMxmbQqlEz2YtAcErkZvh0WABDDE4U8GyV/32F
-# daAvJgTfe9MiL2nSBioYe/g5mHUSWAay/Ip1RQmQCvmF9sNfqlhJwkjy/1U1ibUk
-# TIUBX3HgymyQvqQTZLLys6pL2tCdWcjI9YuLw30rgZm8+K387L7ycUvqrmQ3ZJlu
-# jHl3r1hgV76s3WwMPgKk1bAEFMj+rRXimSC+Ev30hXZdqyMdl/il5Ksd0vhGMYIC
-# WDCCAlQCAQEwgYcwczELMAkGA1UEBhMCVVMxDjAMBgNVBAgMBVRleGFzMRAwDgYD
-# VQQHDAdIb3VzdG9uMREwDwYDVQQKDAhTU0wgQ29ycDEvMC0GA1UEAwwmU1NMLmNv
-# bSBUaW1lc3RhbXBpbmcgSXNzdWluZyBSU0EgQ0EgUjECEB9rFmLSLhtsXfHAwaBg
-# DjgwCwYJYIZIAWUDBAIBoIIBYTAaBgkqhkiG9w0BCQMxDQYLKoZIhvcNAQkQAQQw
-# HAYJKoZIhvcNAQkFMQ8XDTI2MTAxNDAyNDEyNFowKAYJKoZIhvcNAQk0MRswGTAL
-# BglghkgBZQMEAgGhCgYIKoZIzj0EAwIwLwYJKoZIhvcNAQkEMSIEIC1Sd/Rnzjgc
-# PHzXyf1pNT5lMkvy7WhAcr3TzvbkBPxcMIHJBgsqhkiG9w0BCRACLzGBuTCBtjCB
-# szCBsAQgVCr5oWqNci5mEUl4iumUwYqaruWmXLNEolSa+Wx5x4swgYswd6R1MHMx
-# CzAJBgNVBAYTAlVTMQ4wDAYDVQQIDAVUZXhhczEQMA4GA1UEBwwHSG91c3RvbjER
-# MA8GA1UECgwIU1NMIENvcnAxLzAtBgNVBAMMJlNTTC5jb20gVGltZXN0YW1waW5n
-# IElzc3VpbmcgUlNBIENBIFIxAhAfaxZi0i4bbF3xwMGgYA44MAoGCCqGSM49BAMC
-# BEcwRQIgGpsKiSbC4HoJ9hd8mVxCPfgce3XjxdgkYu+pqQAj+MMCIQDsBf0k7gx0
-# XBekH716Cy1S+cJaCmG21Op5DVlYQ3I4pQ==
+# VQQKDAhTU0wgQ29ycDEuMCwGA1UEAwwlU1NMLmNvbSBUaW1lc3RhbXBpbmcgSXNz
+# dWluZyBSU0EgQ0EgMjCCAiIwDQYJKoZIhvcNAQEBBQADggIPADCCAgoCggIBAJ8v
+# q+ZzTZC8MUabNgd5WlBjVPcu71oiedNd8n9Il8+uW0HcGvW44/Jf0pHl6hxqn0od
+# haGnvvNBPJgxH/d6CMI7Mtgl9nF5isarRfByRmAeH+skYShA+dMJGzsrC9NiF3/v
+# xGZ2uOI334YVc+DlP5OdsUPz5yIP7hYXNlpPknPwh6gK/pWFZD8+y8uUagfX9USh
+# q/SQt+1tS4FXRwudHTSHbGt0Fz4ZbWGbm0d56ROAW34tI6FFuZ+TtGssHjeOUf2F
+# S8QNGBpadTh1X1Z7Kl6vG4Z8NS3OJIyelzoF5TpcP2vM3ue0723bmZd3oXsE5rzt
+# AJMv56jlg0vSDz8XcXRur6awW0rh5cTQDQQGx04hYJH2Zn9HWWJU/wJ2SKBcQKtB
+# yCz6JX+DoFoBE++kolkpZtl2ESF8FY6XqhtKZb18ESEAc0ohCY+0HkBZwrx8eIED
+# CDbzd/shv9a8YRG2oxr3tLUz95V+Dzzh1QBNECaeGczyNWGCZIVUa4lVcVUVOBbI
+# OAT8D+iPmC5h29bWeES8DhTS4f4CWA4D5QoQqMTqIBcV4MD2Waw8hEWAdGnjnsVt
+# DimnDeEUbvXKhdiirvwG+QC+3mAy1RlD6xBMmGyDAKVSqqXm3NP4w0J4gvt65Grk
+# QI4FXPJtYqfwkIBtQ8OGfbpVUQGPVUemWtui7E21AgMBAAGjggFRMIIBTTASBgNV
+# HRMBAf8ECDAGAQH/AgEAMB8GA1UdIwQYMBaAFN0ECQei9Xp9UlMSkpXuOIAlDaZZ
+# ME0GCCsGAQUFBwEBBEEwPzA9BggrBgEFBQcwAoYxaHR0cDovL2NlcnQuc3NsLmNv
+# bS9TU0xjb20tUm9vdENBLVJTQS00MDk2LVIxLmNlcjA/BgNVHSAEODA2MDQGBFUd
+# IAAwLDAqBggrBgEFBQcCARYeaHR0cHM6Ly93d3cuc3NsLmNvbS9yZXBvc2l0b3J5
+# MBMGA1UdJQQMMAoGCCsGAQUFBwMIMEIGA1UdHwQ7MDkwN6A1oDOGMWh0dHA6Ly9j
+# cmxzLnNzbC5jb20vU1NMY29tLVJvb3RDQS1SU0EtNDA5Ni1SMS5jcmwwHQYDVR0O
+# BBYEFHCaZcFDgKP86bFkiW7xMJwJIcl8MA4GA1UdDwEB/wQEAwIBhjANBgkqhkiG
+# 9w0BAQsFAAOCAgEAZRRbzTHpgOogYgWKOeiCkI1oVrkGmCrqOKqX9CiTREQLdYM/
+# h7ANki98QP1fhAPEkTzT/Ur19IrPuZg7KaWL6SsmBqmD9+mBVtJmxdRdGbV8bpgl
+# FDv2VeZgTSg3+UOD2O0G9HlgHqVHNKzSa/zL5+WYl3yT8Q29sZnIPGkQ+udv56/j
+# q5NlAT9BON4iXSOCxe1bNvUd0hkS2GTsTNeQyOEHm7CkZdCg5X+DpmBginO7pk8Y
+# m5GbTdQtSloJ3/Y2nVPycJ8kmmBAYMev7/hVQukhjjc4mO03LyPTFfqmMR1D5Tpu
+# gGkD9nUuG41l55vOpXQm1JMbTgArpkn0/e9O+yTYlWuz2dSAZHf9jxNQAvILO1Pv
+# 2JNQTfV0TyIteZP7gNcRfaHnnuSho8ohipKiE+1vEJIFE+c3gopxSpHCmn2THETk
+# lWKV7ZrUKhhkdoOLj2KidCtYZrOoCV6x7f9+KfDPT61fKDVntGZdRKwzLV53VIN6
+# oSS+KQN2VJaO8OZTOZpfgO4o6/9xpNr+EEaA3hNkoZk13R4LaqPC/309dfZmHBE8
+# nBNjWBkV7AZdzdK8w7B0a/D9066a6oUa19OIktD+3kPpQ8YEt8oRp9zs1hoQ7fRn
+# 9sdantP6nYRQFTpF8czGc+FGresbAH819Pv5vBhCluTo8Px2PpC71cM0jzsxggJV
+# MIICUQIBATCBhjByMQswCQYDVQQGEwJVUzEOMAwGA1UECAwFVGV4YXMxEDAOBgNV
+# BAcMB0hvdXN0b24xETAPBgNVBAoMCFNTTCBDb3JwMS4wLAYDVQQDDCVTU0wuY29t
+# IFRpbWVzdGFtcGluZyBJc3N1aW5nIFJTQSBDQSAyAhBUQ/g3vVruGAGEcrhc2o7j
+# MAsGCWCGSAFlAwQCAaCCAWAwGgYJKoZIhvcNAQkDMQ0GCyqGSIb3DQEJEAEEMBwG
+# CSqGSIb3DQEJBTEPFw0yNjExMDMwOTM4MDJaMCgGCSqGSIb3DQEJNDEbMBkwCwYJ
+# YIZIAWUDBAIBoQoGCCqGSM49BAMCMC8GCSqGSIb3DQEJBDEiBCCFYQcbgaerW9fg
+# GCrwDAjKpQux8SpMqnh+cVHylVaddTCByAYLKoZIhvcNAQkQAi8xgbgwgbUwgbIw
+# ga8EIFdP6heq+l58aiubCMmYsXNeRQs4c8pE5qJMoJMOY/OwMIGKMHakdDByMQsw
+# CQYDVQQGEwJVUzEOMAwGA1UECAwFVGV4YXMxEDAOBgNVBAcMB0hvdXN0b24xETAP
+# BgNVBAoMCFNTTCBDb3JwMS4wLAYDVQQDDCVTU0wuY29tIFRpbWVzdGFtcGluZyBJ
+# c3N1aW5nIFJTQSBDQSAyAhBUQ/g3vVruGAGEcrhc2o7jMAoGCCqGSM49BAMCBEYw
+# RAIgImT3VQNFXqTikUo1bOjlucFHF9+vWmb4u5SPUzGgvZoCIBW3Sp2w0Dft4O1W
+# uiJdqhgGIyW9zcG4W3eKsDZlX5JJ
 # SIG # End signature block

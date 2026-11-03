@@ -2,7 +2,7 @@
 //  Exchange Log Report - engine, part 7: sending the report by e-mail (SMTP)
 // -----------------------------------------------------------------------------
 //  Author  : Nicolas Fabert
-//  Version : 2.0.0
+//  Version : 3.0.0
 //
 //  A small SMTP client (RFC 5321) written for the tool, so that every option is
 //  explicit and checked:
@@ -495,34 +495,56 @@ namespace ExchangeLogReport
     public static class ReportMail
     {
         static string H(object v) { return WebUtility.HtmlEncode(Convert.ToString(v, CultureInfo.InvariantCulture) ?? ""); }
+        /// <summary>A share in whole percent, rounded half up as the overview tile of the report rounds it (62.5 % is 63).</summary>
+        internal static string Percent(long part, long whole) { return Math.Round(100.0 * part / whole, MidpointRounding.AwayFromZero).ToString("0", CultureInfo.InvariantCulture); }
         static string N(object v) { return v == null ? "-" : Convert.ToInt64(v, CultureInfo.InvariantCulture).ToString("N0", CultureInfo.GetCultureInfo("en-US")); }
 
         /// <summary>
-        /// Builds the message. Attach: Html (the HTML file; zipped when it is larger than the limit), Zip (every file of
-        /// the report in one archive) or None. An attachment still larger than maxBytes is left out and the body says so.
+        /// Builds the message. Attach: Html (the HTML file; zipped when it is larger than the limit, together with its data
+        /// folder when the report has one), Zip (every file of the report, and the data folder, in one archive) or None.
+        /// An attachment still larger than maxBytes is left out and the body says so.
         /// </summary>
         public static MailContent Build(ReportResult report, string subject, string title, string period, string reportType, string computer, string attach, long maxBytes)
         {
             var m = new MailContent { Subject = subject };
-            string note = null;
+            string note = null, folderNote = null;
             if (!string.Equals(attach, "None", StringComparison.OrdinalIgnoreCase))
             {
                 MailAttachment a = null;
-                if (string.Equals(attach, "Html", StringComparison.OrdinalIgnoreCase) && report.HtmlPath != null && File.Exists(report.HtmlPath))
+                bool page = string.Equals(attach, "Html", StringComparison.OrdinalIgnoreCase) && report.HtmlPath != null && File.Exists(report.HtmlPath);
+                var entries = new List<KeyValuePair<string, string>>();   // file, name in the archive
+                if (page) entries.Add(new KeyValuePair<string, string>(report.HtmlPath, Path.GetFileName(report.HtmlPath)));
+                else foreach (var f in report.Files.Select(x => x.Path).Where(File.Exists)) entries.Add(new KeyValuePair<string, string>(f, Path.GetFileName(f)));
+                bool withFolder = !string.IsNullOrEmpty(report.HtmlDataFolder) && Directory.Exists(report.HtmlDataFolder) && (page || entries.Any(x => x.Key == report.HtmlPath));
+                if (withFolder)
                 {
-                    var bytes = File.ReadAllBytes(report.HtmlPath);
-                    a = bytes.LongLength <= maxBytes
-                        ? new MailAttachment { Name = Path.GetFileName(report.HtmlPath), ContentType = "text/html", Content = bytes }
-                        : Zip(new[] { report.HtmlPath }, Path.GetFileNameWithoutExtension(report.HtmlPath) + ".zip");
+                    string folderName = Path.GetFileName(report.HtmlDataFolder.TrimEnd('\\', '/'));
+                    foreach (var f in Directory.GetFiles(report.HtmlDataFolder)) entries.Add(new KeyValuePair<string, string>(f, folderName + "/" + Path.GetFileName(f)));
+                    folderNote = "The page needs its " + folderName + " folder: extract the zip before opening it.";
                 }
-                else a = Zip(report.Files.Select(f => f.Path).Where(File.Exists).ToArray(), Path.GetFileName(report.Folder.TrimEnd('\\', '/')) + ".zip");
-                if (a != null && a.Content.LongLength > maxBytes)
+                // Raw size known from the directory: a report far above the limit is left out without building the archive.
+                // Base64 of gzip data compresses only to about three quarters (6 of 8 bits), CSV text to about a tenth: more
+                // than 10 times the limit cannot fit whatever the files are.
+                long raw = entries.Sum(x => new FileInfo(x.Key).Length);
+                if (raw > 10 * maxBytes)
                 {
-                    note = string.Format(CultureInfo.InvariantCulture, "The report ({0:0.0} MB) is larger than Mail.MaxAttachmentMB: it is not attached. It is in {1} on {2}.", a.Content.LongLength / 1048576.0, report.Folder, computer);
-                    m.OmittedBytes = a.Content.LongLength;
-                    a = null;
+                    note = string.Format(CultureInfo.InvariantCulture, "The report (about {0:0.0} MB) is larger than Mail.MaxAttachmentMB: it is not attached. It is in {1} on {2}.", raw / 1048576.0, report.Folder, computer);
+                    m.OmittedBytes = raw;
                 }
-                if (a != null) m.Attachments.Add(a);
+                else if (page && !withFolder && raw <= maxBytes)
+                    a = new MailAttachment { Name = Path.GetFileName(report.HtmlPath), ContentType = "text/html", Content = File.ReadAllBytes(report.HtmlPath) };
+                else if (entries.Count > 0)
+                {
+                    string zipName = page ? Path.GetFileNameWithoutExtension(report.HtmlPath) + ".zip" : Path.GetFileName(report.Folder.TrimEnd('\\', '/')) + ".zip";
+                    long zipped;
+                    a = Zip(entries, zipName, report.Folder, maxBytes, out zipped);
+                    if (a == null)
+                    {
+                        note = string.Format(CultureInfo.InvariantCulture, "The report ({0:0.0} MB) is larger than Mail.MaxAttachmentMB: it is not attached. It is in {1} on {2}.", zipped / 1048576.0, report.Folder, computer);
+                        m.OmittedBytes = zipped;
+                    }
+                }
+                if (a != null) m.Attachments.Add(a); else folderNote = null;
             }
             else note = "The report is in " + report.Folder + " on " + computer + ".";
 
@@ -531,6 +553,10 @@ namespace ExchangeLogReport
             var figures = new List<KeyValuePair<string, string>>();
             bool edge = counts.ContainsKey("smtpdestinations");
             if (!edge) figures.Add(new KeyValuePair<string, string>("Real users", N(count("users"))));
+            // Users with a recorded authentication type: the share that used OAuth, and those still seen on Basic or Windows authentication.
+            if (!edge && count("usersWithAuth") > 0)
+                figures.Add(new KeyValuePair<string, string>("Authentication", Percent(count("usersOnOAuth"), count("usersWithAuth")) +
+                    " % of users on OAuth, " + N(count("usersOnBasic")) + " on Basic, " + N(count("usersOnIntegrated")) + " on Negotiate/NTLM/Kerberos"));
             if (counts.ContainsKey("sessions")) figures.Add(new KeyValuePair<string, string>("Client sessions", N(count("sessions")) + " (" + N(count("sessionsWithFailures")) + " with failures)"));
             if (counts.ContainsKey("issues")) figures.Add(new KeyValuePair<string, string>("Failed or slow requests", N(count("issues"))));
             if (counts.ContainsKey("messages")) figures.Add(new KeyValuePair<string, string>("Messages", N(count("messages")) + " (" + N(count("smtp")) + " SMTP transactions)"));
@@ -577,7 +603,7 @@ namespace ExchangeLogReport
             }
             AppendHighlights(report.Highlights, html, text);
             string attached = m.Attachments.Count > 0 ? "Attached: " + m.Attachments[0].Name + " (" + (m.Attachments[0].Content.LongLength / 1024.0).ToString("N0", CultureInfo.InvariantCulture) + " KB)." : null;
-            foreach (var p in new[] { attached, note }.Where(x => x != null))
+            foreach (var p in new[] { attached, folderNote, note }.Where(x => x != null))
             {
                 html.Append("<p style=\"color:#57606a;margin-top:16px\">").Append(H(p)).Append("</p>");
                 text.Append("\r\n").Append(p).Append("\r\n");
@@ -627,15 +653,21 @@ namespace ExchangeLogReport
             }
         }
 
-        static MailAttachment Zip(string[] files, string name)
+        // The archive is built in a file next to the report and read back only when it fits the limit: a report of several
+        // hundred MB never sits in memory. null (and its size in `length`) when the archive is larger than maxBytes.
+        static MailAttachment Zip(List<KeyValuePair<string, string>> files, string name, string folder, long maxBytes, out long length)
         {
-            if (files.Length == 0) return null;
-            using (var ms = new MemoryStream())
+            string temp = Path.Combine(Directory.Exists(folder) ? folder : Path.GetTempPath(), ".mail-" + Guid.NewGuid().ToString("N") + ".zip.partial");
+            try
             {
-                using (var zip = new ZipArchive(ms, ZipArchiveMode.Create, true))
-                    foreach (var f in files) zip.CreateEntryFromFile(f, Path.GetFileName(f), CompressionLevel.Optimal);
-                return new MailAttachment { Name = name, ContentType = "application/zip", Content = ms.ToArray() };
+                using (var stream = new FileStream(temp, FileMode.Create, FileAccess.ReadWrite, FileShare.None))
+                using (var zip = new ZipArchive(stream, ZipArchiveMode.Create, false))
+                    foreach (var f in files) zip.CreateEntryFromFile(f.Key, f.Value, CompressionLevel.Optimal);
+                length = new FileInfo(temp).Length;
+                if (length > maxBytes) return null;
+                return new MailAttachment { Name = name, ContentType = "application/zip", Content = File.ReadAllBytes(temp) };
             }
+            finally { try { if (File.Exists(temp)) File.Delete(temp); } catch { } }
         }
     }
 }

@@ -25,6 +25,86 @@ namespace ExchangeLogReport
         public int Ordinal, Priority;
     }
 
+    internal sealed class ExactMessageCounts : IDisposable
+    {
+        readonly ReportScratch _scratch;
+        readonly string _server;
+        readonly SqliteCommand _addServer;
+        // Server names compare case-insensitively and keep the first spelling; identities stay exact (ordinal) strings.
+        readonly Dictionary<string, int> _ids = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
+        readonly List<string> _names = new List<string>();
+        readonly Dictionary<int, HashSet<string>> _current = new Dictionary<int, HashSet<string>>();
+        readonly List<long[]> _hours = new List<long[]>();
+        long _hour = long.MinValue;
+
+        public ExactMessageCounts(ReportScratch scratch)
+        {
+            _scratch = scratch;
+            _server = "message_server_" + scratch.NewId().ToString(System.Globalization.CultureInfo.InvariantCulture);
+            // The server is an integer id, so the primary key needs no managed collation callback.
+            using (var c = scratch.Command("CREATE TABLE " + _server +
+                "(server_id INTEGER, identity TEXT COLLATE BINARY, PRIMARY KEY(server_id,identity)) WITHOUT ROWID;"))
+                c.ExecuteNonQuery();
+            _addServer = scratch.Own(scratch.Command("INSERT OR IGNORE INTO " + _server + " VALUES(@s,@i);"));
+            _addServer.Parameters.Add("@s", SqliteType.Integer); _addServer.Parameters.Add("@i", SqliteType.Text);
+            _addServer.Prepare();
+        }
+
+        // Rows arrive in time order: only the current hour is held in memory, then its distinct identities are flushed.
+        public void Add(string server, long hour, string identity)
+        {
+            if (hour != _hour)
+            {
+                if (hour < _hour) throw new InvalidDataException("Message events must be read in time order.");
+                Flush();
+                _hour = hour;
+            }
+            int id;
+            if (!_ids.TryGetValue(server, out id)) { id = _names.Count; _ids[server] = id; _names.Add(server); }
+            HashSet<string> set;
+            if (!_current.TryGetValue(id, out set)) _current[id] = set = new HashSet<string>(StringComparer.Ordinal);
+            set.Add(identity);
+        }
+
+        void Flush()
+        {
+            foreach (var kv in _current)
+            {
+                if (kv.Value.Count == 0) continue;
+                _hours.Add(new[] { kv.Key, _hour, kv.Value.Count });
+                // Sorted identities keep the scratch index inserts local.
+                var sorted = new string[kv.Value.Count];
+                kv.Value.CopyTo(sorted);
+                Array.Sort(sorted, StringComparer.Ordinal);
+                _addServer.Parameters["@s"].Value = kv.Key;
+                foreach (var identity in sorted)
+                {
+                    _addServer.Parameters["@i"].Value = identity;
+                    _addServer.ExecuteNonQuery();
+                }
+                kv.Value.Clear();
+            }
+        }
+
+        public void Read(Action<string, long> server, Action<string, long, long> hour)
+        {
+            Flush();
+            _hour = long.MaxValue;
+            var totals = new Dictionary<int, long>();
+            using (var c = _scratch.Command("SELECT server_id,COUNT(*) FROM " + _server + " GROUP BY server_id;"))
+            using (var r = c.ExecuteReader()) while (r.Read()) totals[r.GetInt32(0)] = r.GetInt64(1);
+            foreach (var id in totals.Keys.OrderBy(x => _names[x], StringComparer.OrdinalIgnoreCase)) server(_names[id], totals[id]);
+            foreach (var h in _hours.OrderBy(x => _names[(int)x[0]], StringComparer.OrdinalIgnoreCase).ThenBy(x => x[1])) hour(_names[(int)h[0]], h[1], h[2]);
+        }
+
+        public void Dispose()
+        {
+            _addServer.Dispose();
+            _scratch.Forget(_addServer);
+            using (var c = _scratch.Command("DROP TABLE " + _server + ";")) c.ExecuteNonQuery();
+        }
+    }
+
     internal sealed class ReportScratch : IDisposable
     {
         sealed class DiskTable
@@ -42,6 +122,7 @@ namespace ExchangeLogReport
         readonly List<ReportRows> _datasets = new List<ReportRows>();
         readonly List<SqliteCommand> _auxiliary = new List<SqliteCommand>();
         readonly long _retainedLimit;
+        readonly int _cacheKb;
         long _retained, _working;
         public long PeakBufferBytes { get; private set; }
         public long SpilledRows { get; private set; }
@@ -49,10 +130,55 @@ namespace ExchangeLogReport
         public long PeakFileBytes { get; private set; }
         public readonly List<Exception> WorkerFailures = new List<Exception>();
 
+        // The work file of a report is written to Report.ScratchFolder when it is set, else to the report folder (on the
+        // volume chosen for the reports). The file is opened through an extended path, so the 260-character limit does not
+        // apply; what remains is the SQLite Windows VFS bound of 1040 UTF-8 bytes for the full name (prefix included), of
+        // which 8 bytes are kept for the journal suffixes. A folder beyond it stops the report with a message that says to
+        // set Report.ScratchFolder to a shorter local path.
+        internal const int MaxScratchPathBytes = 1040 - 8;
+        const long MinFreeBytes = 256L * 1048576;
+
+        /// <summary>The folder for the work file: Report.ScratchFolder when set, else the report folder; checked to be short enough
+        /// and to have room. freeBytes is the free space of its drive (-1 when it cannot be read).</summary>
+        internal static string Folder(string configured, string outputFolder, out long freeBytes)
+        {
+            string folder;
+            bool own = !string.IsNullOrWhiteSpace(configured);
+            freeBytes = -1;
+            try { folder = Path.GetFullPath(own ? configured.Trim() : outputFolder); }
+            catch (Exception error)
+            {
+                throw new IOException((own ? "Report.ScratchFolder is not a valid path: " + configured : "The report folder is not a valid path: " + outputFolder) + " (" + error.Message + ")", error);
+            }
+            folder = folder.TrimEnd('\\', '/');
+            // ".report-" + 32 hex digits + ".tmp" + the journal suffixes SQLite may add.
+            int nameBytes = System.Text.Encoding.UTF8.GetByteCount(Store.SqlitePath(folder)) + 1 + 64;
+            if (nameBytes > MaxScratchPathBytes)
+                throw new IOException((own ? "The report work folder " : "The report folder ") + folder + " is too long for the SQLite library to hold the report work file ("
+                    + nameBytes + " bytes with the file name, the limit is " + MaxScratchPathBytes + "): set Report.ScratchFolder to a shorter local path such as C:\\Temp.");
+            try { Directory.CreateDirectory(folder); }
+            catch (Exception error) { throw new IOException("The report work folder " + folder + " cannot be created: " + error.Message + " Set Report.ScratchFolder to a local folder you can write to.", error); }
+            try
+            {
+                var drive = new DriveInfo(Path.GetPathRoot(folder));
+                freeBytes = drive.AvailableFreeSpace;
+                if (drive.AvailableFreeSpace < MinFreeBytes)
+                    throw new IOException("The report work folder " + folder + " has only " + (drive.AvailableFreeSpace / 1048576) + " MB free (at least "
+                        + (MinFreeBytes / 1048576) + " MB are needed, a large report several GB): free some space or set Report.ScratchFolder to another drive.");
+            }
+            catch (ArgumentException) { }
+            catch (IOException error) when (error.Message.StartsWith("The report work folder", StringComparison.Ordinal)) { throw; }
+            catch (IOException) { }
+            catch (UnauthorizedAccessException) { }
+            return folder;
+        }
+
         public ReportScratch(string folder, long budgetBytes)
         {
             _path = Path.Combine(folder, ".report-" + Guid.NewGuid().ToString("N") + ".tmp");
             _retainedLimit = budgetBytes / 2 - 8L * 1048576;
+            // Same share of the budget as the report database cache (budget / 4, at most 256 MB); 8 MB when no budget is given.
+            _cacheKb = (int)Math.Max(8192L, Math.Min(256L * 1024, budgetBytes / 4096));
         }
 
         public int Register(ReportRows rows) { _datasets.Add(rows); return ++_nextDataset; }
@@ -82,14 +208,24 @@ namespace ExchangeLogReport
         {
             if (_db != null) return;
             _db = new SqliteConnection(new SqliteConnectionStringBuilder { DataSource = Store.SqlitePath(_path), Pooling = false }.ToString());
-            _db.Open();
-            _db.CreateCollation("EXL_REPORT_ID", (x, y) => StringComparer.OrdinalIgnoreCase.Compare(x, y));
-            using (var c = _db.CreateCommand())
+            try
             {
-                c.CommandText = "PRAGMA journal_mode=OFF; PRAGMA synchronous=OFF; PRAGMA temp_store=FILE; PRAGMA cache_size=-8192;";
-                c.ExecuteNonQuery();
+                // SQLite creates the file lazily: a path it cannot open fails at the first statement, not at Open().
+                _db.Open();
+                _db.CreateCollation("EXL_REPORT_ID", (x, y) => StringComparer.OrdinalIgnoreCase.Compare(x, y));
+                using (var c = _db.CreateCommand())
+                {
+                    c.CommandText = "PRAGMA journal_mode=OFF; PRAGMA synchronous=OFF; PRAGMA temp_store=FILE; PRAGMA cache_size=-" + _cacheKb.ToString(System.Globalization.CultureInfo.InvariantCulture) + ";";
+                    c.ExecuteNonQuery();
+                }
+                _transaction = _db.BeginTransaction();
             }
-            _transaction = _db.BeginTransaction();
+            catch (SqliteException error)
+            {
+                _db.Dispose(); _db = null;
+                throw new IOException("The work file " + _path + " (" + System.Text.Encoding.UTF8.GetByteCount(Store.SqlitePath(_path)) + " bytes) could not be created: " + error.Message
+                    + ". It needs a short local path with free space: for a report, set Report.ScratchFolder to such a folder.", error);
+            }
         }
 
         internal SqliteCommand Command(string sql)

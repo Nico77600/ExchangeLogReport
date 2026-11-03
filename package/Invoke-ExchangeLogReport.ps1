@@ -39,6 +39,9 @@
                       are read first. No collection yet: the report stops (run -Mode Collect first).
     Collect           Collects what is new (scheduled task). No report.
     Status            Shows what the database contains. Reads no log file.
+    Serve             On-demand, loopback-only read-only API and the Detailed report's own page (the portal).
+                      Never collects, generates a report, sends mail or upgrades the source database.
+                      Use -Port, -DatabasePath and -NoBrowser as needed.
     Discover          Reads the real log folders of every Exchange server (Exchange cmdlets in Windows
                       PowerShell 5.1: local Exchange Management Shell or Exchange remote PowerShell,
                       View-Only Organization Management is enough) and the IIS log folder of every
@@ -96,6 +99,56 @@
 .PARAMETER IncludeSessionDetails
     Overrides Report.IncludeSessionDetails: timeline of each client session in the CSV files.
 
+.PARAMETER ConfigPath
+    Configuration file. Default: config\ExchangeLogReport.config.psd1 next to this script.
+
+.PARAMETER OutputPath
+    Report mode: folder of the report files, instead of Report.OutputPath.
+
+.PARAMETER HtmlLayout
+    Report mode: Overrides Report.HtmlLayout for this run. SingleFile: one self-contained HTML file. Folder: a small
+    HTML page and its <FilePrefix>_data folder (keep them together). Auto: one file while the data to put in it
+    is at most Report.SingleFileMaxMB, else page and folder. Every row of every table is in the report either way.
+
+.PARAMETER DatabasePath
+    Serve mode: absolute path of the SQLite database to read. Default: Storage.DatabasePath of the
+    configuration. The database must have the current schema; Serve never migrates it.
+
+.PARAMETER Port
+    Serve mode: local port of the loopback listener (127.0.0.1). Default: 8765; 0 picks a free port.
+
+.PARAMETER NoBrowser
+    Serve mode: does not open the default browser.
+
+.PARAMETER ReadyFile
+    Serve mode: new, unused private file in which the listener writes its status ("ready" or "blocked")
+    once started. An existing file is never replaced.
+
+.PARAMETER ReadyFileWithToken
+    Serve mode: also writes the access token to the ReadyFile (local automation only; never share that file).
+
+.PARAMETER RequestTimeoutSeconds
+    Serve mode: time limit of one list, detail or export request, 1 to 120 seconds. Default: 15.
+
+.PARAMETER AggregateTimeoutSeconds
+    Serve mode: time limit of one Overview request (one day of the portal), 1 to 120 seconds. Default: 60.
+
+.PARAMETER MmapMB
+    Serve mode: SQLite memory-mapped I/O per read connection, 0 to 256 MB. Default: 0 (none).
+
+.PARAMETER ClientRowsMax
+    Serve mode: the largest list (client sessions, failed and slow requests, messages) the portal page loads whole,
+    10000 to 1000000. A larger list is browsed on the server, every row reachable. Default: 50000.
+
+.PARAMETER ScanBudgetMs
+    Serve mode: time budget of one scan request of the portal, 100 to 120000 milliseconds (never more than the
+    request deadline). Default: 2000.
+
+.PARAMETER DevelopmentMode
+    Allows a source checkout without a package manifest, and a package whose built binaries (PowerShell runtime,
+    SQLite tools) are not verified. A present PackageIntegrity.psd1 is always verified
+    for the PowerShell scripts and the hashed sources, and the verifier must carry the owner signature.
+
 .PARAMETER Collect
     Report mode: reads the new log lines first, whatever the age of the data (the first collection reads the last
     Collection.BackfillDays days).
@@ -146,12 +199,15 @@
 
 .NOTES
     Author  : Nicolas Fabert
-    Version : 2.1.1
+    Version : 3.0.0
     Exit codes : 0 = success, 1 = failure, 2 = finished with warnings (a server, a folder or a file could not
                  be read, a source is stale, the IIS log folders changed since -Mode Discover, or the report
                  could not be sent by e-mail).
     Documentation : docs\ExchangeLogReport-UserGuide.html (user guide: prerequisites, everyday commands) and
-                    docs\ExchangeLogReport-Guide.html (developer guide); sources: docs\*.md
+                    docs\ExchangeLogReport-Guide.html (developer guide)
+    Launcher : Run-Collector.cmd starts this script with the server garbage collector (DOTNET_gcServer=1,
+               DOTNET_GCHeapCount=4, DOTNET_GCNoAffinitize=1). A direct pwsh.exe -File call keeps the
+               workstation garbage collector unless it sets the same variables.
 
     This Script is a Personal project.
     It's provided "AS-IS". It's not an official Microsoft product so no support can be expected from Microsoft.
@@ -161,7 +217,7 @@
 [CmdletBinding(DefaultParameterSetName = 'Range')]
 param(
     [Parameter(Position = 0)]
-    [ValidateSet('Report', 'Collect', 'Status', 'Discover', 'MailTest')]
+    [ValidateSet('Report', 'Collect', 'Status', 'Discover', 'MailTest', 'Serve')]
     [string]$Mode = 'Report',
 
     # Period of the report: one parameter set per kind of period, so that a period parameter is never ignored.
@@ -189,6 +245,18 @@ param(
 
     [string]$ConfigPath = (Join-Path $PSScriptRoot 'config\ExchangeLogReport.config.psd1'),
     [string]$OutputPath,
+    [ValidateSet('Auto', 'SingleFile', 'Folder')][string]$HtmlLayout,
+    [string]$DatabasePath,
+    [ValidateRange(0, 65535)][int]$Port = 8765,
+    [switch]$NoBrowser,
+    [string]$ReadyFile,
+    [switch]$ReadyFileWithToken,
+    [ValidateRange(1, 120)][int]$RequestTimeoutSeconds = 15,
+    [ValidateRange(1, 120)][int]$AggregateTimeoutSeconds = 60,
+    [ValidateRange(0, 256)][int]$MmapMB = 0,
+    [ValidateRange(10000, 1000000)][int]$ClientRowsMax = 50000,
+    [ValidateRange(100, 120000)][int]$ScanBudgetMs = 2000,
+    [switch]$DevelopmentMode,
     [switch]$Collect,
     [switch]$NoCollect,
     [switch]$SendMail,
@@ -198,6 +266,13 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
+# -File (the launchers, a scheduled task) hands a comma-separated list over as one string: split it, as a PowerShell array would be.
+foreach ($listName in 'User', 'Server') {
+    $listValue = Get-Variable -Name $listName -ValueOnly -ErrorAction SilentlyContinue
+    if ($null -ne $listValue) {
+        Set-Variable -Name $listName -Value ([string[]]@($listValue | ForEach-Object { $_ -split ',' } | ForEach-Object { $_.Trim() } | Where-Object { $_ }))
+    }
+}
 [Console]::OutputEncoding = [Text.UTF8Encoding]::new($false)
 $previousCulture = [Threading.Thread]::CurrentThread.CurrentCulture
 [Threading.Thread]::CurrentThread.CurrentCulture = [Globalization.CultureInfo]::GetCultureInfo('en-US')
@@ -208,23 +283,54 @@ $store = $null; $lock = $null; $runId = $null; $collection = $null
 
 try {
     do {
-        $integrityVerifier = Join-Path $PSScriptRoot 'src\Test-PackageIntegrity.ps1'
-        $integrityCursor = [IO.Path]::GetFullPath($integrityVerifier)
-        while ($integrityCursor) {
-            $integrityItem = Microsoft.PowerShell.Management\Get-Item -LiteralPath $integrityCursor -Force -ErrorAction Stop
-            if ($integrityItem.Attributes -band [IO.FileAttributes]::ReparsePoint) {
-                throw "Package integrity: reparse point: $integrityCursor"
+        # The package is verified before any of its code runs: the verifier must carry the owner signature, then it
+        # checks the signed manifest. A tree without a manifest is accepted only with -DevelopmentMode.
+        $integrityManifest = Join-Path $PSScriptRoot 'PackageIntegrity.psd1'
+        if (Microsoft.PowerShell.Management\Test-Path -LiteralPath $integrityManifest) {
+            $integrityVerifier = Join-Path $PSScriptRoot 'src\Test-PackageIntegrity.ps1'
+            $integrityCursor = [IO.Path]::GetFullPath($integrityVerifier)
+            while ($integrityCursor) {
+                $integrityItem = Microsoft.PowerShell.Management\Get-Item -LiteralPath $integrityCursor -Force -ErrorAction Stop
+                if ($integrityItem.Attributes -band [IO.FileAttributes]::ReparsePoint) {
+                    throw "Package integrity: reparse point: $integrityCursor"
+                }
+                $integrityCursor = [IO.Path]::GetDirectoryName($integrityCursor)
             }
-            $integrityCursor = [IO.Path]::GetDirectoryName($integrityCursor)
+            $integritySignature = Microsoft.PowerShell.Security\Get-AuthenticodeSignature -LiteralPath $integrityVerifier -ErrorAction Stop
+            if ([string]$integritySignature.Status -cne 'Valid' -or $null -eq $integritySignature.SignerCertificate -or
+                $integritySignature.SignerCertificate.Thumbprint -cne '0F28E442889F17B5F4D251E8F96E7CC6E2C9C6D6' -or
+                $null -eq $integritySignature.TimeStamperCertificate) {
+                throw 'Package integrity: verifier must have the trusted, timestamped owner signature. Use the complete release ZIP (https://github.com/Nico77600/ExchangeLogReport/releases/latest): extract it again and unblock it. A development or CI build is started from its folder with powershell\pwsh.exe -NoLogo -NoProfile -File Invoke-ExchangeLogReport.ps1 <parameters> -DevelopmentMode.'
+            }
+            if ($DevelopmentMode) { & $integrityVerifier -Root $PSScriptRoot -DevelopmentMode | Out-Null } else { & $integrityVerifier -Root $PSScriptRoot -Distribution | Out-Null }
+        } elseif (-not $DevelopmentMode) {
+            throw 'Package integrity: PackageIntegrity.psd1 is missing. Use the complete release ZIP (https://github.com/Nico77600/ExchangeLogReport/releases/latest): extract it again and unblock it. A development or CI build is started from its folder with powershell\pwsh.exe -NoLogo -NoProfile -File Invoke-ExchangeLogReport.ps1 <parameters> -DevelopmentMode.'
+        } else {
+            Write-Warning 'DevelopmentMode: no package manifest; package byte integrity and publisher authentication are not established.'
+            # The module does not repeat this warning in the same process.
+            [AppDomain]::CurrentDomain.SetData('ExchangeLogReport.UnverifiedTreeWarned', $true)
         }
-        $integritySignature = Microsoft.PowerShell.Security\Get-AuthenticodeSignature -LiteralPath $integrityVerifier -ErrorAction Stop
-        if ([string]$integritySignature.Status -cne 'Valid' -or $null -eq $integritySignature.SignerCertificate -or
-            $integritySignature.SignerCertificate.Thumbprint -cne '0F28E442889F17B5F4D251E8F96E7CC6E2C9C6D6' -or
-            $null -eq $integritySignature.TimeStamperCertificate) {
-            throw 'Package integrity: verifier must have the trusted, timestamped owner signature.'
-        }
-        & $integrityVerifier -Root $PSScriptRoot
         Import-Module (Join-Path $PSScriptRoot 'ExchangeLogReport.psd1') -Force
+
+        if ($Mode -eq 'Serve') {
+            # Only the database and the time zone settings are needed (the days of the daily tables are days of Report.TimeZone). No log,
+            # lock, collection, report or mail path is entered. Without a configuration file (-DatabasePath given) the zone is the default one.
+            $data = @{}
+            if ((-not $DatabasePath) -or (Microsoft.PowerShell.Management\Test-Path -LiteralPath $ConfigPath)) { $data = Import-PowerShellDataFile -LiteralPath $ConfigPath }
+            if (-not $DatabasePath) {
+                $DatabasePath = '.\data\ExchangeLogReport.sqlite'
+                if ($data.ContainsKey('Storage') -and $data.Storage.ContainsKey('DatabasePath')) { $DatabasePath = [string]$data.Storage.DatabasePath }
+                $DatabasePath = [IO.Path]::GetFullPath($DatabasePath, $PSScriptRoot)
+            }
+            $zoneId = 'Romance Standard Time'
+            if ($data.ContainsKey('Report') -and $data.Report.ContainsKey('TimeZone') -and $data.Report.TimeZone) { $zoneId = [string]$data.Report.TimeZone }
+            Start-ExlServe -DatabasePath $DatabasePath -TimeZone (Get-ExlTimeZone $zoneId) -Port $Port -NoBrowser:$NoBrowser `
+                -ReadyFile $ReadyFile -ReadyFileWithToken:$ReadyFileWithToken -RequestTimeoutSeconds $RequestTimeoutSeconds -AggregateTimeoutSeconds $AggregateTimeoutSeconds -MmapMB $MmapMB `
+                -ClientRowsMax $ClientRowsMax -ScanBudgetMs $ScanBudgetMs -DevelopmentMode:$DevelopmentMode
+            $exitCode = 0
+            $runStatus = 'Completed'
+            break
+        }
 
         # ---- configuration, then command-line overrides -------------------------------------------
         $settings = Import-ExlConfiguration -Path $ConfigPath -Root $PSScriptRoot
@@ -236,6 +342,7 @@ try {
         if ($PSBoundParameters.ContainsKey('IncludeRoutingDetails')) { $settings.Report.IncludeRoutingDetails = [bool]$IncludeRoutingDetails }
         if ($PSBoundParameters.ContainsKey('IncludeSessionDetails')) { $settings.Report.IncludeSessionDetails = [bool]$IncludeSessionDetails }
         if ($OutputPath) { $settings.Report.OutputPath = [IO.Path]::GetFullPath($OutputPath, (Get-Location).Path) }
+        if ($HtmlLayout) { $settings.Report.HtmlLayout = $HtmlLayout }
         $servers = @($settings.Servers)
         if ($Server) {
             $unknown = @($Server | Where-Object { $_ -notin $servers.Name })
@@ -315,7 +422,7 @@ try {
             if ($found.NotFound.Count) { $values['Unknown'] = @('Warn', ("in the configuration but not found in Exchange: " + ($found.NotFound -join ', '))) }
             $values['Warnings'] = @($(if ($found.Warnings.Count) { 'Warn' } else { 'Ok' }), $(if ($found.Warnings.Count) { "$($found.Warnings.Count) (see above and the log file)" } else { 'none' }))
             $values['File'] = @('File', $found.File)
-            $values['Next'] = @('Info', '.\Invoke-ExchangeLogReport.ps1 -Mode Collect')
+            $values['Next'] = @('Info', '.\Run-Collector.cmd -Mode Collect')
             Write-ExlSummary -Title 'Log paths discovered' -Values $values -Status $(if ($found.Warnings.Count -or $found.NotFound.Count) { 'Warn' } else { 'Ok' })
             $exitCode = 0; $runStatus = 'Completed'
             break
@@ -360,7 +467,7 @@ try {
         }
 
         if ($data -and $data.NoData) {
-            throw ("No collection in the database yet: run '.\Invoke-ExchangeLogReport.ps1 -Mode Collect' first (it reads the last {0} days of logs; then schedule it every hour), or add -Collect to this command." -f $settings.Collection.BackfillDays)
+            throw ("No collection in the database yet: run '.\Run-Collector.cmd -Mode Collect' first (it reads the last {0} days of logs; then schedule it every hour), or add -Collect to this command." -f $settings.Collection.BackfillDays)
         }
 
         # ---- step 1: database ------------------------------------------------------------------------
@@ -371,7 +478,7 @@ try {
             Write-ExlSummary -Title 'Ready for the first collection' -Values ([ordered]@{
                     Config  = @('Ok', "valid $dot $($settings.Servers.Count) server(s)")
                     Engine  = @('Ok', 'ready')
-                    Next    = @('Info', '.\Invoke-ExchangeLogReport.ps1 -Mode Collect')
+                    Next    = @('Info', '.\Run-Collector.cmd -Mode Collect')
                 }) -Status Ok
             $exitCode = 0; $runStatus = 'Completed'
             break
@@ -458,6 +565,7 @@ try {
         Write-ExlStep $step $totalSteps "Building the $($ReportType.ToLowerInvariant()) report" -Icon Report
         $report = New-ExlReport -Store $store -Settings $settings -Period $period -ReportType $ReportType -User $User -Server $Server -IncludeRoutingDetails $settings.Report.IncludeRoutingDetails -IncludeSessionDetails $settings.Report.IncludeSessionDetails
         foreach ($f in $report.Files) { Write-ExlItem Ok ("{0}  {1} rows {2} {3}" -f (Split-Path $f.Path -Leaf), (Format-ExlNumber $f.Rows), $dot, (Format-ExlBytes $f.Bytes)) -Icon File }
+        if ($report.HtmlDataFolder) { Write-ExlItem Ok ("{0}  {1} files {2} {3}" -f (Split-Path $report.HtmlDataFolder -Leaf), (Format-ExlNumber $report.HtmlDataFiles), $dot, (Format-ExlBytes $report.HtmlDataBytes)) -Icon File }
         if ($runId) {
             $store.EndRun($runId, $(if ($incomplete) { 'Incomplete' } else { 'Completed' }), $collection.Files, $collection.Bytes, $collection.Lines, $collection.Kept, $collection.Noise, $null)
             $runId = $null
@@ -528,12 +636,11 @@ finally {
 }
 exit $exitCode
 
-
 # SIG # Begin signature block
-# MIIghQYJKoZIhvcNAQcCoIIgdjCCIHICAQExDzANBglghkgBZQMEAgEFADB5Bgor
+# MIImIgYJKoZIhvcNAQcCoIImEzCCJg8CAQExDzANBglghkgBZQMEAgEFADB5Bgor
 # BgEEAYI3AgEEoGswaTA0BgorBgEEAYI3AgEeMCYCAwEAAAQQH8w7YFlLCE63JNLG
-# KX7zUQIBAAIBAAIBAAIBAAIBADAxMA0GCWCGSAFlAwQCAQUABCBtcnINZKS8rBnd
-# HiA2xzG3YpKX8U/z2uFVHIh1YRjW56CCDW8wggZyMIIEWqADAgECAghkM1HTxzif
+# KX7zUQIBAAIBAAIBAAIBAAIBADAxMA0GCWCGSAFlAwQCAQUABCAtAL4/6/CwLdbl
+# mqhlGBX6YiHq+NKwWrBTWuef1K2HjqCCDW8wggZyMIIEWqADAgECAghkM1HTxzif
 # CDANBgkqhkiG9w0BAQsFADB8MQswCQYDVQQGEwJVUzEOMAwGA1UECAwFVGV4YXMx
 # EDAOBgNVBAcMB0hvdXN0b24xGDAWBgNVBAoMD1NTTCBDb3Jwb3JhdGlvbjExMC8G
 # A1UEAwwoU1NMLmNvbSBSb290IENlcnRpZmljYXRpb24gQXV0aG9yaXR5IFJTQTAe
@@ -605,103 +712,133 @@ exit $exitCode
 # ULeH38N0Vr83psiJVuBSxQyt5nRVrpYz7FACq5gtXELkyViq/rGOlJKaRrgQ6WWq
 # eoIXqKhVFAdP/jAEm2M8ezoVYsUgPyKY2OcuecV9coulAcxUIUydx6qYiOfsGj5u
 # Dy7l4aYjvB771wkUMzUQwxzcDYXJtMMTaWRe6n9EemR67jc73u5CJyFg3PfA5WR1
-# wZislcdCZuS6MYISbDCCEmgCAQEwgYwweDELMAkGA1UEBhMCVVMxDjAMBgNVBAgM
+# wZislcdCZuS6MYIYCTCCGAUCAQEwgYwweDELMAkGA1UEBhMCVVMxDjAMBgNVBAgM
 # BVRleGFzMRAwDgYDVQQHDAdIb3VzdG9uMREwDwYDVQQKDAhTU0wgQ29ycDE0MDIG
 # A1UEAwwrU1NMLmNvbSBDb2RlIFNpZ25pbmcgSW50ZXJtZWRpYXRlIENBIFJTQSBS
 # MQIQBof4ljXihJpmCqqt2mhAWzANBglghkgBZQMEAgEFAKCBhDAYBgorBgEEAYI3
 # AgEMMQowCKACgAChAoAAMBkGCSqGSIb3DQEJAzEMBgorBgEEAYI3AgEEMBwGCisG
-# AQQBgjcCAQsxDjAMBgorBgEEAYI3AgEVMC8GCSqGSIb3DQEJBDEiBCCD42o52vM2
-# oeSvaSbO+jaeGsMrObIBP2fY7AjnMimQqzANBgkqhkiG9w0BAQEFAASCAgBTKGM2
-# l4h9+1S9pKmRbvlQSL0FmE/hfqZxsIH99olR0p5crk228er8GAln8XByv1OYkGLo
-# UpPK3EJP+bc5hVJpFOaCm5HiKCoWmDe2mdv7lazoKz8a77Hmv+kQ6AXxmdb//YZa
-# rFCrforkousGCu6oOXf4CPmagshonuh2Yj5xgnV/+g1l3h/ZCz8Y5umLKjXTLA/h
-# Ow2TGkT6USRC/T5jhgDAYqtT7atnnDhTPy80IkxfpmmsG3uapnGFR6bOiRrF//Js
-# 4TmNS/k1XYRb4NeCL8zESE9YKfulnUAFCCwpqvc7rRw8Y9QH6CWjS+7G7/Zu2eTf
-# /sa2FWPUqzC29pRqA2NTmVJ0JeFNzxBQ5SOBRRYT0rZwbmX4BWpnnAiMFxEnyeQZ
-# 21RV//KQhPBk+nwHxPgbSOBw4fGeghoSBn6Vw7O4VwmL6g9hpDSwYtWDuYMdefB0
-# mJcH1YU2erEe+rMhnzAcl84Vv4Gmniz7n3U+8otM6Uxw68JfSaUiOvs1XerqyTuV
-# 1Zs28jsOFIOHZtOBaZbxDbJ19CkcwftX6aarXgdx/8Ayhn7Y1WQUvZEhxYMt5SyL
-# cTUj7e79dRD0uvYZaRA/aBuGJgT+BkwCdsDIpo7+sv8g0M9M0n/0uQKkT3Q26KxA
-# 8oyVx3FAf99d5xPMCY4wH3KBok45kbVre9XpcaGCDykwgg8lBgorBgEEAYI3AwMB
-# MYIPFTCCDxEGCSqGSIb3DQEHAqCCDwIwgg7+AgEDMQ0wCwYJYIZIAWUDBAIBMIGJ
-# BgsqhkiG9w0BCRABBKB6BHgwdgIBAQYMKwYBBAGCqTABAwYBMDEwDQYJYIZIAWUD
-# BAIBBQAEIJwHud67Vy7JzUhTy95qFW6KCMGcvy/+kTUvavZC+BqKAggsXegOYhnf
-# 3xgPMjAyNjEwMTQxNTE2MzNaMAMCAQECEHG7tUNGCdAEoTmzD56PUYegggwAMIIE
-# /DCCAuSgAwIBAgIQH2sWYtIuG2xd8cDBoGAOODANBgkqhkiG9w0BAQsFADBzMQsw
-# CQYDVQQGEwJVUzEOMAwGA1UECAwFVGV4YXMxEDAOBgNVBAcMB0hvdXN0b24xETAP
-# BgNVBAoMCFNTTCBDb3JwMS8wLQYDVQQDDCZTU0wuY29tIFRpbWVzdGFtcGluZyBJ
-# c3N1aW5nIFJTQSBDQSBSMTAeFw0yNTAyMTgxNjMyMDJaFw0zNDExMTIxODUwMDVa
-# MG4xCzAJBgNVBAYTAlVTMQ4wDAYDVQQIDAVUZXhhczEQMA4GA1UEBwwHSG91c3Rv
-# bjERMA8GA1UECgwIU1NMIENvcnAxKjAoBgNVBAMMIVNTTC5jb20gVGltZXN0YW1w
-# aW5nIFVuaXQgMjAyNSBFMTBZMBMGByqGSM49AgEGCCqGSM49AwEHA0IABBv7UVHH
-# b+ZVluxPXlfE3M6tg0Xnq8dic+O3vPOCRpalUM1vO9A+GRzSVVjyygHhYrBw62XL
-# Fh1kv7e+yRd/aTajggFaMIIBVjAfBgNVHSMEGDAWgBQMnRAljpqnG5mHQ88IfuG9
-# gZD0zzBRBggrBgEFBQcBAQRFMEMwQQYIKwYBBQUHMAKGNWh0dHA6Ly9jZXJ0LnNz
-# bC5jb20vU1NMLmNvbS10aW1lU3RhbXBpbmctSS1SU0EtUjEuY2VyMFEGA1UdIARK
-# MEgwPAYMKwYBBAGCqTABAwYBMCwwKgYIKwYBBQUHAgEWHmh0dHBzOi8vd3d3LnNz
-# bC5jb20vcmVwb3NpdG9yeTAIBgZngQwBBAIwFgYDVR0lAQH/BAwwCgYIKwYBBQUH
-# AwgwRgYDVR0fBD8wPTA7oDmgN4Y1aHR0cDovL2NybHMuc3NsLmNvbS9TU0wuY29t
-# LXRpbWVTdGFtcGluZy1JLVJTQS1SMS5jcmwwHQYDVR0OBBYEFM582cAEgMUkEGoJ
-# 6hyrJT0R/ajSMA4GA1UdDwEB/wQEAwIHgDANBgkqhkiG9w0BAQsFAAOCAgEAgHN1
-# JIW9ZlNip07FfY9r1LJwLKTl1h/y9r1BjDgHMEz7U7J7mAy32JxA1KLyjCCJqNku
-# RfhDHGFEfZtjTOru7AQMDSDiUDvCCc3jaz5py9jGvwIe5npkLbXqXhA+SqCzG719
-# USigwhHkYr7v8NiXoaY0Xu03p0BiZZreZlpngmGB9+86N94FqIFx2I5Z5iuu7d4j
-# 7aAOZBNxfU9jFDIIGDtWfWeCpF0Q8rLE/3DHDlzJKs5Il3i/VoOl7rTU938oSrxM
-# www6GDBlKX8rGHxvkjgIb9MXkVglJSDHsNAZDeCS/inaxKHA+ChuB8K4OxIxa6k1
-# e+eHBypakAY3wuN7w7PlPmhN6k5IdqZn3HZHs2VjoR841Z9wmVPFdGDdkBZ7XOmb
-# 5OZUaKufsvtER0VbY2DkzaqAaItt1kc+I+FUz7PiVz2PUzpegkftRRxvrPyIL08b
-# lJTnbMQ0XrqDN0rEfuTLv4XhhnKyJaXhxCUdjO/cRumMzZ35QTUMItBWy1xGp0iy
-# oFVnAya2pPsVMuAI+sy1zxlOS9l5iSxvKJ8gpnpOgjqYTa7u1eyZo+4JlcGoiiR1
-# 7LthMTrF1q62tO5xOpI8txUZ6gtKGtkJV6wdj+vZLcwKZ2M93GqVpOo6UBlGjx1s
-# KsVZ7AIUzJZli4NJ0M2KYcrfNnlebkYKpDnSqWwwggb8MIIE5KADAgECAhBtUhhw
-# h+gjTYVgANCAj5NWMA0GCSqGSIb3DQEBCwUAMHwxCzAJBgNVBAYTAlVTMQ4wDAYD
+# AQQBgjcCAQsxDjAMBgorBgEEAYI3AgEVMC8GCSqGSIb3DQEJBDEiBCD2Ladk/oVZ
+# ZevTcq11FxQWRmRrVRfgdGeZjMTrlrjuPjANBgkqhkiG9w0BAQEFAASCAgAosi8L
+# scQSnqkJlPnUewU3q2s2KwY3kDcV3hhlII2n/bicNb560Yj+89F22WEYvsW1dxwo
+# hQ70qaA9UBXTajKqmWcZrI6Li4dmqLv79RV+47c9NraGRfn298E5C7gPNT0rWchq
+# 2EbbwZfHPUqKfE7H+EVdjdEjFV7omORkwMZu2/kAE/am/4frO5XG9f/VMFdyqZJL
+# 0yTMnaaIhDZmh3RznjA67eiasdHjRX/wmL7bP/o7BNmMGUv2S4memuSmd2t/sVrm
+# U65X43s8qJxsd1m6FGbaUOIvC8wia1A4NLuTxmIdaF3w02fTkoG0KDahydQgkub2
+# b6ewFSLSwCLNPvB+gdxrDYsHK8ISLityu0eofsStBapPTKl3EGX6WB6YZDISZIQS
+# H6nzPUoQbOhnj+naB0IzBg7QN8AU/UUUQOVeJgEDserlfGFUCtf9+0iQdELwU6MM
+# 2BJxP1AJqMFaVm9QM3bzhEqFZwPlcjGIWIETvEUHx6MPxpSxQR+RwXhK/bywnoz+
+# JMn24L9nmkJGfmASG8oz89riwGkCTc0vK6tkhwcXvnjCDSXtrYqtoBs1uzNMUsXR
+# BbTUQJLeM+DnheqmGngLfkUXGq9p1JGsX3tLuqp9JACoW8555YK9uGDHjtQ5huJO
+# 3eqJW0ioTxgtfPfh4yUc21u3LaLeFgFLKk0EYqGCFMYwghTCBgorBgEEAYI3AwMB
+# MYIUsjCCFK4GCSqGSIb3DQEHAqCCFJ8wghSbAgEDMQ0wCwYJYIZIAWUDBAIBMIGB
+# BgsqhkiG9w0BCRABBKByBHAwbgIBAQYMKwYBBAGCqTABAwYBMDEwDQYJYIZIAWUD
+# BAIBBQAEIG1aR7M8IF83exffj5c49Vd/EE5/c7rViiizmkvyb3SiAghjJgpP1y6h
+# 8BgPMjAyNjExMDMwOTM4MDVaMAMCAQECCAlN+JA0OU8XoIIRpzCCBPMwggLboAMC
+# AQICEFRD+De9Wu4YAYRyuFzajuMwDQYJKoZIhvcNAQELBQAwcjELMAkGA1UEBhMC
+# VVMxDjAMBgNVBAgMBVRleGFzMRAwDgYDVQQHDAdIb3VzdG9uMREwDwYDVQQKDAhT
+# U0wgQ29ycDEuMCwGA1UEAwwlU1NMLmNvbSBUaW1lc3RhbXBpbmcgSXNzdWluZyBS
+# U0EgQ0EgMjAeFw0yNjA2MTIxNzIyNDZaFw0zNjA2MDkxNzIyNDVaMG4xCzAJBgNV
+# BAYTAlVTMQ4wDAYDVQQIDAVUZXhhczEQMA4GA1UEBwwHSG91c3RvbjERMA8GA1UE
+# CgwIU1NMIENvcnAxKjAoBgNVBAMMIVNTTC5jb20gVGltZXN0YW1waW5nIFVuaXQg
+# MjAyNiBFMTBZMBMGByqGSM49AgEGCCqGSM49AwEHA0IABOgli7hmEy5IkjjzCzbJ
+# DgbYV7CIUUgOOn3jkML0i3A2jYer8VMwShMdSnRQURbOzh65x/ytFQOjGw0CBaVI
+# ND2jggFSMIIBTjAfBgNVHSMEGDAWgBRwmmXBQ4Cj/OmxZIlu8TCcCSHJfDBNBggr
+# BgEFBQcBAQRBMD8wPQYIKwYBBQUHMAKGMWh0dHA6Ly9jZXJ0LnNzbC5jb20vU1NM
+# LmNvbS10aW1lU3RhbXBpbmctSS1SMi5jZXIwUQYDVR0gBEowSDA8BgwrBgEEAYKp
+# MAEDBgEwLDAqBggrBgEFBQcCARYeaHR0cHM6Ly93d3cuc3NsLmNvbS9yZXBvc2l0
+# b3J5MAgGBmeBDAEEAjAWBgNVHSUBAf8EDDAKBggrBgEFBQcDCDBCBgNVHR8EOzA5
+# MDegNaAzhjFodHRwOi8vY3Jscy5zc2wuY29tL1NTTC5jb20tdGltZVN0YW1waW5n
+# LUktUjIuY3JsMB0GA1UdDgQWBBQnrANWuihquhc7gz1Af3moJOzDPDAOBgNVHQ8B
+# Af8EBAMCB4AwDQYJKoZIhvcNAQELBQADggIBAE92bs78A57CGU1wZ/oY5rgV4Mwd
+# dn22MU/bmHumb4b6W2VinMg0IGnBE5D8PJOsnqp2AmMhWdOt5TDxKgIQA9pzBute
+# GYez7R1vQ1qn7IIr8Wz2AXjfre1MYJGE93saW1jHTxKgbVlchzry3CrzMYCVnyYw
+# DcFZMFQ35Mv4+3H9vPoopjfDynO0v7vPy3p0UZ1dltmH53EZ5M/Qn7OZ0Q82mYLo
+# h666dhscIJzUEh+BgYxzpdz8y7J1WxqGSouGRI4F7qbOJhhjiu/hgdhwJUJ/jkve
+# OHB6pZB9IBJbdlns6AjUaRC6YfamsbgZ40hKl1ln4BOshgcDtLsSjaqVlUx5gMK+
+# krwT6H8bm1yLhJ/Yr0eAizrgMVEqyeNWQYP6qhtKCYxehpESm8au3MlkpBGWCYZi
+# goNh4OX1x2oDsYsG5p+ST2db4Vgq25N7/3U8doL0yufnqwuR/f603JY1CO++sndq
+# 34Y35Kb8gLG7V7OA+5658PIvcKK+fn3bUUiQVcasy5spBX7aC9FKdkPvrciglHa4
+# m3XJ6weBykt7PrdwI3XGwNOgwi/Bon0IvXy9MkQUTZQOKOgT/kq++eTGgjY1EWGQ
+# 7w8sSRwQU+3Ko2SMLIkfLPuvOtJ6BWwQbXYHtiMOwjwv9UN9SNu4VaJUuwdMmqN7
+# /F9jLVst5rGZV03BMIIF3TCCA8WgAwIBAgIIeyyb0xaAMpkwDQYJKoZIhvcNAQEL
+# BQAwfDELMAkGA1UEBhMCVVMxDjAMBgNVBAgMBVRleGFzMRAwDgYDVQQHDAdIb3Vz
+# dG9uMRgwFgYDVQQKDA9TU0wgQ29ycG9yYXRpb24xMTAvBgNVBAMMKFNTTC5jb20g
+# Um9vdCBDZXJ0aWZpY2F0aW9uIEF1dGhvcml0eSBSU0EwHhcNMTYwMjEyMTczOTM5
+# WhcNNDEwMjEyMTczOTM5WjB8MQswCQYDVQQGEwJVUzEOMAwGA1UECAwFVGV4YXMx
+# EDAOBgNVBAcMB0hvdXN0b24xGDAWBgNVBAoMD1NTTCBDb3Jwb3JhdGlvbjExMC8G
+# A1UEAwwoU1NMLmNvbSBSb290IENlcnRpZmljYXRpb24gQXV0aG9yaXR5IFJTQTCC
+# AiIwDQYJKoZIhvcNAQEBBQADggIPADCCAgoCggIBAPkP3aMrfcvQKv7sZ4Wm5y4b
+# unfh4/WvpOz6Sl2RxFdHaxh3a3by/ZPkPQ/CFp4LZsNWlJ4Xg4XOVu/yFv0AYvUi
+# CVToZRdOQbngT0aXqhvIuG5iXmmxX9sqAn78bMrzQdjt0Oj8P2FI7bADFB0QDksZ
+# 4LtO7IZl/zbzXmcCC52GVWH9ejjt/uIZALdvoVBidXQ8oPrIJZK0bnoix/geoeOy
+# 3ZExqysdBP+lSgQ36YWkMyv94tZVNHwZpEpox7Ko07fKoZOI68GXvIz5HdkihCR0
+# xwQ9aqkpk8zruFvh/l8lqjRYyMEjVJ0bmBHDOJx+PYZspQ9AhnwC9FwCTyjLrnGf
+# DzrIM/4RJTXq/LrFYD3ZfBjVsqnTdXgDciLKOsMf7yzlLqn6niy2UUb9rwPW6mBo
+# 6oUWNmuF6R7As93EJNyAKoFBbZQ+yODJgUEAnl6/f8UImKIYLEJAs/lvOCdLToD0
+# PYFH4Ih86hzOtXVcUS4cK38acijnALXRdMbX5J+tB5O2UzU1/Dfkw/ZdFr4hc96S
+# CvigY2q8lpJqPvi8ZVWb3vUNiSYE/CUapiVpy8JtynziWV+XrOvvLsi81xtZPCvM
+# 8hnIk2snYxnP/Okm+Mpxm3+T/jRnhE6Z6/yzeAkzcLpmpnbtG3PrGqUNxCITIJRW
+# Ck4sbE6x/c+cCbqiM+2HAgMBAAGjYzBhMB0GA1UdDgQWBBTdBAkHovV6fVJTEpKV
+# 7jiAJQ2mWTAPBgNVHRMBAf8EBTADAQH/MB8GA1UdIwQYMBaAFN0ECQei9Xp9UlMS
+# kpXuOIAlDaZZMA4GA1UdDwEB/wQEAwIBhjANBgkqhkiG9w0BAQsFAAOCAgEAIBgR
+# lCn7Jp0cHh5wYfGVcpNxJK1ok1iOMq8bs3AD/CUrdIWQPXhq9LmLpZc7tRiRux6n
+# +UBbkflVma8eEdBcHadm47GUBwwyOabqG7B52B2ccETjit3E+ZUfijhDPwGFpUen
+# PUayvOUiaPd7nNgsPgohyC0zrL/FgZkxdMF1ccW+sfAjRfSda/wZY52jvATGGAsl
+# u1OJD7OAUN5F7kR/q5R4ZJjT9ijdh9hwZXT7DrkT66cPYakylszeu+1jTBi7qUD3
+# oFRuIIhxdRjqerQ0cuAjJ3dctpDqhiVAq+8zD8ufgr6iIPv2tS0a5sKFsXQP+8hl
+# AqRSAUfdSSLBv9jra6x+3uxjMxW3IwiPxg+NQVrdjsW5j+VFP3jbutIbQLH+cU0/
+# 4IGiul607BXgk90IH37hVZkLId6Tngr75qNJvTYw/ud3sqB1l7UtgYgXZSD32pAA
+# n8lSzDLKNXz1PQ/YK9f1JmzJBjSWFupwWRoyeXkLtoh/D1JIPb9s2KJELtFOt3JY
+# 04kTlf5Eq/jXixtunLwsoFvVagCvXzfh1foQC5ichucmj87w7G6KVwuA406ywKBj
+# YZC6VWg3dGq2ktufoYYitmUnDuy2n0Jg5GfCtdpBC8TTi2EbvPofkSvXRAdeuims
+# 2cXp71NIWuuA8ShYIc2wBlX7Jz9TkHCpBB5XJ7kwggbLMIIEs6ADAgECAhBSnbvC
+# uImH9YOA4LDrogY2MA0GCSqGSIb3DQEBCwUAMHwxCzAJBgNVBAYTAlVTMQ4wDAYD
 # VQQIDAVUZXhhczEQMA4GA1UEBwwHSG91c3RvbjEYMBYGA1UECgwPU1NMIENvcnBv
 # cmF0aW9uMTEwLwYDVQQDDChTU0wuY29tIFJvb3QgQ2VydGlmaWNhdGlvbiBBdXRo
-# b3JpdHkgUlNBMB4XDTE5MTExMzE4NTAwNVoXDTM0MTExMjE4NTAwNVowczELMAkG
+# b3JpdHkgUlNBMB4XDTI2MDYxMjE2NDIxNVoXDTQxMDIxMjE3MzkzOVowcjELMAkG
 # A1UEBhMCVVMxDjAMBgNVBAgMBVRleGFzMRAwDgYDVQQHDAdIb3VzdG9uMREwDwYD
-# VQQKDAhTU0wgQ29ycDEvMC0GA1UEAwwmU1NMLmNvbSBUaW1lc3RhbXBpbmcgSXNz
-# dWluZyBSU0EgQ0EgUjEwggIiMA0GCSqGSIb3DQEBAQUAA4ICDwAwggIKAoICAQCu
-# URAT0vk8IKAghd7JUBxkyeH9xek0/wp/MUjoclrFXqhh/fGH91Fc+7fm0MHCE7A+
-# wmOiqBj9ODrJAYGq3rm33jCnHSsCBNWAQYyoauLq8IjqsS1JlXL29qDNMMdwZ8UN
-# zQS7vWZMDJ40JSGNphMGTIA2qn2bohGtgRc4p1395ESypUOaGvJ3t0FNL3BuKmb6
-# YctMcQUF2sqooMzd89h0E6ujdvBDo6ZwNnWoxj7YmfWjSXg33A5GuY9ym4QZM5OE
-# Vgo8ebz/B+gyhyCLNNhh4Mb/4xvCTCMVmNYrBviGgdPZYrym8Zb84TQCmSuX0JlL
-# La6WK1aO6qlwISbb9bVGh866ekKblC/XRP20gAu1CjvcYciUgNTrGFg8f8AJgQPO
-# Cc1/CCdaJSYwhJpSdheKOnQgESgNmYZPhFOC6IKaMAUXk5U1tjTcFCgFvvArXtK4
-# azAWUOO1Y3fdldIBL6LjkzLUCYJNkFXqhsBVcPMuB0nUDWvLJfPimstjJ8lF4S6E
-# CxWnlWi7OElVwTnt1GtRqeY9ydvvGLntU+FecK7DbqHDUd366UreMkSBtzevAc9a
-# qoZPnjVMjvFqV1pYOjzmTiVHZtAc80bAfFe5LLfJzPI6DntNyqobpwTevQpHqPDN
-# 9qqNO83r3kaw8A9j+HZiSw2AX5cGdQP0kG0vhzfgBwIDAQABo4IBgTCCAX0wEgYD
-# VR0TAQH/BAgwBgEB/wIBADAfBgNVHSMEGDAWgBTdBAkHovV6fVJTEpKV7jiAJQ2m
-# WTCBgwYIKwYBBQUHAQEEdzB1MFEGCCsGAQUFBzAChkVodHRwOi8vd3d3LnNzbC5j
-# b20vcmVwb3NpdG9yeS9TU0xjb21Sb290Q2VydGlmaWNhdGlvbkF1dGhvcml0eVJT
-# QS5jcnQwIAYIKwYBBQUHMAGGFGh0dHA6Ly9vY3Nwcy5zc2wuY29tMD8GA1UdIAQ4
-# MDYwNAYEVR0gADAsMCoGCCsGAQUFBwIBFh5odHRwczovL3d3dy5zc2wuY29tL3Jl
-# cG9zaXRvcnkwEwYDVR0lBAwwCgYIKwYBBQUHAwgwOwYDVR0fBDQwMjAwoC6gLIYq
-# aHR0cDovL2NybHMuc3NsLmNvbS9zc2wuY29tLXJzYS1Sb290Q0EuY3JsMB0GA1Ud
-# DgQWBBQMnRAljpqnG5mHQ88IfuG9gZD0zzAOBgNVHQ8BAf8EBAMCAYYwDQYJKoZI
-# hvcNAQELBQADggIBAJIZdQ2mWkLPGQfZ8vyU+sCb8BXpRJZaL3Ez3VDlE3uZk3cP
-# xPtybVfLuqaci0W6SB22JTMttCiQMnIVOsXWnIuAbD/aFTcUkTLBI3xys+wEajzX
-# aXJYWACDS47BRjDtYlDW14gLJxf8W6DQoH3jHDGGy8kGJFOlDKG7/YrK7UGfHtBA
-# EDVe6lyZ+FtCsrk7dD/IiL/+Q3Q6SFASJLQ2XI89ihFugdYL77CiDNXrI2MFspQG
-# swXEAGpHuaQDTHUp/LdR3TyrIsLlnzoLskUGswF/KF8+kpWUiKJNC4rPWtNrxlbX
-# YRGgdEdx8SMjUTDClldcrknlFxbqHsVmr9xkT2QtFmG+dEq1v5fsIK0vHaHrWjMM
-# maJ9i+4qGJSD0stYfQ6v0PddT7EpGxGd867Ada6FZyHwbuQSadMb0K0P0OC2r7rw
-# qBUe0BaMqTa6LWzWItgBjGcObXeMxmbQqlEz2YtAcErkZvh0WABDDE4U8GyV/32F
-# daAvJgTfe9MiL2nSBioYe/g5mHUSWAay/Ip1RQmQCvmF9sNfqlhJwkjy/1U1ibUk
-# TIUBX3HgymyQvqQTZLLys6pL2tCdWcjI9YuLw30rgZm8+K387L7ycUvqrmQ3ZJlu
-# jHl3r1hgV76s3WwMPgKk1bAEFMj+rRXimSC+Ev30hXZdqyMdl/il5Ksd0vhGMYIC
-# WDCCAlQCAQEwgYcwczELMAkGA1UEBhMCVVMxDjAMBgNVBAgMBVRleGFzMRAwDgYD
-# VQQHDAdIb3VzdG9uMREwDwYDVQQKDAhTU0wgQ29ycDEvMC0GA1UEAwwmU1NMLmNv
-# bSBUaW1lc3RhbXBpbmcgSXNzdWluZyBSU0EgQ0EgUjECEB9rFmLSLhtsXfHAwaBg
-# DjgwCwYJYIZIAWUDBAIBoIIBYTAaBgkqhkiG9w0BCQMxDQYLKoZIhvcNAQkQAQQw
-# HAYJKoZIhvcNAQkFMQ8XDTI2MTAxNDE1MTYzM1owKAYJKoZIhvcNAQk0MRswGTAL
-# BglghkgBZQMEAgGhCgYIKoZIzj0EAwIwLwYJKoZIhvcNAQkEMSIEIOnqw4jy27k9
-# rIxbKYQpu/YwJD8Mv9c7VPH2MDpWLNe/MIHJBgsqhkiG9w0BCRACLzGBuTCBtjCB
-# szCBsAQgVCr5oWqNci5mEUl4iumUwYqaruWmXLNEolSa+Wx5x4swgYswd6R1MHMx
-# CzAJBgNVBAYTAlVTMQ4wDAYDVQQIDAVUZXhhczEQMA4GA1UEBwwHSG91c3RvbjER
-# MA8GA1UECgwIU1NMIENvcnAxLzAtBgNVBAMMJlNTTC5jb20gVGltZXN0YW1waW5n
-# IElzc3VpbmcgUlNBIENBIFIxAhAfaxZi0i4bbF3xwMGgYA44MAoGCCqGSM49BAMC
-# BEcwRQIhANAJyarSFNd1v5zHu1y383eRIsEtM6OC+sHkAaAWurysAiBBpc0764Fu
-# urhXXTY4RYnhmx7/j6H9v3F7TdbDu4QvNA==
+# VQQKDAhTU0wgQ29ycDEuMCwGA1UEAwwlU1NMLmNvbSBUaW1lc3RhbXBpbmcgSXNz
+# dWluZyBSU0EgQ0EgMjCCAiIwDQYJKoZIhvcNAQEBBQADggIPADCCAgoCggIBAJ8v
+# q+ZzTZC8MUabNgd5WlBjVPcu71oiedNd8n9Il8+uW0HcGvW44/Jf0pHl6hxqn0od
+# haGnvvNBPJgxH/d6CMI7Mtgl9nF5isarRfByRmAeH+skYShA+dMJGzsrC9NiF3/v
+# xGZ2uOI334YVc+DlP5OdsUPz5yIP7hYXNlpPknPwh6gK/pWFZD8+y8uUagfX9USh
+# q/SQt+1tS4FXRwudHTSHbGt0Fz4ZbWGbm0d56ROAW34tI6FFuZ+TtGssHjeOUf2F
+# S8QNGBpadTh1X1Z7Kl6vG4Z8NS3OJIyelzoF5TpcP2vM3ue0723bmZd3oXsE5rzt
+# AJMv56jlg0vSDz8XcXRur6awW0rh5cTQDQQGx04hYJH2Zn9HWWJU/wJ2SKBcQKtB
+# yCz6JX+DoFoBE++kolkpZtl2ESF8FY6XqhtKZb18ESEAc0ohCY+0HkBZwrx8eIED
+# CDbzd/shv9a8YRG2oxr3tLUz95V+Dzzh1QBNECaeGczyNWGCZIVUa4lVcVUVOBbI
+# OAT8D+iPmC5h29bWeES8DhTS4f4CWA4D5QoQqMTqIBcV4MD2Waw8hEWAdGnjnsVt
+# DimnDeEUbvXKhdiirvwG+QC+3mAy1RlD6xBMmGyDAKVSqqXm3NP4w0J4gvt65Grk
+# QI4FXPJtYqfwkIBtQ8OGfbpVUQGPVUemWtui7E21AgMBAAGjggFRMIIBTTASBgNV
+# HRMBAf8ECDAGAQH/AgEAMB8GA1UdIwQYMBaAFN0ECQei9Xp9UlMSkpXuOIAlDaZZ
+# ME0GCCsGAQUFBwEBBEEwPzA9BggrBgEFBQcwAoYxaHR0cDovL2NlcnQuc3NsLmNv
+# bS9TU0xjb20tUm9vdENBLVJTQS00MDk2LVIxLmNlcjA/BgNVHSAEODA2MDQGBFUd
+# IAAwLDAqBggrBgEFBQcCARYeaHR0cHM6Ly93d3cuc3NsLmNvbS9yZXBvc2l0b3J5
+# MBMGA1UdJQQMMAoGCCsGAQUFBwMIMEIGA1UdHwQ7MDkwN6A1oDOGMWh0dHA6Ly9j
+# cmxzLnNzbC5jb20vU1NMY29tLVJvb3RDQS1SU0EtNDA5Ni1SMS5jcmwwHQYDVR0O
+# BBYEFHCaZcFDgKP86bFkiW7xMJwJIcl8MA4GA1UdDwEB/wQEAwIBhjANBgkqhkiG
+# 9w0BAQsFAAOCAgEAZRRbzTHpgOogYgWKOeiCkI1oVrkGmCrqOKqX9CiTREQLdYM/
+# h7ANki98QP1fhAPEkTzT/Ur19IrPuZg7KaWL6SsmBqmD9+mBVtJmxdRdGbV8bpgl
+# FDv2VeZgTSg3+UOD2O0G9HlgHqVHNKzSa/zL5+WYl3yT8Q29sZnIPGkQ+udv56/j
+# q5NlAT9BON4iXSOCxe1bNvUd0hkS2GTsTNeQyOEHm7CkZdCg5X+DpmBginO7pk8Y
+# m5GbTdQtSloJ3/Y2nVPycJ8kmmBAYMev7/hVQukhjjc4mO03LyPTFfqmMR1D5Tpu
+# gGkD9nUuG41l55vOpXQm1JMbTgArpkn0/e9O+yTYlWuz2dSAZHf9jxNQAvILO1Pv
+# 2JNQTfV0TyIteZP7gNcRfaHnnuSho8ohipKiE+1vEJIFE+c3gopxSpHCmn2THETk
+# lWKV7ZrUKhhkdoOLj2KidCtYZrOoCV6x7f9+KfDPT61fKDVntGZdRKwzLV53VIN6
+# oSS+KQN2VJaO8OZTOZpfgO4o6/9xpNr+EEaA3hNkoZk13R4LaqPC/309dfZmHBE8
+# nBNjWBkV7AZdzdK8w7B0a/D9066a6oUa19OIktD+3kPpQ8YEt8oRp9zs1hoQ7fRn
+# 9sdantP6nYRQFTpF8czGc+FGresbAH819Pv5vBhCluTo8Px2PpC71cM0jzsxggJW
+# MIICUgIBATCBhjByMQswCQYDVQQGEwJVUzEOMAwGA1UECAwFVGV4YXMxEDAOBgNV
+# BAcMB0hvdXN0b24xETAPBgNVBAoMCFNTTCBDb3JwMS4wLAYDVQQDDCVTU0wuY29t
+# IFRpbWVzdGFtcGluZyBJc3N1aW5nIFJTQSBDQSAyAhBUQ/g3vVruGAGEcrhc2o7j
+# MAsGCWCGSAFlAwQCAaCCAWAwGgYJKoZIhvcNAQkDMQ0GCyqGSIb3DQEJEAEEMBwG
+# CSqGSIb3DQEJBTEPFw0yNjExMDMwOTM4MDVaMCgGCSqGSIb3DQEJNDEbMBkwCwYJ
+# YIZIAWUDBAIBoQoGCCqGSM49BAMCMC8GCSqGSIb3DQEJBDEiBCBGnnmyHMPQ8rn7
+# 3zcvEQSuaQYV+3XrxfHoSSS3q/nKoTCByAYLKoZIhvcNAQkQAi8xgbgwgbUwgbIw
+# ga8EIFdP6heq+l58aiubCMmYsXNeRQs4c8pE5qJMoJMOY/OwMIGKMHakdDByMQsw
+# CQYDVQQGEwJVUzEOMAwGA1UECAwFVGV4YXMxEDAOBgNVBAcMB0hvdXN0b24xETAP
+# BgNVBAoMCFNTTCBDb3JwMS4wLAYDVQQDDCVTU0wuY29tIFRpbWVzdGFtcGluZyBJ
+# c3N1aW5nIFJTQSBDQSAyAhBUQ/g3vVruGAGEcrhc2o7jMAoGCCqGSM49BAMCBEcw
+# RQIhAIMqHrEXkDd3RoFNszXO5JPqMVLgjOGMVYWgV1VvpXt2AiB1MfCExkPiw7vp
+# hOAmlWG5+SEXiNqvv2jjmQukxW+fkA==
 # SIG # End signature block

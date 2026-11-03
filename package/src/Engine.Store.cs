@@ -2,12 +2,13 @@
 //  Exchange Log Report - engine, part 2: SQLite store
 // -----------------------------------------------------------------------------
 //  Author  : Nicolas Fabert
-//  Version : 2.0.0
+//  Version : 3.0.0
 //
 //  Tables (all times in Unix ms, UTC)
 //    run              one row per execution
 //    source_file      read position of every log file (server, kind, file_key) -> offset; file_key is the
-//                     identity of the file whatever the path used to reach it (see FileKey)
+//                     identity of the file whatever the path used to reach it (see FileKey); its '#Fields' header
+//                     text is stored once per distinct text in source_fields (schema 10, source_file.fields_id)
 //    noise            lines set aside per execution, server, kind and reason
 //    access_usage     client access, one row per day x server x user x protocol (aggregate)
 //    access_action    client access, one row per day x server x protocol x action (latency per operation)
@@ -55,14 +56,23 @@ namespace ExchangeLogReport
 
     public sealed class PurgeResult
     {
-        public long Usage, Events, IisStatus, Smtp, Transcripts, AuthFragments, Messages, Runs, Files, Sessions, Actions, Clients;
+        public long Usage, Events, IisStatus, Smtp, Transcripts, AuthFragments, Messages, Runs, Files, Sessions, Actions, Clients, Identities;
         public double DeleteSeconds, VacuumSeconds, OptimizeSeconds;
         public long Total { get { return Usage + Events + IisStatus + Smtp + Messages + Sessions + Actions + Clients; } }
     }
 
-    public sealed class Store : IDisposable
+    /// <summary>Row of PRAGMA wal_checkpoint: busy, frames in the log, frames copied into the database (-1: unknown).</summary>
+    public struct WalCheckpoint
     {
-        public const string SchemaVersion = "6";
+        public long Busy, Log, Checkpointed;
+        /// <summary>Not blocked and every frame of the log copied: the next writer starts the log again at its beginning.</summary>
+        public bool Complete { get { return Busy == 0 && Log >= 0 && Log == Checkpointed; } }
+    }
+
+    public sealed partial class Store : IDisposable
+    {
+        public const string SchemaVersion = "13";
+        public const string MessageHashAlgorithm = "fnv1a64-utf8-v1";
         /// <summary>SQLite page cache of a collection, in KB (set before opening the store; 256 MB by default).</summary>
         public static int CacheKilobytes = 262144;
         /// <summary>Page size of a NEW database (an existing one keeps its own). 16 KB: fewer and larger writes, on a
@@ -73,7 +83,8 @@ namespace ExchangeLogReport
         public string FilePath { get; private set; }
         public bool ReadOnly { get; private set; }
 
-        // The shipped SQLite Windows VFS needs extended paths, including for its journal sidecars.
+        // The shipped SQLite Windows VFS needs extended paths, including for its journal sidecars. The VFS bound that
+        // remains is 1040 UTF-8 bytes for the full name, prefix included.
         internal static string SqlitePath(string path)
         {
             path = Path.GetFullPath(path);
@@ -81,7 +92,21 @@ namespace ExchangeLogReport
             return path.StartsWith(@"\\", StringComparison.Ordinal) ? @"\\?\UNC\" + path.Substring(2) : @"\\?\" + path;
         }
 
-        public Store(string path, bool readOnly, string toolVersion)
+        public Store(string path, bool readOnly, string toolVersion) : this(path, readOnly, toolVersion, true) { }
+
+        /// <summary>
+        /// A read-only open of an older database would upgrade it first (see the constructor): true when it would. A report takes the collector
+        /// lock around such an open, so that the upgrade never runs beside a collection.
+        /// </summary>
+        public static bool RequiresUpgrade(string path)
+        {
+            using (var s = new Store(path, true, null, false)) return s.UpgradePending;
+        }
+
+        /// <summary>A read-only store opened without its upgrade (RequiresUpgrade) found a database that needs one; nothing else can be read.</summary>
+        bool UpgradePending;
+
+        Store(string path, bool readOnly, string toolVersion, bool upgrade)
         {
             FilePath = Path.GetFullPath(path);
             ReadOnly = readOnly;
@@ -94,24 +119,33 @@ namespace ExchangeLogReport
                 Pooling = false
             };
             _db = new SqliteConnection(builder.ToString());
+            try
+            {
             _db.Open();
+            RegisterFunctions();
             Exec("PRAGMA busy_timeout=30000;");
+            if (StoredSchemaVersion() > int.Parse(SchemaVersion, System.Globalization.CultureInfo.InvariantCulture))
+                throw new InvalidOperationException("This database uses a newer schema; no changes were made.");
             if (readOnly)
             {
-                // A database of an older version (report without collection after an update): upgrade it
-                // once (new tables and columns only), then go on read-only.
-                if (StoredSchemaVersion() < int.Parse(SchemaVersion, System.Globalization.CultureInfo.InvariantCulture))
+                // A database of an older version (a report, -NoCollect included, or -Mode Status after an update): it is upgraded once, as the
+                // next collection would do it (the migration steps of Migrate: new tables, columns, indexes and triggers, and the derived rows they
+                // need), then opened read-only. The same for a schema-12 database of an earlier 3.0 build without the authentication columns (HasAuthShape).
+                if (StoredSchemaVersion() < int.Parse(SchemaVersion, System.Globalization.CultureInfo.InvariantCulture) || !HasAuthShape(null))
                 {
+                    if (!upgrade) { UpgradePending = true; return; }
                     _db.Dispose();
                     using (new Store(FilePath, false, toolVersion)) { }
                     _db = new SqliteConnection(builder.ToString());
                     _db.Open();
+                    RegisterFunctions();
                     Exec("PRAGMA busy_timeout=30000;");
                 }
                 // A report reads index pages again and again (messages by id, steps by session) and sorts large sets:
                 // the same page cache as a collection; large temporary sorts may spill to disk.
                 Exec("PRAGMA cache_size=-" + CacheKilobytes.ToString(System.Globalization.CultureInfo.InvariantCulture) + ";");
                 Exec("PRAGMA temp_store=FILE;");
+                VerifyHashMetadata();
                 return;
             }
             // auto_vacuum and page_size must be chosen before the first table is created (new database only).
@@ -120,22 +154,58 @@ namespace ExchangeLogReport
             Exec("PRAGMA journal_mode=WAL;");
             Exec("PRAGMA synchronous=NORMAL;");
             Exec("PRAGMA temp_store=MEMORY;");
-            // A collection writes large batches: a large page cache keeps the indexes in memory (the default 2 MB cache
-            // made every row of a large database wait for the disk), and the WAL is copied to the database every 64 MB
-            // instead of every 4 MB (fewer checkpoints, each one flushed to the disk).
+            // A collection writes large batches: a large page cache keeps the indexes in memory (with the SQLite default
+            // of 2 MB, every row of a large database waits for the disk), and the WAL is copied to the database every 64 MB
+            // rather than at the SQLite default of 4 MB (fewer checkpoints, each one flushed to the disk).
             Exec("PRAGMA cache_size=-" + CacheKilobytes.ToString(System.Globalization.CultureInfo.InvariantCulture) + ";");
             Exec("PRAGMA wal_autocheckpoint=16384;");
             Exec(Schema);
             Migrate();
-            Exec("INSERT INTO metadata(key,value) VALUES('schema_version','" + SchemaVersion + "') ON CONFLICT(key) DO UPDATE SET value=excluded.value;");
             using (var c = Command("INSERT INTO metadata(key,value) VALUES('tool_version',@v) ON CONFLICT(key) DO UPDATE SET value=excluded.value;"))
             {
                 c.Parameters.AddWithValue("@v", toolVersion ?? "");
                 c.ExecuteNonQuery();
             }
+            }
+            catch { _db.Dispose(); throw; }
         }
 
-        const string Schema = @"
+        /// <summary>Immutable FNV-1a over UTF-8 bytes; signed INTEGER is the same 64 bits. NULL stays NULL.</summary>
+        public static long? MessageHash(string text)
+        {
+            if (text == null) return null;
+            unchecked
+            {
+                ulong hash = 14695981039346656037UL;
+                foreach (byte b in System.Text.Encoding.UTF8.GetBytes(text)) { hash ^= b; hash *= 1099511628211UL; }
+                return (long)hash;
+            }
+        }
+
+        void RegisterFunctions()
+        {
+            _db.CreateFunction<string, long?>("exl_msg_hash", MessageHash, isDeterministic: true);
+            // Schema 11: the SMTP client key (peer) of a transaction, a pure function of its remote_ep. Used by the migration and the verification;
+            // the collector computes the same value in C# (Identity.RemoteHost).
+            _db.CreateFunction<string, string>("exl_remote_host", Identity.RemoteHost, isDeterministic: true);
+        }
+
+        void VerifyHashMetadata()
+        {
+            using (var c = Command("SELECT value FROM metadata WHERE key='message_hash_algorithm';"))
+                if (!string.Equals(c.ExecuteScalar() as string, MessageHashAlgorithm, StringComparison.Ordinal))
+                    throw new InvalidOperationException("Unknown or missing message hash algorithm; refusing incompatible lookups.");
+        }
+
+        /// <summary>The canonical access_client table: one row per day x user x protocol x address x user agent x device x authentication type
+        /// (auth_type: the AuthMode.Token of the HttpProxy AuthenticationType, '' when none). Schema creates it; EnsureAuthShape rebuilds an earlier one.</summary>
+        internal const string AccessClientTableSql = @"CREATE TABLE access_client(
+  day TEXT NOT NULL, user TEXT NOT NULL, protocol TEXT NOT NULL, client_ip TEXT NOT NULL, user_agent TEXT NOT NULL, device_id TEXT NOT NULL,
+  device_type TEXT, software TEXT, requests INTEGER NOT NULL, failures INTEGER NOT NULL,
+  first_ms INTEGER NOT NULL, last_ms INTEGER NOT NULL, servers TEXT, auth_type TEXT NOT NULL DEFAULT '',
+  PRIMARY KEY(day, user, protocol, client_ip, user_agent, device_id, auth_type)) WITHOUT ROWID";
+
+        static readonly string Schema = @"
 CREATE TABLE IF NOT EXISTS metadata(key TEXT PRIMARY KEY, value TEXT);
 CREATE TABLE IF NOT EXISTS run(
   id INTEGER PRIMARY KEY, mode TEXT, started_ms INTEGER, ended_ms INTEGER, status TEXT, host TEXT, account TEXT, version TEXT,
@@ -171,11 +241,10 @@ CREATE TABLE IF NOT EXISTS iis_status(
 CREATE TABLE IF NOT EXISTS smtp_transaction(
   id INTEGER PRIMARY KEY, time_ms INTEGER NOT NULL, end_ms INTEGER, server TEXT NOT NULL, direction TEXT NOT NULL,
   role TEXT, connector TEXT, session_id TEXT NOT NULL, local_ep TEXT, remote_ep TEXT, helo TEXT, tls TEXT, auth TEXT,
-  mail_from TEXT, rcpt_count INTEGER, rcpts TEXT, message_id TEXT, internal_id TEXT, status TEXT, response TEXT, transcript TEXT,
+  mail_from TEXT, rcpt_count INTEGER, rcpts TEXT, message_id TEXT, internal_id TEXT, status TEXT, response TEXT, transcript TEXT, msg_hash INTEGER,
   UNIQUE(server, direction, session_id, time_ms));
 -- 2.0.0: covering index of the SMTP aggregates of the reports (replaces ix_smtp_time).
 CREATE INDEX IF NOT EXISTS ix_smtp_flow ON smtp_transaction(time_ms, server, direction, status);
-CREATE INDEX IF NOT EXISTS ix_smtp_message ON smtp_transaction(message_id);
 -- 2.0.0 (schema 6): typed evidence of the authentication of SMTP sessions. Never holds an AUTH payload, challenge or
 -- password: only the observations the resolver needs (see Engine.SmtpAuth.cs). One row per part of a session read in one file.
 CREATE TABLE IF NOT EXISTS smtp_auth_fragment(
@@ -191,19 +260,14 @@ CREATE TABLE IF NOT EXISTS message_event(
   message_id TEXT, internal_id TEXT, network_id TEXT, sender TEXT, recipients TEXT, recipient_status TEXT,
   recipient_count INTEGER, total_bytes INTEGER, subject TEXT, client_ip TEXT, client_host TEXT, server_ip TEXT,
   server_host TEXT, connector TEXT, source_context TEXT, related_recipient TEXT, reference TEXT,
-  directionality TEXT, message_info TEXT, return_path TEXT, log_id TEXT, UNIQUE(server, log_id));
+  directionality TEXT, message_info TEXT, return_path TEXT, log_id TEXT, msg_hash INTEGER, UNIQUE(server, log_id));
 -- 2.0.0: covering index of the mail flow aggregates of the reports (replaces ix_msg_time).
 CREATE INDEX IF NOT EXISTS ix_msg_flow ON message_event(time_ms, server, event_id, message_id, internal_id);
-CREATE INDEX IF NOT EXISTS ix_msg_id ON message_event(message_id);
 CREATE TABLE IF NOT EXISTS access_action(
   day TEXT NOT NULL, server TEXT NOT NULL, protocol TEXT NOT NULL, action TEXT NOT NULL,
   requests INTEGER NOT NULL, failures INTEGER NOT NULL, slow INTEGER NOT NULL, total_ms INTEGER NOT NULL, max_ms INTEGER NOT NULL,
   PRIMARY KEY(day, server, protocol, action)) WITHOUT ROWID;
-CREATE TABLE IF NOT EXISTS access_client(
-  day TEXT NOT NULL, user TEXT NOT NULL, protocol TEXT NOT NULL, client_ip TEXT NOT NULL, user_agent TEXT NOT NULL, device_id TEXT NOT NULL,
-  device_type TEXT, software TEXT, requests INTEGER NOT NULL, failures INTEGER NOT NULL,
-  first_ms INTEGER NOT NULL, last_ms INTEGER NOT NULL, servers TEXT,
-  PRIMARY KEY(day, user, protocol, client_ip, user_agent, device_id)) WITHOUT ROWID;
+" + AccessClientTableSql.Replace("CREATE TABLE access_client", "CREATE TABLE IF NOT EXISTS access_client") + @";
 CREATE INDEX IF NOT EXISTS ix_client_user ON access_client(user, day);
 CREATE TABLE IF NOT EXISTS client_session(
   id INTEGER PRIMARY KEY, skey TEXT NOT NULL, day TEXT NOT NULL, start_ms INTEGER NOT NULL, end_ms INTEGER NOT NULL,
@@ -212,13 +276,30 @@ CREATE TABLE IF NOT EXISTS client_session(
   requests INTEGER NOT NULL, successes INTEGER NOT NULL, failures INTEGER NOT NULL, slow INTEGER NOT NULL,
   first_success_ms INTEGER NOT NULL, last_success_ms INTEGER NOT NULL, first_failure_ms INTEGER NOT NULL, last_failure_ms INTEGER NOT NULL,
   total_ms INTEGER NOT NULL, max_ms INTEGER NOT NULL, bytes_in INTEGER NOT NULL, bytes_out INTEGER NOT NULL,
-  actions TEXT, statuses TEXT, first_error TEXT, last_error TEXT, backend TEXT, connections INTEGER NOT NULL DEFAULT 0, updated_ms INTEGER);
+  actions TEXT, statuses TEXT, first_error TEXT, last_error TEXT, backend TEXT, connections INTEGER NOT NULL DEFAULT 0, updated_ms INTEGER, auth_modes TEXT);
 CREATE INDEX IF NOT EXISTS ix_session_key ON client_session(skey);
-CREATE INDEX IF NOT EXISTS ix_session_time ON client_session(start_ms);
+CREATE INDEX IF NOT EXISTS ix_session_time ON client_session(start_ms,end_ms,requests);
 CREATE INDEX IF NOT EXISTS ix_session_user ON client_session(user, start_ms);
 CREATE TABLE IF NOT EXISTS session_step(session_id INTEGER NOT NULL, time_ms INTEGER NOT NULL, data TEXT NOT NULL);
 CREATE INDEX IF NOT EXISTS ix_step_session ON session_step(session_id, time_ms);
+-- 3.0.0: one row per security identifier Exchange logged as the user of token (OAuth) requests: its status, the account the logs pair it
+-- with (user, NULL unless resolved), the evidence (names) and the accounts its devices reported (hints). A source dictionary of the collector.
+CREATE TABLE IF NOT EXISTS identity_map(
+  sid TEXT PRIMARY KEY, user TEXT, status TEXT NOT NULL, names TEXT, hints TEXT,
+  lines INTEGER NOT NULL DEFAULT 0, first_ms INTEGER NOT NULL, last_ms INTEGER NOT NULL,
+  resolved_ms INTEGER, applied_ms INTEGER) WITHOUT ROWID;
+CREATE INDEX IF NOT EXISTS ix_identity_user ON identity_map(user);
 ";
+
+        /// <summary>The database has this table (a table a later version added may be missing from a database opened read-only).</summary>
+        public bool HasTable(string name)
+        {
+            using (var c = Command("SELECT 1 FROM sqlite_master WHERE type='table' AND name=@n;"))
+            {
+                c.Parameters.AddWithValue("@n", name);
+                return c.ExecuteScalar() != null;
+            }
+        }
 
         /// <summary>Schema version written in the database (0 when unknown).</summary>
         int StoredSchemaVersion()
@@ -276,6 +357,13 @@ CREATE INDEX IF NOT EXISTS ix_step_session ON session_step(session_id, time_ms);
             }
             Exec("CREATE UNIQUE INDEX IF NOT EXISTS ux_source_file_key ON source_file(server, kind, file_key);");
             MigrateSmtpAuth();
+            MigrateMessageHashes();
+            MigrateServeRollups();
+            MigrateServeSchema10();
+            MigrateSchema11();
+            MigrateSchema12();
+            EnsureServeShape12();
+            MigrateSchema13();
         }
 
         static readonly string[][] SmtpAuthColumns = {
@@ -325,9 +413,150 @@ CREATE INDEX IF NOT EXISTS ix_step_session ON session_step(session_id, time_ms);
                 foreach (var d in SmtpAuthFragmentColumns)
                     if (!fragmentColumns.Contains(d[0])) using (var c = Command("ALTER TABLE smtp_auth_fragment ADD COLUMN " + d[0] + " " + d[1] + ";", tx)) c.ExecuteNonQuery();
                 foreach (var d in SmtpAuthIndexes) using (var c = Command(d[1], tx)) c.ExecuteNonQuery();
-                using (var c = Command("INSERT INTO metadata(key,value) VALUES('schema_version','6') ON CONFLICT(key) DO UPDATE SET value=excluded.value;", tx)) c.ExecuteNonQuery();
+                if (upgrade) using (var c = Command("INSERT INTO metadata(key,value) VALUES('schema_version','6') ON CONFLICT(key) DO UPDATE SET value=excluded.value;", tx)) c.ExecuteNonQuery();
                 tx.Commit();
             }
+        }
+
+        /// <summary>
+        /// Schema 7: one SQL backfill, index replacement and version change in a single transaction.
+        /// External writable SQLite clients must register exl_msg_hash with MessageHashAlgorithm semantics;
+        /// inserts/message-id updates without it fail rather than silently creating unsearchable rows.
+        /// Hashes are nonunique accelerators only: every lookup must also compare the original binary TEXT.
+        /// </summary>
+        void MigrateMessageHashes()
+        {
+            if (StoredSchemaVersion() >= 7) { VerifyHashMetadata(); EnsureMessageHashTriggers(); return; }
+            using (var c = Command("SELECT value FROM metadata WHERE key='message_hash_algorithm';"))
+            {
+                object algorithm = c.ExecuteScalar();
+                if (algorithm != null && !(algorithm is DBNull) && !string.Equals(algorithm as string, MessageHashAlgorithm, StringComparison.Ordinal))
+                    throw new InvalidOperationException("Cannot change an existing message hash algorithm.");
+            }
+            using (var tx = Begin())
+            {
+                foreach (string table in new[] { "message_event", "smtp_transaction" })
+                {
+                    bool exists = false;
+                    using (var c = Command("PRAGMA table_info(" + table + ");", tx))
+                    using (var r = c.ExecuteReader()) while (r.Read()) if (r.GetString(1) == "msg_hash") exists = true;
+                    if (!exists) using (var c = Command("ALTER TABLE " + table + " ADD COLUMN msg_hash INTEGER;", tx)) c.ExecuteNonQuery();
+                    using (var c = Command("UPDATE " + table + " SET msg_hash=exl_msg_hash(message_id);", tx)) c.ExecuteNonQuery();
+               }
+                EnsureMessageHashTriggers(tx);
+                using (var c = Command("DROP INDEX IF EXISTS ix_msg_id; DROP INDEX IF EXISTS ix_smtp_message;" +
+                    "INSERT INTO metadata(key,value) VALUES('message_hash_algorithm','" + MessageHashAlgorithm + "') ON CONFLICT(key) DO NOTHING;" +
+                    "INSERT INTO metadata(key,value) VALUES('schema_version','7') ON CONFLICT(key) DO UPDATE SET value=excluded.value;", tx)) c.ExecuteNonQuery();
+                tx.Commit();
+            }
+        }
+
+        void EnsureMessageHashTriggers(SqliteTransaction transaction = null)
+        {
+            var changes = new List<string[]>();
+            foreach (string table in new[] { "message_event", "smtp_transaction" })
+                foreach (bool insert in new[] { true, false })
+                {
+                    string name = "tr_" + table + (insert ? "_hash_insert" : "_hash_update");
+                    // Production inserts bind the hash, so the common path validates it without a second row/index write.
+                    // Raw/legacy SQL still repairs missing or incorrect values, including direct edits to msg_hash.
+                    string sql = MessageHashTriggerSql(table, insert);
+                    using (var c = Command("SELECT sql FROM sqlite_master WHERE type='trigger' AND name=@n;", transaction))
+                    {
+                        c.Parameters.AddWithValue("@n", name);
+                        if (string.Equals((c.ExecuteScalar() as string ?? "").TrimEnd(';'), sql, StringComparison.Ordinal)) continue;
+                    }
+                    changes.Add(new[] { name, sql });
+                }
+            if (changes.Count == 0) return;
+            SqliteTransaction tx = transaction ?? Begin();
+            try
+            {
+                foreach (var change in changes)
+                    using (var c = Command("DROP TRIGGER IF EXISTS " + change[0] + ";" + change[1] + ";", tx)) c.ExecuteNonQuery();
+                if (transaction == null) tx.Commit();
+            }
+            finally { if (transaction == null) tx.Dispose(); }
+        }
+
+        internal static string MessageHashTriggerSql(string table, bool insert)
+        {
+            return "CREATE TRIGGER tr_" + table + (insert ? "_hash_insert" : "_hash_update") +
+                " AFTER " + (insert ? "INSERT" : "UPDATE OF message_id,msg_hash") +
+                " ON " + table + " WHEN NEW.msg_hash IS NOT exl_msg_hash(NEW.message_id)" +
+                " BEGIN UPDATE " + table + " SET msg_hash=exl_msg_hash(NEW.message_id) WHERE id=NEW.id; END";
+        }
+
+        /// <summary>
+        /// Explicit, lossless maintenance for an operator-selected copy. No VACUUM, retention or automatic call.
+        /// Only display text is eligible; SQL-filtered, indexed and identity columns are never packed.
+        /// Each transaction retains at most 128 rows / approximately 4 MiB, apart from one oversized row.
+        /// Unknown BLOB formats are left byte-for-byte intact.
+        /// </summary>
+        /// <returns>Number of cells whose stored representation changed.</returns>
+        public long RepackSafeText()
+        {
+            if (ReadOnly) throw new InvalidOperationException("Repacking requires a writable copy.");
+            long changed = 0;
+            // observations stays TEXT: the existing evidence/replay contract uses SQLite JSON and replace() on it.
+            foreach (var fields in new[] {
+                new[] { "access_event", "url", "errors" },
+                new[] { "client_session", "actions", "statuses" }, new[] { "smtp_transaction", "response" } })
+            {
+                string table = fields[0], columns = string.Join(",", fields.Skip(1));
+                long after = long.MinValue;
+                bool first = true;
+                while (true)
+                {
+                    var rows = new List<object[]>();
+                    long bytes = 0;
+                    using (var tx = Begin())
+                    {
+                        using (var c = Command("SELECT id," + columns + " FROM " + table + (first ? "" : " WHERE id>@id") + " ORDER BY id LIMIT 128;", tx))
+                        {
+                            if (!first) c.Parameters.AddWithValue("@id", after);
+                            using (var r = c.ExecuteReader())
+                                while (r.Read())
+                                {
+                                    var row = new object[fields.Length];
+                                    row[0] = r.GetInt64(0);
+                                    for (int i = 1; i < row.Length; i++)
+                                    {
+                                        object value = r.IsDBNull(i) ? null : r.GetValue(i);
+                                        row[i] = value;
+                                        bytes += value is string ? ((string)value).Length * 2L : value is byte[] ? ((byte[])value).Length : 0;
+                                    }
+                                    rows.Add(row);
+                                    if (bytes >= 4L * 1048576) break;
+                                }
+                        }
+                        using (var c = Command("UPDATE " + table + " SET " + string.Join(",", fields.Skip(1).Select((f, i) => f + "=@v" + i)) + " WHERE id=@id;", tx))
+                        {
+                            c.Parameters.Add("@id", SqliteType.Integer);
+                            for (int i = 1; i < fields.Length; i++) c.Parameters.Add(new SqliteParameter("@v" + (i - 1), DBNull.Value));
+                            foreach (var row in rows)
+                            {
+                                long cells = 0;
+                                for (int i = 1; i < row.Length; i++)
+                                {
+                                    object before = row[i], decoded = Packed.Unpack(before);
+                                    object next = decoded is string ? Packed.Adaptive((string)decoded) : before;
+                                    bool same = before is byte[] && next is byte[] ? ((byte[])before).SequenceEqual((byte[])next) : Equals(before, next);
+                                    if (!same) cells++;
+                                    var p = c.Parameters[i];
+                                    p.SqliteType = next is byte[] ? SqliteType.Blob : SqliteType.Text;
+                                    p.Value = next ?? DBNull.Value;
+                                }
+                                if (cells > 0) { c.Parameters[0].Value = row[0]; c.ExecuteNonQuery(); changed += cells; }
+                                after = (long)row[0]; first = false;
+                            }
+                        }
+                        tx.Commit();
+                    }
+                    if (rows.Count == 0) break;
+                }
+            }
+            return changed;
         }
 
         static readonly System.Text.RegularExpressions.Regex AdminShareRx =
@@ -385,6 +614,19 @@ CREATE INDEX IF NOT EXISTS ix_step_session ON session_step(session_id, time_ms);
         public void Exec(string sql)
         {
             using (var c = Command(sql)) c.ExecuteNonQuery();
+        }
+
+        /// <summary>
+        /// Enables or disables trigger execution on THIS connection only (SQLITE_DBCONFIG_ENABLE_TRIGGER); the triggers stay defined in the
+        /// database and run for every other connection. SQLite decides at prepare time, so statements must be prepared after the change.
+        /// Returns the state before the call, or null when the setting could not be read or applied.
+        /// </summary>
+        internal bool? SetTriggersEnabled(bool enabled)
+        {
+            int before, after;
+            if (SQLitePCL.raw.sqlite3_db_config(_db.Handle, SQLitePCL.raw.SQLITE_DBCONFIG_ENABLE_TRIGGER, -1, out before) != SQLitePCL.raw.SQLITE_OK) return null;
+            if (SQLitePCL.raw.sqlite3_db_config(_db.Handle, SQLitePCL.raw.SQLITE_DBCONFIG_ENABLE_TRIGGER, enabled ? 1 : 0, out after) != SQLitePCL.raw.SQLITE_OK || (after != 0) != enabled) return null;
+            return before != 0;
         }
 
         public long Scalar(string sql, Hashtable parameters)
@@ -468,7 +710,8 @@ CREATE INDEX IF NOT EXISTS ix_step_session ON session_step(session_id, time_ms);
         public Dictionary<string, FileState> KnownFiles()
         {
             var d = new Dictionary<string, FileState>(StringComparer.OrdinalIgnoreCase);
-            using (var c = Command("SELECT id,server,kind,path,file_key,offset,size,last_write_ms,fields,first_ms,last_ms,lines,kept,noise FROM source_file WHERE file_key IS NOT NULL;"))
+            // The header text comes from the dictionary (schema 10); a row without fields_id keeps being read from its own fields column.
+            using (var c = Command("SELECT s.id,s.server,s.kind,s.path,s.file_key,s.offset,s.size,s.last_write_ms,COALESCE(d.text,s.fields),s.first_ms,s.last_ms,s.lines,s.kept,s.noise FROM source_file s LEFT JOIN source_fields d ON d.id=s.fields_id WHERE s.file_key IS NOT NULL;"))
             using (var r = c.ExecuteReader())
                 while (r.Read())
                 {
@@ -509,11 +752,19 @@ SELECT id FROM source_file WHERE server=@s AND kind=@k AND file_key=@fk;", tx))
         public void SaveFile(FileState f, SqliteTransaction tx)
         {
             FileId(f, tx);
-            using (var c = Command(@"UPDATE source_file SET offset=@o,size=@z,last_write_ms=@w,fields=@f,first_ms=@fm,last_ms=@lm,lines=@l,kept=@kp,noise=@n,updated_ms=@u WHERE id=@id;", tx))
+            // The header text is written once in source_fields (exact text, compared as BINARY); the row only keeps its id.
+            object fieldsId = DBNull.Value;
+            if (f.Fields != null)
+                using (var q = Command("INSERT INTO source_fields(text) VALUES(@t) ON CONFLICT(text) DO UPDATE SET text=excluded.text RETURNING id;", tx))
+                {
+                    q.Parameters.AddWithValue("@t", f.Fields);
+                    fieldsId = Convert.ToInt64(q.ExecuteScalar(), System.Globalization.CultureInfo.InvariantCulture);
+                }
+            using (var c = Command(@"UPDATE source_file SET offset=@o,size=@z,last_write_ms=@w,fields=NULL,fields_id=@f,first_ms=@fm,last_ms=@lm,lines=@l,kept=@kp,noise=@n,updated_ms=@u WHERE id=@id;", tx))
             {
                 c.Parameters.AddWithValue("@id", f.Id);
                 c.Parameters.AddWithValue("@o", f.Offset); c.Parameters.AddWithValue("@z", f.Size); c.Parameters.AddWithValue("@w", f.LastWriteMs);
-                c.Parameters.AddWithValue("@f", (object)f.Fields ?? DBNull.Value);
+                c.Parameters.AddWithValue("@f", fieldsId);
                 c.Parameters.AddWithValue("@fm", f.FirstMs > 0 ? (object)f.FirstMs : DBNull.Value);
                 c.Parameters.AddWithValue("@lm", f.LastMs > 0 ? (object)f.LastMs : DBNull.Value);
                 c.Parameters.AddWithValue("@l", f.Lines); c.Parameters.AddWithValue("@kp", f.Kept); c.Parameters.AddWithValue("@n", f.Noise);
@@ -549,6 +800,8 @@ ON CONFLICT(run_id,server,kind,reason) DO UPDATE SET lines=lines+excluded.lines;
         {
             var p = new PurgeResult();
             var clock = System.Diagnostics.Stopwatch.StartNew();
+            // The rollup DELETE triggers must run for every row removed here (a collection on this connection turns them off only while it applies).
+            if (SetTriggersEnabled(true) == null) throw new InvalidOperationException("The triggers of the database connection could not be enabled; nothing was deleted.");
             using (var tx = Begin())
             {
                 p.Usage = Delete("DELETE FROM access_usage WHERE day < @d;", "@d", retentionCutoffDay, tx);
@@ -572,8 +825,16 @@ ON CONFLICT(run_id,server,kind,reason) DO UPDATE SET lines=lines+excluded.lines;
                 p.Messages = Delete("DELETE FROM message_event WHERE time_ms < @t;", "@t", retentionCutoffMs, tx);
                 p.Runs = Delete("DELETE FROM noise WHERE run_id IN (SELECT id FROM run WHERE started_ms < @t);", "@t", retentionCutoffMs, tx);
                 p.Runs = Delete("DELETE FROM run WHERE started_ms < @t;", "@t", retentionCutoffMs, tx);
-                // Positions of files that Exchange deleted long ago are no longer needed.
+                // The read positions of files whose last write is older than the retention cutoff are removed.
                 p.Files = Delete("DELETE FROM source_file WHERE COALESCE(last_write_ms,0) < @t;", "@t", retentionCutoffMs, tx);
+                // A security identifier not seen for RetentionDays.
+                p.Identities = Delete("DELETE FROM identity_map WHERE last_ms < @t;", "@t", retentionCutoffMs, tx);
+                // The whole hours before the cutoff hold no row any more; the hour cut by the cutoff was queued by the delete triggers.
+                Delete("DELETE FROM mail_flow_hour WHERE hour_ms < @h;", "@h", FloorHour(retentionCutoffMs), tx);
+                // The delete triggers queued the buckets of the removed transactions (a bucket cut by the cutoff is recomputed from what remains).
+                ReconcileSmtpClients(tx);
+                ReconcileMailFlow(tx);
+                ReconcileMessageRollups(tx);
                 tx.Commit();
             }
             p.DeleteSeconds = clock.Elapsed.TotalSeconds;
@@ -591,6 +852,141 @@ ON CONFLICT(run_id,server,kind,reason) DO UPDATE SET lines=lines+excluded.lines;
             using (var c = Command(sql, tx)) { c.Parameters.AddWithValue(name, value); return c.ExecuteNonQuery(); }
         }
 
+        // ---------------------------------------------------------------- mail flow per hour (schema 12, derived)
+        //  mail_flow_hour   one row per UTC hour x server (case-insensitive) with the additive counters of the tracking events and SMTP transactions of
+        //                   that hour and the hour's distinct message count (the figure the static report adds into daily.Messages); never an identity
+        //  mail_flow_dirty  hour x server buckets to recompute from the rows (written by the triggers, by the collector and by the retention)
+        //  A row is exactly MailFlowBucketSql of its key: derived data, re-derivable and verified by recomputation (VerifyMailFlowCore). Serve reads it
+        //  for the whole hours of a period and never writes; while the queue is not empty it answers 503 MailFlowPending.
+
+        internal const string MailFlowHourTableSql = "CREATE TABLE mail_flow_hour(hour_ms INTEGER NOT NULL, server TEXT NOT NULL COLLATE NOCASE, " +
+            "tracking INTEGER NOT NULL, deliveries INTEGER NOT NULL, failures INTEGER NOT NULL, messages INTEGER NOT NULL, tracking_first_ms INTEGER, tracking_last_ms INTEGER, " +
+            "smtp_in INTEGER NOT NULL, smtp_out INTEGER NOT NULL, smtp_rejected INTEGER NOT NULL, smtp_first_ms INTEGER, smtp_last_ms INTEGER, PRIMARY KEY(hour_ms, server)) WITHOUT ROWID";
+        internal const string MailFlowDirtyTableSql = "CREATE TABLE mail_flow_dirty(hour_ms INTEGER NOT NULL, server TEXT NOT NULL COLLATE NOCASE, PRIMARY KEY(hour_ms, server)) WITHOUT ROWID";
+        internal static readonly string[][] MailFlowTables = { new[] { "mail_flow_hour", MailFlowHourTableSql }, new[] { "mail_flow_dirty", MailFlowDirtyTableSql } };
+        /// <summary>The six triggers (name, table, canonical text): every writer that keeps its triggers on queues the bucket of each row it inserts, changes or deletes.</summary>
+        internal static readonly string[][] MailFlowTriggers = {
+            MailFlowTrigger("message_event", "INSERT"), MailFlowTrigger("message_event", "UPDATE"), MailFlowTrigger("message_event", "DELETE"),
+            MailFlowTrigger("smtp_transaction", "INSERT"), MailFlowTrigger("smtp_transaction", "UPDATE"), MailFlowTrigger("smtp_transaction", "DELETE") };
+        static string[] MailFlowTrigger(string table, string operation)
+        {
+            string name = "tr_" + table + "_flow_" + operation.ToLowerInvariant(), body = "";
+            foreach (string row in operation == "UPDATE" ? new[] { "OLD", "NEW" } : new[] { operation == "DELETE" ? "OLD" : "NEW" })
+                body += "INSERT OR IGNORE INTO mail_flow_dirty VALUES(" + row + ".time_ms-((" + row + ".time_ms%3600000+3600000)%3600000)," + row + ".server);";
+            // The columns a bucket is computed from (an update of any other column changes no counter).
+            string update = operation != "UPDATE" ? "" : table == "message_event" ? " OF time_ms,server,event_id,message_id,internal_id" : " OF time_ms,server,direction,status";
+            return new[] { name, table, "CREATE TRIGGER " + name + " AFTER " + operation + update + " ON " + table + " BEGIN " + body + " END" };
+        }
+
+        // The counters of the tracking events and of the SMTP transactions of a group, in the column order of mail_flow_hour after hour_ms and server.
+        // The comparisons are BINARY, as the static report's (event_id 'DELIVER', 'FAIL' or 'DSN'; direction 'Receive'; status 'Rejected').
+        const string FlowTracking = "COUNT(*) t,COALESCE(SUM(e.event_id='DELIVER'),0) d,COALESCE(SUM(e.event_id IN('FAIL','DSN')),0) fl,COUNT(DISTINCT COALESCE(e.message_id,e.internal_id)) m," +
+            "MIN(e.time_ms) tf,MAX(e.time_ms) tl,0 si,0 so,0 sr,NULL sf,NULL sl";
+        const string FlowSmtp = "0 t,0 d,0 fl,0 m,NULL tf,NULL tl,COALESCE(SUM(e.direction='Receive'),0) si,COALESCE(SUM(e.direction<>'Receive'),0) so,COALESCE(SUM(e.status='Rejected'),0) sr," +
+            "MIN(e.time_ms) sf,MAX(e.time_ms) sl";
+        const string FlowHour = "(e.time_ms-((e.time_ms%3600000+3600000)%3600000))";
+        // One spelling per bucket: the smallest (BINARY) of the server names of its rows.
+        const string FlowColumns = "MIN(s COLLATE BINARY),SUM(t),SUM(d),SUM(fl),SUM(m),MIN(tf),MAX(tl),SUM(si),SUM(so),SUM(sr),MIN(sf),MAX(sl)";
+        /// <summary>Every bucket of the stored rows, in the column order of mail_flow_hour (two index-only scans): the build and the verification.</summary>
+        internal const string MailFlowRecomputeSql = "SELECT h," + FlowColumns + " FROM (" +
+            "SELECT " + FlowHour + " h,MIN(e.server) s," + FlowTracking + " FROM message_event e INDEXED BY ix_msg_flow GROUP BY 1,e.server COLLATE NOCASE UNION ALL " +
+            "SELECT " + FlowHour + " h,MIN(e.server) s," + FlowSmtp + " FROM smtp_transaction e INDEXED BY ix_smtp_flow GROUP BY 1,e.server COLLATE NOCASE) GROUP BY h,s COLLATE NOCASE";
+        /// <summary>The bucket of one hour (@h, its first millisecond) and server (@s, any spelling): the reconciliation. Its rows are those the recomputation
+        /// groups under @h (FlowHour), read in the index range of the hour.</summary>
+        internal const string MailFlowBucketSql = "SELECT " + FlowColumns + " FROM (" +
+            "SELECT MIN(e.server) s," + FlowTracking + " FROM message_event e INDEXED BY ix_msg_flow WHERE e.time_ms>=@h AND e.time_ms<@h+3600000 AND " + FlowHour + "=@h AND e.server=@s COLLATE NOCASE UNION ALL " +
+            "SELECT MIN(e.server) s," + FlowSmtp + " FROM smtp_transaction e INDEXED BY ix_smtp_flow WHERE e.time_ms>=@h AND e.time_ms<@h+3600000 AND " + FlowHour + "=@h AND e.server=@s COLLATE NOCASE)";
+
+        /// <summary>The bucket key of a row the collector wrote: its hour and its server folded to upper case ASCII, the NOCASE equality of the queue.</summary>
+        internal static (long, string) FlowKey(long timeMs, string server)
+        {
+            var folded = new System.Text.StringBuilder(server.Length);
+            foreach (char ch in server) folded.Append(ch >= 'a' && ch <= 'z' ? (char)(ch - 32) : ch);
+            return (FloorHour(timeMs), folded.ToString());
+        }
+
+        /// <summary>Queues buckets in the caller's transaction (the collector, whose apply connection runs without triggers).</summary>
+        internal void QueueMailFlow(SqliteTransaction tx, IEnumerable<(long, string)> keys)
+        {
+            using (var c = Command("INSERT OR IGNORE INTO mail_flow_dirty VALUES(@h,@s);", tx))
+            {
+                var h = c.Parameters.Add("@h", SqliteType.Integer); var s = c.Parameters.Add("@s", SqliteType.Text);
+                foreach (var key in keys) { h.Value = key.Item1; s.Value = key.Item2; c.ExecuteNonQuery(); }
+            }
+        }
+
+        /// <summary>
+        /// Creates mail_flow_hour and mail_flow_dirty (replacing any earlier copy), fills the hours from the stored rows with one grouped scan of each
+        /// source, proves the result with the verification inside the same transaction and creates the six triggers last, so that none of these statements
+        /// queues work (the order of BuildSmtpClients).
+        /// </summary>
+        internal void BuildMailFlow(SqliteTransaction tx)
+        {
+            foreach (var trigger in MailFlowTriggers) Exec(tx, "DROP TRIGGER IF EXISTS " + trigger[0] + ";");
+            Exec(tx, "DROP TABLE IF EXISTS mail_flow_hour; DROP TABLE IF EXISTS mail_flow_dirty;");
+            foreach (var table in MailFlowTables) Exec(tx, table[1] + ";");
+            Exec(tx, "INSERT INTO mail_flow_hour " + MailFlowRecomputeSql + " ORDER BY 1,2;");
+            VerifyMailFlowCore(sql => Command(sql, tx), null);
+            foreach (var trigger in MailFlowTriggers) Exec(tx, trigger[2] + ";");
+        }
+
+        /// <summary>True when both tables and the six triggers have their canonical definition (the shape check of a schema-12 database).</summary>
+        bool HasMailFlow(SqliteTransaction tx)
+        {
+            foreach (var table in MailFlowTables) if (!SchemaObjectIs("table", table[0], table[1], tx)) return false;
+            foreach (var trigger in MailFlowTriggers) if (!SchemaObjectIs("trigger", trigger[0], trigger[2], tx)) return false;
+            return true;
+        }
+
+        /// <summary>
+        /// Drains mail_flow_dirty, 4,096 keys at a time: each bucket is recomputed from the rows (MailFlowBucketSql) and replaces the stored one, or removes
+        /// it when the hour holds no row of that server any more. Never called by Serve.
+        /// </summary>
+        public void ReconcileMailFlow(SqliteTransaction transaction)
+        {
+            if (ReadOnly) throw new InvalidOperationException("Mail flow reconciliation requires a writable collection transaction.");
+            if (transaction == null) throw new ArgumentNullException(nameof(transaction));
+            using (var c = Command("SELECT EXISTS(SELECT 1 FROM mail_flow_dirty);", transaction))
+                if (Convert.ToInt64(c.ExecuteScalar(), System.Globalization.CultureInfo.InvariantCulture) == 0) return;
+            using (var page = Command("SELECT hour_ms,server FROM mail_flow_dirty ORDER BY hour_ms,server LIMIT 4096;", transaction))
+            using (var bucket = Command(MailFlowBucketSql + ";", transaction))
+            using (var remove = Command("DELETE FROM mail_flow_hour WHERE hour_ms=@h AND server=@s; DELETE FROM mail_flow_dirty WHERE hour_ms=@h AND server=@s;", transaction))
+            using (var insert = Command("INSERT INTO mail_flow_hour VALUES(@h,@s,@t,@d,@fl,@m,@tf,@tl,@si,@so,@sr,@sf,@sl);", transaction))
+            {
+                var bh = bucket.Parameters.Add("@h", SqliteType.Integer); var bs = bucket.Parameters.Add("@s", SqliteType.Text);
+                var rh = remove.Parameters.Add("@h", SqliteType.Integer); var rs = remove.Parameters.Add("@s", SqliteType.Text);
+                string[] names = { "@h", "@s", "@t", "@d", "@fl", "@m", "@tf", "@tl", "@si", "@so", "@sr", "@sf", "@sl" };
+                foreach (string name in names) insert.Parameters.Add(name, name == "@s" ? SqliteType.Text : SqliteType.Integer);
+                while (true)
+                {
+                    var keys = new List<object[]>();
+                    // A key is bound as it is stored: a time written as a REAL (by another program than the collector) queues a REAL hour, which an
+                    // integer would never delete from the queue.
+                    using (var r = page.ExecuteReader()) while (r.Read()) keys.Add(new object[] { r.GetValue(0), r.GetString(1) });
+                    if (keys.Count == 0) break;
+                    foreach (var key in keys)
+                    {
+                        object[] row = null;
+                        var hourType = key[0] is double ? SqliteType.Real : SqliteType.Integer;
+                        bh.SqliteType = rh.SqliteType = insert.Parameters["@h"].SqliteType = hourType;
+                        bh.Value = key[0]; bs.Value = key[1];
+                        using (var r = bucket.ExecuteReader())
+                            if (r.Read() && !r.IsDBNull(0) && r.GetInt64(1) + r.GetInt64(7) + r.GetInt64(8) > 0)
+                            {
+                                row = new object[12];
+                                for (int i = 0; i < 12; i++) row[i] = r.IsDBNull(i) ? (object)DBNull.Value : r.GetValue(i);
+                            }
+                        rh.Value = key[0]; rs.Value = key[1];
+                        remove.ExecuteNonQuery();
+                        if (row == null) continue;
+                        insert.Parameters["@h"].Value = key[0];
+                        for (int i = 0; i < 12; i++) insert.Parameters[names[i + 1]].Value = row[i];
+                        insert.ExecuteNonQuery();
+                    }
+                }
+            }
+        }
+
         /// <summary>Writes the WAL into the database file (smaller files to copy, consistent backups).</summary>
         public void Checkpoint()
         {
@@ -598,6 +994,24 @@ ON CONFLICT(run_id,server,kind,reason) DO UPDATE SET lines=lines+excluded.lines;
             Exec("PRAGMA wal_checkpoint(TRUNCATE);");
             // A collection copies the WAL itself (Collector.Checkpoints): automatic copies again afterwards.
             Exec("PRAGMA wal_autocheckpoint=16384;");
+        }
+
+        /// <summary>
+        /// One checkpoint of the given mode (PASSIVE, FULL, RESTART or TRUNCATE) on this connection, outside any transaction, and its row:
+        /// busy (0: not blocked), frames in the log, frames copied into the database (-1 when unknown). Unlike Checkpoint() it leaves
+        /// wal_autocheckpoint as it is (a collection keeps it off while it runs).
+        /// </summary>
+        public WalCheckpoint Checkpoint(string mode)
+        {
+            if (ReadOnly) throw new InvalidOperationException("A checkpoint requires a writable store.");
+            string m = (mode ?? "").Trim().ToUpperInvariant();
+            if (m != "PASSIVE" && m != "FULL" && m != "RESTART" && m != "TRUNCATE") throw new ArgumentOutOfRangeException(nameof(mode), mode, "PASSIVE, FULL, RESTART or TRUNCATE.");
+            using (var c = Command("PRAGMA wal_checkpoint(" + m + ");"))
+            using (var r = c.ExecuteReader())
+            {
+                if (!r.Read()) return new WalCheckpoint { Busy = 1, Log = -1, Checkpointed = -1 };
+                return new WalCheckpoint { Busy = r.GetInt64(0), Log = r.GetInt64(1), Checkpointed = r.GetInt64(2) };
+            }
         }
 
         /// <summary>Size of the WAL file (written but not yet copied into the database).</summary>

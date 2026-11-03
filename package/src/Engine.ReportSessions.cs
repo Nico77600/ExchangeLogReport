@@ -3,12 +3,12 @@
 //  clients (devices, versions) and operations (latency per operation)
 // -----------------------------------------------------------------------------
 //  Author  : Nicolas Fabert
-//  Version : 2.0.0
+//  Version : 3.0.0
 //
 //  sessions    one row per client session; its timeline is rebuilt from the steps written
 //              per log file: sorted, back-end details joined to the front-end request with the
 //              same RequestId (MAPI), consecutive batches of successes merged.
-//  clients     one row per user x protocol x client (user agent or ActiveSync device)
+//  clients     one row per user x protocol x client (user agent or ActiveSync device), with its authentication types
 //  operations  one row per protocol x operation (MAPI request type, ActiveSync command,
 //              OWA action, IMAP/POP command...), all users, with failures and latency
 // =============================================================================
@@ -60,6 +60,20 @@ namespace ExchangeLogReport
             return parts.Count == 0 ? "" : " AND (" + string.Join(" OR ", parts) + ")";
         }
 
+        /// <summary>
+        /// SessionOutcome of the stored counters of client_session (alias a), in SQL: the failures add the back-end errors of the backend column
+        /// ("n|servers"), the recovery window is the one of a default report request. The session list of Serve takes its Outcome from it and its
+        /// Outcome filter compares with it, so a filter always selects what the list shows.
+        /// </summary>
+        internal static string SessionOutcomeSql(string a)
+        {
+            string failures = "(" + a + ".failures+COALESCE(CAST(CASE WHEN instr(" + a + ".backend,'|')>0 THEN substr(" + a + ".backend,1,instr(" + a + ".backend,'|')-1) ELSE " + a + ".backend END AS INTEGER),0))";
+            string window = new ReportRequest().RecoveryWindowMs.ToString(CultureInfo.InvariantCulture);
+            return "(CASE WHEN " + failures + "=0 THEN (CASE WHEN " + a + ".slow>0 THEN 'OK (slow)' ELSE 'OK' END) WHEN " + a + ".successes=0 THEN 'Failed' WHEN " +
+                a + ".last_failure_ms>=" + a + ".last_success_ms THEN 'Failed at end' WHEN " + failures + ">=3 AND " + a + ".last_failure_ms-" + a + ".first_failure_ms>" + window +
+                " AND " + a + ".first_failure_ms>" + a + ".first_success_ms THEN 'Intermittent errors' ELSE 'Recovered' END)";
+        }
+
         static string SessionOutcome(long failures, long successes, long slow, long firstSuccess, long lastSuccess, long firstFailure, long lastFailure, long windowMs)
         {
             if (failures == 0) return slow > 0 ? "OK (slow)" : "OK";
@@ -75,7 +89,7 @@ namespace ExchangeLogReport
             "OPTIONS", "LOGOUT", "QUIT", "CAPABILITY", "CAPA", "NOOP", "USER", "GET logoff.owa", "Disconnect", "Unbind"
         };
 
-        static string ClientFamily(string protocol, string agent, string deviceType)
+        internal static string ClientFamily(string protocol, string agent, string deviceType)
         {
             if (string.Equals(protocol, "Eas", StringComparison.OrdinalIgnoreCase) && !string.IsNullOrEmpty(deviceType)) return deviceType + " (ActiveSync)";
             if (string.IsNullOrEmpty(agent))
@@ -87,7 +101,7 @@ namespace ExchangeLogReport
             return Identity.Client(agent);
         }
 
-        static string Top(string counts, int max)
+        internal static string Top(string counts, int max)
         {
             if (string.IsNullOrEmpty(counts)) return null;
             var parts = counts.Split(';').Where(x => x.Length > 0).ToList();
@@ -113,10 +127,10 @@ namespace ExchangeLogReport
                 if (current == null || L(current.Row[0]) != L(r[0]))
                 {
                     if (current != null) yield return current;
-                    current = new SessionInput { Row = r.Take(29).ToArray() };
+                    current = new SessionInput { Row = r.Take(30).ToArray() };
                     current.Bytes = ReportMemory.Bytes(current.Row);
                 }
-                string data = S(r[29]);
+                string data = S(r[30]);
                 if (data != null) { current.Data.Add(data); current.Bytes += ReportMemory.Bytes(data) * 8; }
             }
             if (current != null) yield return current;
@@ -135,21 +149,41 @@ namespace ExchangeLogReport
             if (batch.Count > 0) yield return batch;
         }
 
+        /// <summary>Columns of the sessions dataset; the timeline is the last one (Serve lists every column but that one).</summary>
+        internal static readonly string[] SessionColumns = { "Start:time", "End:time", "Duration:text", "Outcome:text", "User:text", "Protocol:text", "Client:text", "Client IP:text",
+            "Front ends:text", "Back ends:text", "Requests:num", "Failures:num", "Slow:num", "Average (ms):num", "Max (ms):num", "Operations:text",
+            "Last error:text", "Software:text", "Client mode:text", "Device ID:text", "Mailbox:text", "Connections:num", "First error:text", "User agent:text",
+            "Session ID:num", "Authentication:text", "Timeline:steps" };
+
+        /// <summary>The client_session fields SessionRow reads (indexes 0..29), prefixed by the table alias.</summary>
+        internal static string SessionFields(string alias)
+        {
+            return string.Join(",", new[] { "id","start_ms","end_ms","user","protocol","mailbox","client_ip","user_agent","device_id","device_type","software","client_mode",
+                "front_ends","back_ends","requests","successes","failures","slow","first_success_ms","last_success_ms","first_failure_ms","last_failure_ms",
+                "total_ms","max_ms","actions","first_error","last_error","backend","connections","auth_modes" }.Select(x => alias + "." + x));
+        }
+
+        /// <summary>
+        /// A session row from client_session alone (no timeline): the outcome and the failures come from the stored counters, the timeline cell is
+        /// left out. row = the SessionFields values.
+        /// </summary>
+        internal static object[] SessionSummaryRow(object[] row, Func<long, object> local)
+        {
+            var cells = SessionRow(new SessionInput { Row = row, Steps = new List<Step>() }, new ReportRequest(), local, new Dictionary<long, string[]>(), true);
+            return cells.Take(cells.Length - 1).ToArray();
+        }
+
         static Dataset BuildSessions(Store store, ReportRequest q, Func<long, object> local)
         {
             var set = new Dataset("sessions", "ClientSessions", q.Scratch);
-            foreach (var n in new[] { "Start:time", "End:time", "Duration:text", "Outcome:text", "User:text", "Protocol:text", "Client:text", "Client IP:text",
-                "Front ends:text", "Back ends:text", "Requests:num", "Failures:num", "Slow:num", "Average (ms):num", "Max (ms):num", "Operations:text",
-                "Last error:text", "Software:text", "Client mode:text", "Device ID:text", "Mailbox:text", "Connections:num", "First error:text", "User agent:text",
-                "Session ID:num", "Timeline:steps" })
-            { var x = n.Split(':'); set.Add(x[0], x[1]); }
+            foreach (var n in SessionColumns) { var x = n.Split(':'); set.Add(x[0], x[1]); }
             set.Columns[set.Columns.Count - 1].Grid = false;
             set.Columns[set.Columns.Count - 1].Csv = q.IncludeSessionDetails;
             var f = new Sql(); f.P["@t0"] = q.StartMs; f.P["@t1"] = q.EndMs;
             string where = " FROM client_session c LEFT JOIN session_step s ON s.session_id=c.id WHERE c.end_ms >= @t0 AND c.start_ms < @t1" + f.Users(q.Users, "c.user", "c.mailbox")
                 + ServerFilter(q.Servers, f.P, "','||COALESCE(c.front_ends,'')||','||COALESCE(c.back_ends,'')||','");
             var sessions = SessionInputs(store, "SELECT c.id,c.start_ms,c.end_ms,c.user,c.protocol,c.mailbox,c.client_ip,c.user_agent,c.device_id,c.device_type,c.software,c.client_mode,c.front_ends,c.back_ends," +
-                "c.requests,c.successes,c.failures,c.slow,c.first_success_ms,c.last_success_ms,c.first_failure_ms,c.last_failure_ms,c.total_ms,c.max_ms,c.actions,c.first_error,c.last_error,c.backend,c.connections,s.data" +
+                "c.requests,c.successes,c.failures,c.slow,c.first_success_ms,c.last_success_ms,c.first_failure_ms,c.last_failure_ms,c.total_ms,c.max_ms,c.actions,c.first_error,c.last_error,c.backend,c.connections,c.auth_modes,s.data" +
                 where + " ORDER BY c.start_ms,c.id,s.time_ms,s.rowid;", f.P);
             foreach (var batch in SessionBatches(sessions, q.WorkingBudgetBytes / 2))
             {
@@ -172,7 +206,7 @@ namespace ExchangeLogReport
                     {
                         set.FailedSessionCount++;
                         var summary = (object[])row.Clone();
-                        summary[25] = null;
+                        summary[26] = null;
                         KeepTopRow(set.FailureSample, summary, (a, b) =>
                         {
                             int c = SessionSeverity(S(a[3])).CompareTo(SessionSeverity(S(b[3])));
@@ -184,7 +218,7 @@ namespace ExchangeLogReport
             return set;
         }
 
-        static object[] SessionRow(SessionInput input, ReportRequest q, Func<long, object> local, Dictionary<long, string[]> files)
+        static object[] SessionRow(SessionInput input, ReportRequest q, Func<long, object> local, Dictionary<long, string[]> files, bool milliseconds = false)
         {
             var r = input.Row;
             long id = L(r[0]), start = L(r[1]), end = L(r[2]), requests = L(r[14]), successes = L(r[15]), failures = L(r[16]), slow = L(r[17]);
@@ -192,7 +226,7 @@ namespace ExchangeLogReport
             string backend = S(r[27]);
             if (backend != null) { int bar = backend.IndexOf('|'); long.TryParse(bar > 0 ? backend.Substring(0, bar) : backend, NumberStyles.Integer, CultureInfo.InvariantCulture, out backEndErrors); }
             string protocol = S(r[4]), agent = S(r[7]);
-            var tl = Timeline(input.Steps, local, protocol, files);
+            var tl = Timeline(input.Steps, local, protocol, files, milliseconds);
             long shownFailures = failures + backEndErrors;
             string outcome;
             if (tl.Rows.Count > 0)
@@ -205,7 +239,8 @@ namespace ExchangeLogReport
                 local(start), local(end), TimeUtil.Duration((end - start) / 1000.0), outcome, S(r[3]), protocol, ClientFamily(protocol, agent, S(r[9])),
                 (S(r[6]) ?? "").Replace(",", ", "), (S(r[12]) ?? "").Replace(",", ", "), (S(r[13]) ?? "").Replace(",", ", "),
                 requests, shownFailures, slow, requests > 0 ? (object)(L(r[22]) / requests) : null, L(r[23]), Top(S(r[24]), 4),
-                S(r[26]), S(r[10]), S(r[11]) == "0" ? null : S(r[11]), S(r[8]), S(r[5]), L(r[28]) > 0 ? (object)L(r[28]) : null, S(r[25]), agent, id, tl.Rows };
+                S(r[26]), S(r[10]), S(r[11]) == "0" ? null : S(r[11]), S(r[8]), S(r[5]), L(r[28]) > 0 ? (object)L(r[28]) : null, S(r[25]), agent, id,
+                AuthMode.Modes(S(r[29])), tl.Rows };
         }
 
         static void ParseSteps(string json, List<Step> list)
@@ -247,7 +282,7 @@ namespace ExchangeLogReport
         /// A back-end line completes its front-end request: same RequestId (MAPI), or same action within 5 seconds
         /// (ActiveSync, whose back-end log has no RequestId). An HTTP 200 whose back end reports an error is then a failure.
         /// </summary>
-        static TimelineResult Timeline(List<Step> raw, Func<long, object> local, string protocol, Dictionary<long, string[]> files)
+        static TimelineResult Timeline(List<Step> raw, Func<long, object> local, string protocol, Dictionary<long, string[]> files, bool milliseconds = false)
         {
             var result = new TimelineResult();
             if (raw == null || raw.Count == 0) return result;
@@ -311,7 +346,7 @@ namespace ExchangeLogReport
                 string kind = s.Failures > 0 ? "fail" : s.Batch ? "batch" : s.Source == "BE" ? "backend" : "ok";
                 string action = s.Batch ? s.Count + " successful requests: " + s.Action : s.Action;
                 object until = null;
-                if (s.Batch && s.T2 > s.T) { object t2 = local(s.T2); if (t2 != null) until = DateTimeOffset.FromUnixTimeSeconds(L(t2)).UtcDateTime.ToString("HH:mm:ss", CultureInfo.InvariantCulture); }
+                if (s.Batch && s.T2 > s.T) { object t2 = local(s.T2); if (t2 != null) until = (milliseconds ? DateTimeOffset.FromUnixTimeMilliseconds(L(t2)) : DateTimeOffset.FromUnixTimeSeconds(L(t2))).UtcDateTime.ToString("HH:mm:ss", CultureInfo.InvariantCulture); }
                 object status = s.Status > 0 ? (object)(long)s.Status : null;
                 // IMAP and POP have no HTTP status: show their own result.
                 if (imap || pop) status = s.Batch ? null : (object)(s.Failures > 0 ? (imap ? "NO" : "-ERR") : (imap ? "OK" : "+OK"));
@@ -346,21 +381,29 @@ namespace ExchangeLogReport
         {
             var set = new Dataset("clients", "Clients", q.Scratch);
             foreach (var n in new[] { "User:text", "Protocol:text", "Client:text", "Device type:text", "Device ID:text", "Client IPs:text", "Servers:text",
-                "Requests:num", "Failures:num", "Active days:num", "First seen:time", "Last seen:time", "User agent:text" })
+                "Requests:num", "Failures:num", "Active days:num", "First seen:time", "Last seen:time", "User agent:text", "Authentication:text" })
             { var x = n.Split(':'); set.Add(x[0], x[1]); }
             var f = new Sql(); f.P["@d0"] = d0; f.P["@d1"] = d1;
             string where = " FROM access_client WHERE day >= @d0 AND day <= @d1" + f.Users(q.Users, "user") + ServerFilter(q.Servers, f.P, "','||COALESCE(servers,'')||','");
-            foreach (var r in Rows(store, "SELECT user, protocol, user_agent, device_id, MAX(device_type), group_concat(DISTINCT client_ip), group_concat(DISTINCT servers), SUM(requests), SUM(failures), COUNT(DISTINCT day), MIN(first_ms), MAX(last_ms)" +
-                where + " GROUP BY user, protocol, user_agent, device_id ORDER BY user, SUM(requests) DESC;", f.P))
-            {
-                string protocol = S(r[1]), agent = S(r[2]), device = S(r[3]);
-                var ips = (S(r[5]) ?? "").Split(new[] { ',' }, StringSplitOptions.RemoveEmptyEntries).Where(x => x.Length > 0).Distinct().ToList();
-                var servers = (S(r[6]) ?? "").Split(new[] { ',' }, StringSplitOptions.RemoveEmptyEntries).Distinct(StringComparer.OrdinalIgnoreCase).OrderBy(x => x).ToList();
-                set.Rows.Add(new object[] { S(r[0]), protocol, ClientFamily(protocol, agent, S(r[4])), S(r[4]), string.IsNullOrEmpty(device) ? null : device,
-                    ips.Count > 6 ? string.Join(", ", ips.Take(6)) + " (+" + (ips.Count - 6) + ")" : string.Join(", ", ips), string.Join(", ", servers),
-                    L(r[7]), L(r[8]), L(r[9]), local(L(r[10])), local(L(r[11])), string.IsNullOrEmpty(agent) ? null : agent });
-            }
+            foreach (var r in Rows(store, ClientSql(where), f.P)) set.Rows.Add(ClientRow(r, local));
             return set;
+        }
+
+        /// <summary>The clients statement over access_client (where = " FROM access_client WHERE ...").</summary>
+        internal static string ClientSql(string where)
+        {
+            return "SELECT user, protocol, user_agent, device_id, MAX(device_type), group_concat(DISTINCT client_ip), group_concat(DISTINCT servers), SUM(requests), SUM(failures), COUNT(DISTINCT day), MIN(first_ms), MAX(last_ms), group_concat(DISTINCT auth_type)" +
+                where + " GROUP BY user, protocol, user_agent, device_id ORDER BY user, SUM(requests) DESC;";
+        }
+
+        internal static object[] ClientRow(object[] r, Func<long, object> local)
+        {
+            string protocol = S(r[1]), agent = S(r[2]), device = S(r[3]);
+            var ips = (S(r[5]) ?? "").Split(new[] { ',' }, StringSplitOptions.RemoveEmptyEntries).Where(x => x.Length > 0).Distinct().ToList();
+            var servers = (S(r[6]) ?? "").Split(new[] { ',' }, StringSplitOptions.RemoveEmptyEntries).Distinct(StringComparer.OrdinalIgnoreCase).OrderBy(x => x).ToList();
+            return new object[] { S(r[0]), protocol, ClientFamily(protocol, agent, S(r[4])), S(r[4]), string.IsNullOrEmpty(device) ? null : device,
+                ips.Count > 6 ? string.Join(", ", ips.Take(6)) + " (+" + (ips.Count - 6) + ")" : string.Join(", ", ips), string.Join(", ", servers),
+                L(r[7]), L(r[8]), L(r[9]), local(L(r[10])), local(L(r[11])), string.IsNullOrEmpty(agent) ? null : agent, AuthMode.ModesOf(S(r[12])) };
         }
 
         // ------------------------------------------------------------------ operations
@@ -368,23 +411,29 @@ namespace ExchangeLogReport
         static Dataset BuildOperations(Store store, ReportRequest q, string d0, string d1)
         {
             var set = new Dataset("operations", "Operations");
-            foreach (var n in new[] { "Protocol:text", "Operation:text", "Requests:num", "Share of protocol (%):num", "Failures:num", "Failure rate (%):num",
-                "Slow:num", "Average (ms):num", "Max (ms):num", "Servers:text" })
-            { var x = n.Split(':'); set.Add(x[0], x[1]); }
+            foreach (var n in OperationColumns) { var x = n.Split(':'); set.Add(x[0], x[1]); }
             var f = new Sql(); f.P["@d0"] = d0; f.P["@d1"] = d1;
             string where = " FROM access_action WHERE day >= @d0 AND day <= @d1" + f.Servers(q.Servers, "server");
+            foreach (var row in OperationRows(sql => Rows(store, sql, f.P), where, " ORDER BY protocol, SUM(requests) DESC;")) set.Rows.Add(row);
+            return set;
+        }
+
+        /// <summary>Rows of the operations dataset from access_action (where = " FROM access_action WHERE ..."), in the given order (an ORDER BY clause).</summary>
+        internal static List<object[]> OperationRows(Func<string, IEnumerable<object[]>> rows, string where, string order)
+        {
+            var result = new List<object[]>();
             var perProtocol = new Dictionary<string, long>(StringComparer.OrdinalIgnoreCase);
-            foreach (var r in Rows(store, "SELECT protocol, SUM(requests)" + where + " GROUP BY protocol;", f.P)) perProtocol[S(r[0]) ?? ""] = L(r[1]);
-            foreach (var r in Rows(store, "SELECT protocol, action, SUM(requests), SUM(failures), SUM(slow), SUM(total_ms), MAX(max_ms), group_concat(DISTINCT server)" + where +
-                " GROUP BY protocol, action ORDER BY protocol, SUM(requests) DESC;", f.P))
+            foreach (var r in rows("SELECT protocol, SUM(requests)" + where + " GROUP BY protocol;")) perProtocol[S(r[0]) ?? ""] = L(r[1]);
+            foreach (var r in rows("SELECT protocol, action, SUM(requests), SUM(failures), SUM(slow), SUM(total_ms), MAX(max_ms), group_concat(DISTINCT server)" + where +
+                " GROUP BY protocol, action" + order))
             {
                 long requests = L(r[2]), failures = L(r[3]), all;
                 perProtocol.TryGetValue(S(r[0]) ?? "", out all);
-                set.Rows.Add(new object[] { S(r[0]), S(r[1]), requests, all > 0 ? (object)Math.Round(100.0 * requests / all, 1) : null, failures,
+                result.Add(new object[] { S(r[0]), S(r[1]), requests, all > 0 ? (object)Math.Round(100.0 * requests / all, 1) : null, failures,
                     requests > 0 ? (object)Math.Round(100.0 * failures / requests, 1) : null, L(r[4]), requests > 0 ? (object)(L(r[5]) / requests) : null, L(r[6]),
                     string.Join(", ", (S(r[7]) ?? "").Split(',').OrderBy(x => x)) });
             }
-            return set;
+            return result;
         }
     }
 }
