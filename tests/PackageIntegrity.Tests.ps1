@@ -355,7 +355,9 @@ Describe 'Owner signatures' -Tag 'RealSignature' {
         # EXL_RELEASE_PACKAGE: the release package folder after Build-Standalone.ps1 -Seal (the launchers verify it with -Distribution).
         $package = $env:EXL_RELEASE_PACKAGE
         if (-not $package -or -not (Test-Path -LiteralPath (Join-Path $package 'PackageIntegrity.psd1'))) {
-            throw 'Set EXL_RELEASE_PACKAGE to the sealed release package folder (Build-Standalone.ps1 -Seal).'
+            # A CI runner builds its own binaries and cannot seal a release package: the case runs where the owner seals one.
+            Set-ItResult -Skipped -Because 'EXL_RELEASE_PACKAGE names no sealed release package folder (Build-Standalone.ps1 -Seal)'
+            return
         }
         function Start-Launcher([string]$Root, [string[]]$Arguments, [string]$Name) {
             # An empty standard input: the pause of the refusal branch returns at once.
