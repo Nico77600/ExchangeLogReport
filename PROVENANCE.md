@@ -4,10 +4,10 @@
 - Default branch: `main`
 - Release: `v3.0.0` (`ExchangeLogReport-3.0.0-win-x64.zip`)
 - Base of the release branch: public `main` at `2e0998fc10f0974083ba0e4aa66b784490d84518` (tag `v2.1.1`, merge of pull request #8, 2026-10-14)
-- Audited revision: **[TO RECORD AT PR TIME: the commit of the release branch that `v3.0.0` will point to]**
-- Audit date: **[TO RECORD AT PR TIME]**
-- Public commits inspected across branches and tags: **[TO RECORD AT PR TIME]** (30 before the release branch, on `main`, the 7 other public branches and the tags `v1.3.1`, `v1.4.0`, `v1.6.1`, `v2.0.0`, `v2.1.0` and `v2.1.1`)
-- `Co-authored-by: Copilot` findings: **[TO RECORD AT PR TIME]** (none in the 30 public commits before the release branch, which carry no `Co-authored-by` trailer at all)
+- Audited revision: `1eaffc8d7bbe11dfc4b4e71023b60f84bea92857` (release commit of `release/3.0.0-20261103`)
+- Audit date: 2026-11-03
+- Public commits inspected across branches and tags: 31 (30 before the release branch, on `main`, the 7 other public branches and the tags `v1.3.1`, `v1.4.0`, `v1.6.1`, `v2.0.0`, `v2.1.0` and `v2.1.1`)
+- `Co-authored-by: Copilot` findings: none (none in the 30 public commits before the release branch, which carry no `Co-authored-by` trailer at all)
 - Previous audit: `9777b682853ab322097f9a8be33f5774b1d05107`, 2026-10-07, 25 public commits, no `Co-authored-by: Copilot` finding
 
 This declaration records the public commit-history audit at the revision above. It is not a cryptographic signature and does not make claims about how source code was authored. Release assets are covered by the GitHub Actions workflow in `.github/workflows/attest-release.yml`; run it manually for an existing release when needed.
