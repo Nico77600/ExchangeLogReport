@@ -2483,7 +2483,11 @@ INSERT INTO smtp_transaction(time_ms,server,direction,session_id,status) VALUES(
                 $answer.message | Should -BeExactly 'Counts, value lists and filtered list pages are at their concurrency limit; retry explicitly.'
             }
             # One worker is left for the unfiltered pages, the details and the report description.
-            foreach ($path in "/api/sessions?$script:Period", "/api/sessions/1?$script:Period", "/api/report-meta?$script:Period", '/api/meta') { (Request $h $path).StatusCode | Should -Be 200 -Because $path }
+            foreach ($path in "/api/sessions?$script:Period", "/api/sessions/1?$script:Period", "/api/report-meta?$script:Period", '/api/meta') {
+                # The worker of the previous answer is released just after its last byte: the next request waits for it, as a client that reads its answer does.
+                $clock.Restart(); while ($slots.CurrentCount -ne 1) { $clock.Elapsed.TotalSeconds | Should -BeLessThan 5; Start-Sleep -Milliseconds 5 }
+                (Request $h $path).StatusCode | Should -Be 200 -Because $path
+            }
             @($held | Where-Object IsCompleted).Count | Should -Be 0
             # The clients leave: the scans end at the next look-up of their connections instead of reading on.
             $cancel.Cancel()
