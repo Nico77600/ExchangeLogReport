@@ -15,11 +15,15 @@
   <a href="package/docs/ExchangeLogReport-Guide.md"><b>Developer guide</b></a>
 </p>
 
+<p align="center">
+  <a href="https://github.com/Nico77600/ExchangeLogReport/releases/latest"><img alt="Download the latest release" src="https://img.shields.io/github/v/release/Nico77600/ExchangeLogReport?label=Download%20the%20latest%20release&amp;style=for-the-badge"></a>
+</p>
+
 **Author:** Nicolas Fabert  
 **Version:** 3.0.0
 
 > [!TIP]
-> **Download the latest release.** Open the [latest release](https://github.com/Nico77600/ExchangeLogReport/releases/latest) and download `ExchangeLogReport-3.0.0-win-x64.zip` (its SHA-256 is in the release notes). That ZIP is the whole tool: its own PowerShell, the portal, SQLite and the guides. Nothing else is installed. Do not use the **Source code** archive of a release or the green **Code** button for this: they hold the scripts only, without the PowerShell runtime or the SQLite tools.
+> **Download the latest release.** Open the [latest release](https://github.com/Nico77600/ExchangeLogReport/releases/latest) and download **`ExchangeLogReport-3.0.0-win-x64.zip`** under *Assets* (its SHA-256 is in the release notes). That ZIP is the whole signed tool: its own PowerShell, the portal, SQLite and the guides. Nothing else is installed. Do not use the **Source code** archives or the green **Code** button: they hold the scripts only, without the PowerShell runtime or the SQLite tools.
 
 > [!IMPORTANT]
 > Windows marks files downloaded from the Internet. After you extract the ZIP, check the publisher first (right-click a `.ps1`, for example `Invoke-ExchangeLogReport.ps1`, Properties, Digital Signatures: `Nicolas Fabert`), then unblock the extracted folder once:
