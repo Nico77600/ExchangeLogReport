@@ -445,7 +445,7 @@ Describe 'Documentation standard' {
         $text = [IO.File]::ReadAllText((Join-Path $script:RepoRoot 'README.md')).Replace("`r`n", "`n")
         $headings = @([regex]::Matches($text, '(?m)^## ([^\n]+)$') | ForEach-Object { $_.Groups[1].Value })
         $headings | Should -Be @('Why', 'Get started', 'How it works', 'Noise removed before storage', 'Sessions and messages', 'Reports', 'Requirements',
-            'Package layout', 'Documentation', 'Tests', 'Data handling', 'License', 'Disclaimer')
+            'Quick start', 'Package layout', 'Documentation', 'Tests', 'Data handling', 'License', 'Disclaimer')
         $steps = @([regex]::Matches($text, '(?m)^### ([^\n]+)$') | ForEach-Object { $_.Groups[1].Value })
         $steps | Should -Be @('Set up once · 1 to 4', 'A · Recurring reporting · 5 to 7', 'B · Troubleshooting · 5 to 7', 'C · Investigate in the browser · 5 to 7')
         $text | Should -Match 'Nicolas Fabert'
