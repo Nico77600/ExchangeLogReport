@@ -327,6 +327,12 @@ After a recipient: `(Handed off)`, `(Sent to external)`, `(Suppressed)`, `(Expan
 | E-mail (optional) | SMTP (25, 587 or 465) from the collector to a receive connector that accepts it: anonymous, Basic or Kerberos |
 | SQLite | Bundled in `lib\sqlite` — nothing to install |
 
+## Quick start
+
+1. Download `ExchangeLogReport-3.0.1-win-x64.zip` from the [latest release](https://github.com/Nico77600/ExchangeLogReport/releases/latest), extract it to an access-restricted local folder on the collector, for example `E:\Tools\ExchangeLogReport`, check the publisher and unblock the folder (see *Important* above).
+2. Open Windows PowerShell as administrator in that folder and follow *Set up once · 1 to 4* in [Get started](#get-started): list the servers, run `-Mode Discover`, run the first collection by hand with `-Mode Collect`, create the hourly task, then check with `-Mode Status`.
+3. Take branch A, B or C of [Get started](#get-started).
+
 ## Package layout
 
 The ZIP has one top folder, `ExchangeLogReport-3.0.1-win-x64`:

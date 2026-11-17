@@ -82,12 +82,12 @@ What you get, and what to do:
 
 - [User guide](docs/ExchangeLogReport-UserGuide.html) - the guided path, step by step; the portal; the database maintenance
 - [Developer guide](docs/ExchangeLogReport-Guide.html) - the principles, configuration, correlation rules, data model, the portal, troubleshooting
-- [Change log](CHANGELOG.md) - what changed, with the upgrade steps from 2.1.1
-- [Security policy](SECURITY.md)
+- Change log: `CHANGELOG.md` in this folder - what changed, with the upgrade steps from 2.1.1
+- Security policy: `SECURITY.md` in this folder
 
 Project page and releases: https://github.com/Nico77600/ExchangeLogReport
 
-License: [MIT](LICENSE). Third-party components: [THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md).
+License: MIT (`LICENSE` in this folder). Third-party components: [THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md).
 
 ## Data handling
 
