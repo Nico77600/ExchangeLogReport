@@ -14,7 +14,7 @@ Describe 'Public workflow contracts' {
         $product.visibility | Should -BeExactly 'public'
         $product.status | Should -BeExactly 'release'
         $product.name | Should -BeExactly 'ExchangeLogReport'
-        $product.version | Should -BeExactly '3.0.0'
+        $product.version | Should -BeExactly '3.0.1'
     }
 
     It 'declares the actual package runtime and existing validation paths without inventing required checks' {
@@ -236,14 +236,14 @@ base = {
     "powershell/pwsh.exe": b"synthetic executable placeholder",
     "sqlite-tools/sqlite3.exe": b"synthetic sqlite tool",
     "config/ExchangeLogReport.config.psd1": b"@{Synthetic=$true}",
-    "product.json": json.dumps({"name": "ExchangeLogReport", "version": "3.0.0"}).encode(),
+    "product.json": json.dumps({"name": "ExchangeLogReport", "version": "3.0.1"}).encode(),
 }
 for script in SCRIPTS:
     base[script] = b"# synthetic script" + signature
 MUTABLE = "config/ExchangeLogReport.config.psd1"
 BINARY = ("powershell/", "sqlite-tools/")
 
-def manifest_text(files, *, bad_schema=False, thumbprint="0F28E442889F17B5F4D251E8F96E7CC6E2C9C6D6", version="3.0.0", sign=True, unix_inventory=False, traversal=False):
+def manifest_text(files, *, bad_schema=False, thumbprint="0F28E442889F17B5F4D251E8F96E7CC6E2C9C6D6", version="3.0.1", sign=True, unix_inventory=False, traversal=False):
     lines = ["@{", f"    SchemaVersion = {2 if bad_schema else 1}", "    Algorithm = 'SHA256'",
              f"    SignerThumbprint = '{thumbprint}'", f"    Version = '{version}'"]
     entries = [(name, data) for name, data in files.items() if name != MUTABLE]
@@ -271,7 +271,7 @@ def make_zip(files=None, *, prefix="release/", manifest=True, changed=False, ext
         files["Database-Storage.ps1"] = b"# synthetic script without a signature"
     manifest_bytes = manifest_text(files, bad_schema=bad_schema, sign=not unsigned_manifest, unix_inventory=unix_inventory, traversal=traversal,
                                    thumbprint="0000000000000000000000000000000000000000" if wrong_signer else "0F28E442889F17B5F4D251E8F96E7CC6E2C9C6D6",
-                                   version="3.0.1" if wrong_version else "3.0.0")
+                                   version="3.0.0" if wrong_version else "3.0.1")
     result = io.BytesIO()
     with zipfile.ZipFile(result, "w", zipfile.ZIP_DEFLATED) as archive:
         for name, data in files.items():
@@ -300,7 +300,7 @@ def make_changed():
     result.seek(0)
     return result
 
-assert verify(make_zip(), expected_version="3.0.0")["report_script_bytes"] == len(base[MAIN])
+assert verify(make_zip(), expected_version="3.0.1")["report_script_bytes"] == len(base[MAIN])
 assert verify(make_zip(prefix=""))["verified_files"] == len(base) - 1
 missing_script = {name: data for name, data in base.items() if name != MAIN}
 missing_page = {name: data for name, data in base.items() if name != PAGE}
@@ -318,7 +318,7 @@ cases = [
 ]
 for number, fixture in enumerate(cases):
     try:
-        verify(fixture, expected_version="3.0.0")
+        verify(fixture, expected_version="3.0.1")
     except (SystemExit, ValueError, zipfile.BadZipFile):
         continue
     raise AssertionError(f"Invalid bundle fixture {number} was accepted")

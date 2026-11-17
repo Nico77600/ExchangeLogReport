@@ -2,7 +2,7 @@
 //  Exchange Log Report - engine, part 4b: HTML report (data files and page)
 // -----------------------------------------------------------------------------
 //  Author  : Nicolas Fabert
-//  Version : 3.0.0
+//  Version : 3.0.1
 //
 //  The page and its data. Every table is written first as data files (plain JavaScript: __exl.file / __exl.push
 //  statements with gzip + base64 payloads); the report then either copies those files into the page (one file) or

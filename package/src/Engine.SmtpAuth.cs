@@ -2,7 +2,7 @@
 //  Exchange Log Report - engine, part 12: authenticated user of SMTP sessions
 // -----------------------------------------------------------------------------
 //  Author  : Nicolas Fabert
-//  Version : 3.0.0
+//  Version : 3.0.1
 //
 //  The authenticated user of an SMTP transaction is the account that Exchange itself wrote in its protocol log
 //  ("* data=<account> context=authenticated"), tied to a successful AUTH of the same session. It is never decoded from

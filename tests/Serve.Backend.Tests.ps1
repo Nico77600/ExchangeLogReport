@@ -485,7 +485,7 @@ Describe 'Serve actual HttpListener endpoints' {
         $m = $r.Content | ConvertFrom-Json
         $m.schemaVersion | Should -Be 13
         $m.supportedSchemaVersion | Should -Be 13
-        $m.version | Should -BeExactly '3.0.0'
+        $m.version | Should -BeExactly '3.0.1'
         $m.readOnly | Should -BeTrue
         $m.mode | Should -BeExactly 'Serve'
         $r.Headers['Cache-Control'] | Should -Contain 'no-store'

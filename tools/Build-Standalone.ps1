@@ -17,7 +17,7 @@
 
 .NOTES
     Author  : Nicolas Fabert
-    Version : 3.0.0
+    Version : 3.0.1
 #>
 [CmdletBinding(DefaultParameterSetName = 'Build')]
 param(

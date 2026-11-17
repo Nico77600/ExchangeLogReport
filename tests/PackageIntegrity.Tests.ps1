@@ -434,7 +434,7 @@ Describe 'Launchers and builder' {
     }
     It 'writes a manifest that the verifier parses, with both lists in a stable order' {
         $text = [IO.File]::ReadAllText((Join-Path $script:Template 'PackageIntegrity.psd1'))
-        $text | Should -Match "(?s)^@\{\r\n    SchemaVersion = 1\r\n    Algorithm = 'SHA256'\r\n    SignerThumbprint = '$($script:Signer)'\r\n    Version = '3\.0\.0'\r\n    Files = @\(.*\r\n    \)\r\n    DistributionFiles = @\(.*\r\n    \)\r\n\}\r\n$"
+        $text | Should -Match "(?s)^@\{\r\n    SchemaVersion = 1\r\n    Algorithm = 'SHA256'\r\n    SignerThumbprint = '$($script:Signer)'\r\n    Version = '3\.0\.1'\r\n    Files = @\(.*\r\n    \)\r\n    DistributionFiles = @\(.*\r\n    \)\r\n\}\r\n$"
         $paths = @($script:Entries.Path)
         $paths | Should -Be @($paths | Sort-Object { $_ } -CaseSensitive)
     }
@@ -449,7 +449,7 @@ Describe 'Documentation standard' {
         $steps = @([regex]::Matches($text, '(?m)^### ([^\n]+)$') | ForEach-Object { $_.Groups[1].Value })
         $steps | Should -Be @('Set up once · 1 to 4', 'A · Recurring reporting · 5 to 7', 'B · Troubleshooting · 5 to 7', 'C · Investigate in the browser · 5 to 7')
         $text | Should -Match 'Nicolas Fabert'
-        $text | Should -Match '\*\*Version:\*\* 3\.0\.0'
+        $text | Should -Match '\*\*Version:\*\* 3\.0\.1'
         $text | Should -Not -Match 'unreleased|experimental|pilot'
         $text.TrimEnd().EndsWith($script:Disclaimer, [StringComparison]::Ordinal) | Should -BeTrue
         $text | Should -Match '(?s)^<p align="center">\s*<picture>.*?prefers-color-scheme: dark.*?</picture>'
@@ -484,7 +484,7 @@ Describe 'Documentation standard' {
         $headings = @([regex]::Matches($text, '(?m)^## ([^\n]+)$') | ForEach-Object { $_.Groups[1].Value })
         $headings | Should -Be @('Requirements', 'Quick start', 'Content', 'Documentation', 'Data handling', 'Disclaimer')
         $text | Should -Match 'Nicolas Fabert'
-        $text | Should -Match '\*\*Version:\*\* 3\.0\.0'
+        $text | Should -Match '\*\*Version:\*\* 3\.0\.1'
         $text.TrimEnd().EndsWith($script:Disclaimer, [StringComparison]::Ordinal) | Should -BeTrue
         $text | Should -Not -Match 'unsigned|experimental|pilot|collector\\|host\\|README\.txt'
         foreach ($match in [regex]::Matches($text, '\[[^\]\n]+\]\(([^)#]+)')) {
