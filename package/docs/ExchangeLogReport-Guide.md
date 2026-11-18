@@ -1,7 +1,7 @@
 ---
 title: Exchange Log Report
 subtitle: Developer guide
-version: 3.0.0
+version: 3.0.1
 author: Nicolas Fabert
 updated: 2026-10-30
 ---
@@ -35,7 +35,7 @@ file | What it produces | **CSV + HTML** files in a local folder: a usage report
 Set up once | settings | Set up once: then the collection runs by itself every hour
 Set up once | 1 | List the servers | write their names in the configuration
 Set up once | 2 | Find the log folders | `-Mode Discover`, with your administrator account
-Set up once | 3 | Collect every hour | a scheduled task; its first run reads 14 days of logs
+Set up once | 3 | First collection, then every hour | `-Mode Collect` by hand (it reads 14 days of logs), then a scheduled task
 Set up once | 4 | Check | `-Mode Status`: every server has data
 A | chart | Recurring reporting
 A | 5 | Schedule the reports | every morning the last 24 hours, every month the last month
@@ -209,7 +209,7 @@ The Edge gets its own tool folder and database. Seen from a mailbox server, a su
 ## 5. Installation
 
 ```steps
-Extract the package | Extract `ExchangeLogReport-3.0.0-win-x64.zip` to the collector, for example `E:\Tools\ExchangeLogReport` (no installer, no module to register; PowerShell 7 is inside the package). The scripts alone, from the `package` folder of the repository, run on an installed PowerShell 7.4 or later.
+Extract the package | Extract `ExchangeLogReport-3.0.1-win-x64.zip` to the collector, for example `E:\Tools\ExchangeLogReport` (no installer, no module to register; PowerShell 7 is inside the package). The scripts alone, from the `package` folder of the repository, run on an installed PowerShell 7.4 or later.
 List the servers | Edit `config\ExchangeLogReport.config.psd1`: the server names are enough (chapter 6).
 Check the configuration and the engine | `.\Run-Collector.cmd -Mode Status` — a new installation answers **Ready for the first collection**.
 Find the log folders | `.\Run-Collector.cmd -Mode Discover` with an account of *View-Only Organization Management* (6.1). Check the warnings: folder not readable, logging off.
@@ -1205,4 +1205,4 @@ The columns are found by name in the `#Fields:` header of each file: a different
 <!-- icon: tag -->
 ## Annex C — Versioning
 
-MAJOR.MINOR.PATCH: MAJOR for a database or configuration change that needs action, MINOR for a new feature, PATCH for a fix. Every change is listed in `CHANGELOG.md`. Version 3.0.0 (database schema 13, the portal, the launchers, the storage tool in the bundled PowerShell) follows 2.1.1 directly: a MAJOR change because the database schema upgrades once, the status words changed and the package layout gained the launchers and the built folders.
+MAJOR.MINOR.PATCH: MAJOR for a database or configuration change that needs action, MINOR for a new feature, PATCH for a fix. Every change is listed in `CHANGELOG.md`. Version 3.0.0 (database schema 13, the portal, the launchers, the storage tool in the bundled PowerShell) follows 2.1.1 directly: a MAJOR change because the database schema upgrades once, the status words changed and the package layout gained the launchers and the built folders. Version 3.0.1 changes the documentation only.

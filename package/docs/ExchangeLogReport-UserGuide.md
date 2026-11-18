@@ -1,7 +1,7 @@
 ---
 title: Exchange Log Report
 subtitle: User guide
-version: 3.0.0
+version: 3.0.1
 author: Nicolas Fabert
 updated: 2026-11-01
 ---
@@ -52,7 +52,7 @@ updated: 2026-11-01
 Set up once | settings | Set up once: then the collection runs by itself every hour
 Set up once | 1 | List the servers | write their names in the configuration
 Set up once | 2 | Find the log folders | `-Mode Discover`, with your administrator account
-Set up once | 3 | Collect every hour | a scheduled task; its first run reads 14 days of logs
+Set up once | 3 | First collection, then every hour | `-Mode Collect` by hand (it reads 14 days of logs), then a scheduled task
 Set up once | 4 | Check | `-Mode Status`: every server has data
 A | chart | Recurring reporting
 A | 5 | Schedule the reports | every morning the last 24 hours, every month the last month
@@ -89,7 +89,7 @@ C | 7 | Open a session, a message or an SMTP client | its timeline, its route or
 ## 2. Before you start
 
 ```steps
-Download the package | Download `ExchangeLogReport-3.0.0-win-x64.zip` from the [latest release](https://github.com/Nico77600/ExchangeLogReport/releases/latest) (not the *Source code* archive). It carries its own PowerShell 7: nothing to install.
+Download the package | Download `ExchangeLogReport-3.0.1-win-x64.zip` from the [latest release](https://github.com/Nico77600/ExchangeLogReport/releases/latest) (not the *Source code* archive). It carries its own PowerShell 7: nothing to install.
 Extract it | Extract the ZIP into `E:\Tools\ExchangeLogReport` on EXCH01, then unblock that folder with the command of the box above. The folder holds `Run-Collector.cmd`, `Start-Portal.cmd` and `Database-Storage.cmd`.
 Check your account | You can sign in to EXCH01 as an administrator, and your account is in the Exchange role group *View-Only Organization Management* (for step 2 only; ask the Exchange administrator, or run `Get-RoleGroupMember 'View-Only Organization Management'` in the Exchange Management Shell).
 ```
@@ -160,18 +160,30 @@ Servers = @(
 .\Run-Collector.cmd -Mode Discover
 ```
 
-**You should see:** one line per server, then a green **Log paths discovered**.
+**You should see:** one line per server, then a green **Log paths discovered**, and a *Next* line: `.\Run-Collector.cmd -Mode Collect`, the command of step 3.
 
 **If not:** read the yellow lines.
 
 - *Exchange remote PowerShell could not be opened*: run it on an Exchange server, or add `-ConnectTo EXCH01`.
 - *Folder not readable*: your account is not administrator of that server.
 
-### 3 · Collect every hour
+### 3 · First collection, then every hour
 
-*On EXCH01 · as SYSTEM, scheduled · first run about 6 minutes for two servers, then a few seconds every hour*
+*On EXCH01 · your own administrator account, then SYSTEM, scheduled · first collection about 6 minutes for two servers, then a few seconds every hour*
 
-**Do:** copy the whole block. It creates the scheduled task, then starts its first run now:
+**Do:** in the same administrator window, run the first collection:
+
+```powershell
+.\Run-Collector.cmd -Mode Collect
+```
+
+It reads the last 14 days of logs. It is the only long run: about **6 minutes** for two servers on the lab, more with many servers. The window shows its progress: do not close it. A large first collection needs several GB of memory.
+
+**You should see:** the steps one after the other (access to the servers, reading the log lines, retention), then a green **Collection complete** with the data read, the lines kept and the duration.
+
+**If not:** read the yellow lines above the summary. *Collection finished with warnings* means a server or a source was not read completely: a folder that is not readable or a server that does not answer (chapter 10).
+
+**Do:** then create the hourly task. Copy the whole block:
 
 ```powershell
 $run = 'E:\Tools\ExchangeLogReport\Run-Collector.cmd'
@@ -179,26 +191,19 @@ $run = 'E:\Tools\ExchangeLogReport\Run-Collector.cmd'
 # Every hour: read the new log lines
 schtasks /Create /F /RU SYSTEM /RL HIGHEST /TN "Exchange Log Report - collect" `
     /SC HOURLY /TR "$run -Mode Collect"
-
-# The first run, now
-schtasks /Run /TN "Exchange Log Report - collect"
 ```
 
-**You should see:** `SUCCESS` twice (in the language of Windows).
+**You should see:** `SUCCESS` once (in the language of Windows).
 
 **If not:** *Access is denied*: this PowerShell window is not run as administrator. Open PowerShell as administrator and copy the block again.
 
-The first run reads the last 14 days of logs. It is the only long one: about **6 minutes** for two servers on the lab, more with many servers.
-
-You see nothing in this window while it runs: the task works in the background as SYSTEM. Task Scheduler (`taskschd.msc`) shows it as *Running*, and the file of the day in `logs\` grows. Do not start the collection by hand in the meantime. A large first collection needs several GB of memory.
-
-Then the task runs every hour and reads only the new lines: a few seconds. You never wait for it.
+Each hourly run reads only the new lines: a few seconds. You never wait for it. The task runs as SYSTEM (the computer account), while the first collection used your own account: this is why step 4 also checks the task.
 
 ### 4 · Check
 
-*On EXCH01 · your administrator account · 1 minute, a few minutes after step 3*
+*On EXCH01 · your administrator account · 1 minute right after step 3, then one look after the next full hour*
 
-**Do:** a few minutes later, run:
+**Do:** right after the first collection, run:
 
 ```powershell
 .\Run-Collector.cmd -Mode Status
@@ -208,8 +213,12 @@ Then the task runs every hour and reads only the new lines: a few seconds. You n
 
 **If not:**
 
-- *No database yet* / *Ready for the first collection*, or *No collection in the database yet*: the first run of step 3 is not over (or did not start). Wait a few minutes and run the command again. Still nothing after 15 minutes: open Task Scheduler (`taskschd.msc`), task *Exchange Log Report - collect*, and read its *Last run result* (chapter 8).
+- *No database yet* / *Ready for the first collection*, or *No collection in the database yet*: the first collection of step 3 did not run, or was stopped before its end. Run `.\Run-Collector.cmd -Mode Collect` again: it resumes where it stopped.
 - A server without data: its logs are not readable (chapter 10).
+
+**Do:** after the next full hour, open Task Scheduler (`taskschd.msc`), task *Exchange Log Report - collect*, and read its *Last run result*.
+
+**You should see:** `0x0`: the hourly task ran as SYSTEM and succeeded. Another value: chapter 8.
 
 **Done.** The tool is ready. Go to **A** (chapter 4), **B** (chapter 5), **C** (chapter 6), or several.
 
@@ -271,7 +280,7 @@ Get-ChildItem .\reports -Recurse -Filter ExchangeLogs.html |
 
 **If not:**
 
-- *No collection in the database yet*: the first collection is not over (chapter 3, step 4).
+- *No collection in the database yet*: the first collection has not been done (chapter 3, step 3).
 - No new folder under `reports` for the daily report of step 5: the task did not run yet, or it failed.
 
 1. Check its last result (`Get-ScheduledTaskInfo`, chapter 8: `0` is a success).
@@ -662,7 +671,7 @@ The five messages seen most often, whatever you were doing:
 | You see | Do this | Read more |
 |---|---|---|
 | *The package could not be verified. Read the message above.* | A file of the package was changed, blocked or replaced. Extract the release ZIP again, unblock it (box at the top), and start the launcher again. | [Chapter 6, step 5](#6-c--investigate-in-the-browser) |
-| *No collection in the database yet* | The first collection has not run yet. Do step 3, wait a few minutes, then run `.\Run-Collector.cmd -Mode Status` (step 4). | [Chapter 3](#3-set-up-once) |
+| *No collection in the database yet* | The first collection has not run yet. Do step 3 (it can take several minutes), then run `.\Run-Collector.cmd -Mode Status` (step 4). | [Chapter 3](#3-set-up-once) |
 | *Access is denied* after `schtasks` | This PowerShell window is not run as administrator. Open PowerShell as administrator, go to the folder of the tool, and copy the block again. | [Chapter 3, step 3](#3-set-up-once) |
 | *folder not found or not readable* | The account is not local administrator of that server, or the logs were moved. Run `.\Run-Collector.cmd -Mode Discover` again. | [Chapter 10](#10-results) |
 | *The request exceeded its deadline of 15 s* (504, in the portal) | The question was too big for the time allowed; the portal already tried once more. Click again (it is faster the second time), or choose fewer days, one server or one user. | [Chapter 6](#6-c--investigate-in-the-browser) |

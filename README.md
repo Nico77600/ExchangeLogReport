@@ -20,10 +20,10 @@
 </p>
 
 **Author:** Nicolas Fabert  
-**Version:** 3.0.0
+**Version:** 3.0.1
 
 > [!TIP]
-> **Download the latest release.** Open the [latest release](https://github.com/Nico77600/ExchangeLogReport/releases/latest) and download **`ExchangeLogReport-3.0.0-win-x64.zip`** under *Assets* (its SHA-256 is in the release notes). That ZIP is the whole signed tool: its own PowerShell, the portal, SQLite and the guides. Nothing else is installed. Do not use the **Source code** archives or the green **Code** button: they hold the scripts only, without the PowerShell runtime or the SQLite tools.
+> **Download the latest release.** Open the [latest release](https://github.com/Nico77600/ExchangeLogReport/releases/latest) and download **`ExchangeLogReport-3.0.1-win-x64.zip`** under *Assets* (its SHA-256 is in the release notes). That ZIP is the whole signed tool: its own PowerShell, the portal, SQLite and the guides. Nothing else is installed. Do not use the **Source code** archives or the green **Code** button: they hold the scripts only, without the PowerShell runtime or the SQLite tools.
 
 > [!IMPORTANT]
 > Windows marks files downloaded from the Internet. After you extract the ZIP, check the publisher first (right-click a `.ps1`, for example `Invoke-ExchangeLogReport.ps1`, Properties, Digital Signatures: `Nicolas Fabert`), then unblock the extracted folder once:
@@ -51,7 +51,7 @@ Exchange writes gigabytes of logs per day and per server, and almost none of it 
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="package/docs/images/readme-path-dark.png">
-  <img alt="The guided path. Set up once: 1 list the servers, 2 find the log folders with -Mode Discover, 3 collect every hour with a scheduled task whose first run reads 14 days, 4 check with -Mode Status. Then branch A, recurring reporting: 5 schedule the reports, 6 open the HTML report, 7 option: receive them by e-mail. Branch B, troubleshooting on demand: 5 run a Detailed report on the user and the period, 6 open the client session, 7 follow the timeline to the raw log lines. Branch C, investigate in the browser: 5 start the portal with Start-Portal.cmd, 6 read one day, the newest first, then move with Previous day, Next day, 1, 3 or 7 days or Jump to day, 7 open a session, a message or an SMTP client" src="package/docs/images/readme-path-light.png">
+  <img alt="The guided path. Set up once: 1 list the servers, 2 find the log folders with -Mode Discover, 3 run the first collection by hand with -Mode Collect (it reads 14 days) and then schedule it every hour, 4 check with -Mode Status. Then branch A, recurring reporting: 5 schedule the reports, 6 open the HTML report, 7 option: receive them by e-mail. Branch B, troubleshooting on demand: 5 run a Detailed report on the user and the period, 6 open the client session, 7 follow the timeline to the raw log lines. Branch C, investigate in the browser: 5 start the portal with Start-Portal.cmd, 6 read one day, the newest first, then move with Previous day, Next day, 1, 3 or 7 days or Jump to day, 7 open a session, a message or an SMTP client" src="package/docs/images/readme-path-light.png">
 </picture>
 
 One path for everyone. Set the tool up once (**1 to 4**), then take one branch, or several:
@@ -64,7 +64,7 @@ The commands use one example — servers `EXCH01` to `EXCH04`, the package extra
 
 | You want to | Run, from the package folder | You get |
 |---|---|---|
-| Set up once | `Run-Collector.cmd -Mode Discover`, then the hourly task of step 3 (its first run reads 14 days), then `Run-Collector.cmd -Mode Status` | the log folders of every server, the first 14 days of history, a status line per server |
+| Set up once | `Run-Collector.cmd -Mode Discover`, then `Run-Collector.cmd -Mode Collect` by hand (the first collection reads 14 days), then the hourly task of step 3, then `Run-Collector.cmd -Mode Status` | the log folders of every server, the first 14 days of history, a status line per server |
 | **A · Usage report** (which servers are really used) | `Run-Collector.cmd -Range Last30Days` (a report is the default mode, Usage the default type) | `reports\ExchangeLogs_Usage_<period>_<time>\ExchangeLogs.html` + CSV files |
 | **B · Detailed report** (a user, a message, an incident) | `Run-Collector.cmd -ReportType Detailed -User alice@contoso.com -Start "2026-10-07 08:00" -End "2026-10-07 12:00"` | `ExchangeLogs.html`; above 200 MB of data, a small page **and** an `ExchangeLogs_data` folder next to it (keep them together, zip both to send them) |
 | **C · The portal** (investigate in the browser) | `Start-Portal.cmd` | the portal opens in your browser on `http://127.0.0.1:<port>`, on the newest collected day; stop it with **Stop portal** or Ctrl+C |
@@ -83,13 +83,18 @@ notepad .\config\ExchangeLogReport.config.psd1
 # 2 · Find the log folders, with your administrator account (not as SYSTEM)
 .\Run-Collector.cmd -Mode Discover
 
-# 3 · Collect every hour, as SYSTEM; the first run, now, reads 14 days of logs
+# 3 · First collection, by hand in the same window: it reads the last 14 days of logs and
+# shows its progress; wait for "Collection complete"
+.\Run-Collector.cmd -Mode Collect
+
+# 3 · Then every hour, as SYSTEM
 schtasks /Create /F /RU SYSTEM /RL HIGHEST /TN "Exchange Log Report - collect" `
     /SC HOURLY /TR "E:\Tools\ExchangeLogReport\Run-Collector.cmd -Mode Collect"
-schtasks /Run /TN "Exchange Log Report - collect"
 
-# 4 · Check, once the first run is over: every server and every source has data
+# 4 · Check, right after the first collection: every server and every source has data
 .\Run-Collector.cmd -Mode Status
+# After the next full hour, Task Scheduler (taskschd.msc): the task "Exchange Log Report - collect"
+# shows Last run result 0x0
 ```
 
 Always start the tool through `Run-Collector.cmd`, by hand and in the scheduled tasks: it checks the package, then starts the PowerShell inside it with the right settings. Typed without argument, it shows the status.
@@ -322,9 +327,15 @@ After a recipient: `(Handed off)`, `(Sent to external)`, `(Suppressed)`, `(Expan
 | E-mail (optional) | SMTP (25, 587 or 465) from the collector to a receive connector that accepts it: anonymous, Basic or Kerberos |
 | SQLite | Bundled in `lib\sqlite` — nothing to install |
 
+## Quick start
+
+1. Download `ExchangeLogReport-3.0.1-win-x64.zip` from the [latest release](https://github.com/Nico77600/ExchangeLogReport/releases/latest), extract it to an access-restricted local folder on the collector, for example `E:\Tools\ExchangeLogReport`, check the publisher and unblock the folder (see *Important* above).
+2. Open Windows PowerShell as administrator in that folder and follow *Set up once · 1 to 4* in [Get started](#get-started): list the servers, run `-Mode Discover`, run the first collection by hand with `-Mode Collect`, create the hourly task, then check with `-Mode Status`.
+3. Take branch A, B or C of [Get started](#get-started).
+
 ## Package layout
 
-The ZIP has one top folder, `ExchangeLogReport-3.0.0-win-x64`:
+The ZIP has one top folder, `ExchangeLogReport-3.0.1-win-x64`:
 
 ```text
 Run-Collector.cmd  Start-Portal.cmd  Database-Storage.cmd   launchers: verify the package, then start the bundled PowerShell

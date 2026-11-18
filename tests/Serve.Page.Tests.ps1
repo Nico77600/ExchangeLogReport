@@ -43,7 +43,7 @@ BeforeAll {
     [IO.File]::AppendAllText($ews.FullName, $(if ($text.EndsWith("`n")) { '' } else { "`r`n" }) + ($lines -join "`r`n") + "`r`n")
     $collect = Open-ExlStore -Settings $script:Settings
     try {
-        $run = $collect.StartRun('Collect', 'SYNTHETIC', 'SYNTHETIC', '3.0.0')
+        $run = $collect.StartRun('Collect', 'SYNTHETIC', 'SYNTHETIC', '3.0.1')
         $collection = Invoke-ExlCollection -Store $collect -Settings $script:Settings -RunId $run
         $collect.EndRun($run, 'Completed', $collection.Files, $collection.Bytes, $collection.Lines, $collection.Kept, $collection.Noise, $null)
     } finally { $collect.Dispose() }
@@ -79,7 +79,7 @@ BeforeAll {
     [IO.File]::AppendAllText($tracking.FullName, $(if ($trackingText.EndsWith("`n")) { '' } else { "`r`n" }) + ($externalLines -join "`r`n") + "`r`n")
     $collect = Open-ExlStore -Settings $script:Settings
     try {
-        $run = $collect.StartRun('Collect', 'SYNTHETIC', 'SYNTHETIC', '3.0.0')
+        $run = $collect.StartRun('Collect', 'SYNTHETIC', 'SYNTHETIC', '3.0.1')
         $collection = Invoke-ExlCollection -Store $collect -Settings $script:Settings -RunId $run
         $collect.EndRun($run, 'Completed', $collection.Files, $collection.Bytes, $collection.Lines, $collection.Kept, $collection.Noise, $null)
     } finally { $collect.Dispose() }

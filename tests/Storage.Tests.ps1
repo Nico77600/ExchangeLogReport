@@ -16,7 +16,7 @@ BeforeAll {
         # The JSON report is the only standard output: the unverified-source-tree warning of the import is not written there.
         'Import-Module (Join-Path $Root ''ExchangeLogReport.psd1'') -Force 3>$null',
         'Initialize-ExlEngine -Root $Root -WithStorage 3>$null',
-        'exit [ExchangeLogReport.Storage.StorageCli]::Run([string[]]@(ConvertFrom-Json -InputObject $env:EXL_STORAGE_ARGS), ''3.0.0'', $Tool)') -join "`n")
+        'exit [ExchangeLogReport.Storage.StorageCli]::Run([string[]]@(ConvertFrom-Json -InputObject $env:EXL_STORAGE_ARGS), ''3.0.1'', $Tool)') -join "`n")
     . (Join-Path $PSScriptRoot 'Storage.Fixtures.ps1')
     $marker = 'SYNTHETIC_PRIVATE_PAYLOAD_NEVER_EMIT'
     # -StatusRules: two more messages whose tracking row differs between the schema 8-11 and the schema-12 recipient rules (a SEND without DELIVER).

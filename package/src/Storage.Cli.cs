@@ -1,6 +1,6 @@
 // Storage maintenance command line (Database-Storage.ps1): option parsing, failure reporting and the entry point.
 // Author  : Nicolas Fabert
-// Version : 3.0.0
+// Version : 3.0.1
 #nullable enable
 using System;
 using System.Collections.Generic;
@@ -90,7 +90,7 @@ internal sealed record StorageOptions(string Database, StorageMode StorageMode)
 
 public static class StorageCli
 {
-    internal static string Version { get; private set; } = "3.0.0";
+    internal static string Version { get; private set; } = "3.0.1";
 
     private const string Usage =
         "Read-only audit:\n" +

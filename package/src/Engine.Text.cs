@@ -2,7 +2,7 @@
 //  Exchange Log Report - engine, part 1: text helpers
 // -----------------------------------------------------------------------------
 //  Author  : Nicolas Fabert
-//  Version : 3.0.0
+//  Version : 3.0.1
 //  The src\Engine.*.cs files are compiled together by ExchangeLogReport.psm1
 //  the first time they are used (and again whenever one of them changes).
 //

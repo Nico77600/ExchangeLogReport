@@ -32,7 +32,7 @@
 
 .NOTES
     Author  : Nicolas Fabert
-    Version : 3.0.0
+    Version : 3.0.1
     Part of : Exchange Log Report (repository tool, not in the package)
 #>
 [CmdletBinding()]

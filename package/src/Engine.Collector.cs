@@ -2,7 +2,7 @@
 //  Exchange Log Report - engine, part 3: collector (log files -> SQLite)
 // -----------------------------------------------------------------------------
 //  Author  : Nicolas Fabert
-//  Version : 3.0.0
+//  Version : 3.0.1
 //
 //  A collection has two stages (Engine.Pipeline.cs runs them):
 //    1. PARSE  (several threads, one file each): reads the new part of a log file,

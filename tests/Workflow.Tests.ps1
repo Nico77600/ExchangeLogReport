@@ -3,9 +3,88 @@ BeforeAll {
     Set-StrictMode -Version Latest
     $script:Root = Split-Path $PSScriptRoot -Parent
     $script:Workflows = Join-Path $script:Root '.github\workflows'
-    $script:Ci = Get-Content -LiteralPath (Join-Path $script:Workflows 'ci.yml') -Raw | ConvertFrom-Json
+    $script:CiText = [IO.File]::ReadAllText((Join-Path $script:Workflows 'ci.yml'))
     $script:Codeql = Get-Content -LiteralPath (Join-Path $script:Workflows 'codeql.yml') -Raw | ConvertFrom-Json
     $script:Attestation = Get-Content -LiteralPath (Join-Path $script:Workflows 'attest-release.yml') -Raw
+
+    # Minimal reader for the block-YAML subset of ci.yml: mappings, block sequences of mappings, '|' / '|-' block scalars,
+    # and plain, quoted or flow-style values kept as text. Anything else (tabs, anchors, duplicate keys, bad indentation) throws.
+    function Read-CiYamlMapping {
+        param([string[]]$Lines, [ref]$Index, [int]$Indent)
+        $map = [ordered]@{}
+        while ($Index.Value -lt $Lines.Count) {
+            $line = $Lines[$Index.Value]
+            if ($line -match '^\s*(#.*)?$') { $Index.Value++; continue }
+            if ($line.Contains("`t")) { throw "Tab in YAML at line $($Index.Value + 1)." }
+            $lead = $line.Length - $line.TrimStart(' ').Length
+            if ($lead -lt $Indent) { break }
+            if ($lead -gt $Indent) { throw "Unexpected indentation at line $($Index.Value + 1)." }
+            $m = [regex]::Match($line.Substring($lead), '^(?<key>[A-Za-z0-9_.-]+):(?:\s+(?<value>.*?))?\s*$')
+            if (-not $m.Success) { throw "Unsupported YAML at line $($Index.Value + 1): $line" }
+            $key = $m.Groups['key'].Value
+            if ($map.Contains($key)) { throw "Duplicate YAML key '$key' at line $($Index.Value + 1)." }
+            $value = $m.Groups['value'].Value
+            $Index.Value++
+            if ($value -match '^[|>][+-]?$') {
+                if ($value.StartsWith('>')) { throw 'Folded scalars are not supported.' }
+                $content = [Collections.Generic.List[string]]::new()
+                $blockIndent = -1
+                while ($Index.Value -lt $Lines.Count) {
+                    $next = $Lines[$Index.Value]
+                    if ($next -match '^\s*$') { $content.Add(''); $Index.Value++; continue }
+                    $nextLead = $next.Length - $next.TrimStart(' ').Length
+                    if ($nextLead -le $Indent) { break }
+                    if ($blockIndent -lt 0) { $blockIndent = $nextLead }
+                    if ($nextLead -lt $blockIndent) { throw "Block scalar indentation at line $($Index.Value + 1)." }
+                    $content.Add($next.Substring($blockIndent))
+                    $Index.Value++
+                }
+                while ($content.Count -and $content[$content.Count - 1] -eq '') { $content.RemoveAt($content.Count - 1) }
+                $map[$key] = ($content -join "`n") + $(if ($value.EndsWith('-')) { '' } else { "`n" })
+            } elseif ($value -eq '' -or $value.StartsWith('#')) {
+                $nextIndex = $Index.Value
+                while ($nextIndex -lt $Lines.Count -and $Lines[$nextIndex] -match '^\s*(#.*)?$') { $nextIndex++ }
+                $nextLine = if ($nextIndex -lt $Lines.Count) { $Lines[$nextIndex] } else { '' }
+                $nextLead = $nextLine.Length - $nextLine.TrimStart(' ').Length
+                if ($nextIndex -ge $Lines.Count -or $nextLead -lt $Indent -or ($nextLead -eq $Indent -and -not $nextLine.TrimStart().StartsWith('- '))) {
+                    $map[$key] = $null
+                } elseif ($nextLine.TrimStart().StartsWith('- ')) {
+                    $items = [Collections.Generic.List[object]]::new()
+                    $Index.Value = $nextIndex
+                    while ($Index.Value -lt $Lines.Count) {
+                        $item = $Lines[$Index.Value]
+                        if ($item -match '^\s*(#.*)?$') { $Index.Value++; continue }
+                        $itemLead = $item.Length - $item.TrimStart(' ').Length
+                        if ($itemLead -ne $nextLead -or -not $item.TrimStart().StartsWith('- ')) { break }
+                        $Lines[$Index.Value] = (' ' * ($itemLead + 2)) + $item.Substring($itemLead + 2)
+                        $items.Add((Read-CiYamlMapping -Lines $Lines -Index $Index -Indent ($itemLead + 2)))
+                    }
+                    $map[$key] = $items.ToArray()
+                } else {
+                    $Index.Value = $nextIndex
+                    $map[$key] = Read-CiYamlMapping -Lines $Lines -Index $Index -Indent $nextLead
+                }
+            } else {
+                if ($value -match '^[&*!]|^\{') { throw "Unsupported YAML value at line $($Index.Value): $value" }
+                if ($value -match '^"([^"\\]*)"$|^''([^'']*)''$') { $value = $value.Substring(1, $value.Length - 2) }
+                else { $value = ($value -split '\s+#', 2)[0].TrimEnd() }
+                $map[$key] = $value
+            }
+        }
+        $map
+    }
+    function ConvertTo-CiObject {
+        param($Node)
+        if ($Node -is [Collections.IDictionary]) {
+            $object = [ordered]@{}
+            foreach ($key in $Node.Keys) { $object[$key] = ConvertTo-CiObject $Node[$key] }
+            return [pscustomobject]$object
+        }
+        if ($Node -is [array]) { return , @($Node | ForEach-Object { ConvertTo-CiObject $_ }) }
+        $Node
+    }
+    $ciLines = [string[]]@($script:CiText -split '\r?\n')
+    $script:Ci = ConvertTo-CiObject (Read-CiYamlMapping -Lines $ciLines -Index ([ref]0) -Indent 0)
 }
 
 Describe 'Public workflow contracts' {
@@ -14,7 +93,7 @@ Describe 'Public workflow contracts' {
         $product.visibility | Should -BeExactly 'public'
         $product.status | Should -BeExactly 'release'
         $product.name | Should -BeExactly 'ExchangeLogReport'
-        $product.version | Should -BeExactly '3.0.0'
+        $product.version | Should -BeExactly '3.0.1'
     }
 
     It 'declares the actual package runtime and existing validation paths without inventing required checks' {
@@ -53,6 +132,46 @@ Describe 'Public workflow contracts' {
         $text | Should -Not -Match 'pull_request_target|secrets\.'
     }
 
+    It 'keeps the house YAML format with the single Validate (PowerShell 7) check' {
+        @($script:Ci.PSObject.Properties.Name) | Should -Be @('name', 'on', 'permissions', 'concurrency', 'jobs')
+        $script:Ci.name | Should -BeExactly 'CI'
+        @($script:Ci.on.PSObject.Properties.Name) | Should -Be @('pull_request', 'push', 'workflow_dispatch')
+        $script:Ci.on.pull_request.branches | Should -BeExactly '[main]'
+        $script:Ci.on.push.branches | Should -BeExactly '[main]'
+        $script:Ci.concurrency.group | Should -BeExactly 'ci-${{ github.repository }}-${{ github.ref }}'
+        $script:Ci.concurrency.'cancel-in-progress' | Should -BeExactly 'true'
+        @($script:Ci.jobs.PSObject.Properties.Name) | Should -Be @('validate')
+        $validate = $script:Ci.jobs.validate
+        $validate.'timeout-minutes' | Should -BeExactly '45'
+        $validate.strategy.'fail-fast' | Should -BeExactly 'false'
+        @($validate.strategy.matrix.PSObject.Properties.Name) | Should -Be @('include')
+        # The publication gate reads this exact one-line JSON include and the matrix name template.
+        $script:CiText | Should -Match '(?m)^        include: \[\{"engine":"PowerShell 7","shell":"pwsh"\}\]\r?$'
+        $validate.name | Should -BeExactly 'Validate (${{ matrix.engine }})'
+        $include = @(ConvertFrom-Json -InputObject $validate.strategy.matrix.include -NoEnumerate)
+        $include.Count | Should -Be 1
+        $include[0].engine | Should -BeExactly 'PowerShell 7'
+        $include[0].shell | Should -BeExactly 'pwsh'
+        $validate.name.Replace('${{ matrix.engine }}', $include[0].engine) | Should -BeExactly 'Validate (PowerShell 7)'
+        @($validate.steps | ForEach-Object name) | Should -Be @(
+            'Check out the tested revision without persistent credentials',
+            'Load the exact pinned Pester and PSScriptAnalyzer modules',
+            'Analyze PowerShell sources',
+            'Build and verify the standalone package',
+            'Run collector, Serve, package integrity and workflow tests under the packaged runtime',
+            'Retain only synthetic validation summaries and file hashes')
+        foreach ($step in $validate.steps) {
+            if ($step.PSObject.Properties['run']) { $step.shell | Should -BeExactly 'pwsh' -Because $step.name }
+            else { $step.PSObject.Properties.Name | Should -Not -Contain 'shell' -Because $step.name }
+        }
+        $retain = $validate.steps | Where-Object { $_.PSObject.Properties['uses'] -and $_.uses -like 'actions/upload-artifact@*' }
+        $retain.if | Should -BeExactly '${{ always() }}'
+        $retain.with.'if-no-files-found' | Should -BeExactly 'error'
+        $retain.with.'retention-days' | Should -BeExactly '7'
+        $retain.with.path | Should -BeExactly "artifacts/ci-evidence/module-inventory.json`nartifacts/ci-evidence/validation-summary.json`n"
+        $script:CiText | Should -Not -Match '\t'
+    }
+
     It 'limits CI to the intended public repository with read-only permissions' {
         $script:Ci.permissions.contents | Should -Be 'read'
         @($script:Ci.permissions.PSObject.Properties).Count | Should -Be 1
@@ -60,7 +179,7 @@ Describe 'Public workflow contracts' {
         $script:Ci.jobs.validate.if | Should -Match "github.repository_owner == 'Nico77600'"
         $script:Ci.jobs.validate.if | Should -Match "github.repository == 'Nico77600/ExchangeLogReport'"
         $script:Ci.jobs.validate.if | Should -Match 'github.event.repository.private == false'
-        ($script:Ci.jobs.validate.steps | Where-Object { $_.PSObject.Properties['uses'] -and $_.uses -like 'actions/checkout@*' }).with.'persist-credentials' | Should -BeFalse
+        ($script:Ci.jobs.validate.steps | Where-Object { $_.PSObject.Properties['uses'] -and $_.uses -like 'actions/checkout@*' }).with.'persist-credentials' | Should -BeExactly 'false'
     }
 
     It 'builds the portal from the report template only: no Node.js, npm or Angular step, tool or source' {
@@ -236,14 +355,14 @@ base = {
     "powershell/pwsh.exe": b"synthetic executable placeholder",
     "sqlite-tools/sqlite3.exe": b"synthetic sqlite tool",
     "config/ExchangeLogReport.config.psd1": b"@{Synthetic=$true}",
-    "product.json": json.dumps({"name": "ExchangeLogReport", "version": "3.0.0"}).encode(),
+    "product.json": json.dumps({"name": "ExchangeLogReport", "version": "3.0.1"}).encode(),
 }
 for script in SCRIPTS:
     base[script] = b"# synthetic script" + signature
 MUTABLE = "config/ExchangeLogReport.config.psd1"
 BINARY = ("powershell/", "sqlite-tools/")
 
-def manifest_text(files, *, bad_schema=False, thumbprint="0F28E442889F17B5F4D251E8F96E7CC6E2C9C6D6", version="3.0.0", sign=True, unix_inventory=False, traversal=False):
+def manifest_text(files, *, bad_schema=False, thumbprint="0F28E442889F17B5F4D251E8F96E7CC6E2C9C6D6", version="3.0.1", sign=True, unix_inventory=False, traversal=False):
     lines = ["@{", f"    SchemaVersion = {2 if bad_schema else 1}", "    Algorithm = 'SHA256'",
              f"    SignerThumbprint = '{thumbprint}'", f"    Version = '{version}'"]
     entries = [(name, data) for name, data in files.items() if name != MUTABLE]
@@ -271,7 +390,7 @@ def make_zip(files=None, *, prefix="release/", manifest=True, changed=False, ext
         files["Database-Storage.ps1"] = b"# synthetic script without a signature"
     manifest_bytes = manifest_text(files, bad_schema=bad_schema, sign=not unsigned_manifest, unix_inventory=unix_inventory, traversal=traversal,
                                    thumbprint="0000000000000000000000000000000000000000" if wrong_signer else "0F28E442889F17B5F4D251E8F96E7CC6E2C9C6D6",
-                                   version="3.0.1" if wrong_version else "3.0.0")
+                                   version="3.0.0" if wrong_version else "3.0.1")
     result = io.BytesIO()
     with zipfile.ZipFile(result, "w", zipfile.ZIP_DEFLATED) as archive:
         for name, data in files.items():
@@ -300,7 +419,7 @@ def make_changed():
     result.seek(0)
     return result
 
-assert verify(make_zip(), expected_version="3.0.0")["report_script_bytes"] == len(base[MAIN])
+assert verify(make_zip(), expected_version="3.0.1")["report_script_bytes"] == len(base[MAIN])
 assert verify(make_zip(prefix=""))["verified_files"] == len(base) - 1
 missing_script = {name: data for name, data in base.items() if name != MAIN}
 missing_page = {name: data for name, data in base.items() if name != PAGE}
@@ -318,7 +437,7 @@ cases = [
 ]
 for number, fixture in enumerate(cases):
     try:
-        verify(fixture, expected_version="3.0.0")
+        verify(fixture, expected_version="3.0.1")
     except (SystemExit, ValueError, zipfile.BadZipFile):
         continue
     raise AssertionError(f"Invalid bundle fixture {number} was accepted")

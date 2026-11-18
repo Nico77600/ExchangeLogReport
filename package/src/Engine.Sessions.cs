@@ -2,7 +2,7 @@
 //  Exchange Log Report - engine, part 5: client sessions and back-end correlation
 // -----------------------------------------------------------------------------
 //  Author  : Nicolas Fabert
-//  Version : 3.0.0
+//  Version : 3.0.1
 //
 //  A client session is what one client did for one user on one day, until it
 //  stays idle longer than SessionIdleMinutes. Its key depends on the protocol:

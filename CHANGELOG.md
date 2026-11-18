@@ -3,6 +3,19 @@
 All notable changes are listed here. Versions follow MAJOR.MINOR.PATCH (see the developer guide, Annex C).
 Author: Nicolas Fabert.
 
+## [3.0.1] — 2026-11-17
+
+Documentation only. There is no code change.
+
+### What changed for you
+
+- **Get started and Quick start.** The first collection now runs by hand in the administrator window (`.\Run-Collector.cmd -Mode Collect`): it reads 14 days and shows its progress. The hourly task is created afterwards.
+- **Step 4 of the checklist** also checks the last run result of the scheduled task.
+
+### Upgrade from 3.0.0
+
+Replace the folder with the new one. There is no database or configuration change.
+
 ## [3.0.0] — 2026-11-03
 
 Exchange Log Report now has three ways to read the same collected history: the **Usage** report (unchanged), the **Detailed** report (now with every row, in one file or in a page plus its data folder), and a new **local portal in the browser** that shows client sessions, messages, routes and SMTP conversations on demand, without building a report first. The package is a complete Windows x64 folder with its own PowerShell: nothing to install.

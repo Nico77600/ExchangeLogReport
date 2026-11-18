@@ -3,9 +3,9 @@
 A modern Log Parser for Exchange Server SE on-premises that reads IIS, HTTP Proxy, MAPI, ActiveSync, POP/IMAP, SMTP and tracking logs, removes noise before storage and reports real usage and troubleshooting details: a Usage report, a Detailed report, and a local read-only portal.
 
 **Author:** Nicolas Fabert  
-**Version:** 3.0.0
+**Version:** 3.0.1
 
-This folder is the complete Windows x64 package (`ExchangeLogReport-3.0.0-win-x64.zip`): the launchers, the scripts, the C# engine, the configuration, the report template (also the page of the portal), the SQLite library, the guides and its own PowerShell 7. Nothing else is installed. Tests and build tools stay outside it, in the repository.
+This folder is the complete Windows x64 package (`ExchangeLogReport-3.0.1-win-x64.zip`): the launchers, the scripts, the C# engine, the configuration, the report template (also the page of the portal), the SQLite library, the guides and its own PowerShell 7. Nothing else is installed. Tests and build tools stay outside it, in the repository.
 
 > [!IMPORTANT]
 > Windows marks files downloaded from the Internet. Once the ZIP is extracted (Quick start below), check the publisher first (right-click a `.ps1`, for example `Invoke-ExchangeLogReport.ps1`, Properties, Digital Signatures: `Nicolas Fabert`), then unblock this folder once, from Windows PowerShell opened in it:
@@ -29,17 +29,22 @@ Extract the whole ZIP into a writable, access-restricted local folder, for examp
 
 | You want to | Run | You get |
 |---|---|---|
-| Set up once | `Run-Collector.cmd -Mode Discover`, then the hourly collection task below (its first run reads 14 days), then `Run-Collector.cmd -Mode Status` | the log folders of every server, the first 14 days of history, a status line per server |
+| Set up once | `Run-Collector.cmd -Mode Discover`, then `Run-Collector.cmd -Mode Collect` by hand (the first collection reads 14 days), then the hourly collection task below, then `Run-Collector.cmd -Mode Status` | the log folders of every server, the first 14 days of history, a status line per server |
 | **Usage report** | `Run-Collector.cmd -Range Last30Days` (a report is the default mode, Usage the default type) | `reports\ExchangeLogs_Usage_<period>_<time>\ExchangeLogs.html` + CSV files |
 | **Detailed report** | `Run-Collector.cmd -ReportType Detailed -Range Last24Hours` | `reports\ExchangeLogs_Detailed_<period>_<time>\ExchangeLogs.html`; above 200 MB of data, also an `ExchangeLogs_data` folder that must stay next to the page |
 | **The portal** (Serve mode) | `Start-Portal.cmd` | the Detailed report page opens in your browser on `http://127.0.0.1:<port>`, on the newest collected day, with the day bar under the tiles; stop it with **Stop portal** or Ctrl+C |
 | Database maintenance (rare) | `Database-Storage.cmd` | the three usual commands; a read-only audit, or a **new** compacted or migrated copy |
 
-Edit `config\ExchangeLogReport.config.psd1` first: one `@{ Name = 'EXCH01' }` line per server in `Servers`. Schedule the hourly collection (the first run reads 14 days of logs):
+Edit `config\ExchangeLogReport.config.psd1` first: one `@{ Name = 'EXCH01' }` line per server in `Servers`. Run the first collection by hand in the administrator window; it reads the last 14 days of logs and shows its progress:
+
+```bat
+Run-Collector.cmd -Mode Collect
+```
+
+Then schedule the hourly collection:
 
 ```bat
 schtasks /Create /F /RU SYSTEM /RL HIGHEST /TN "Exchange Log Report - collect" /SC HOURLY /TR "E:\Tools\ExchangeLogReport\Run-Collector.cmd -Mode Collect"
-schtasks /Run /TN "Exchange Log Report - collect"
 ```
 
 Always start the tool through `Run-Collector.cmd`, by hand and in the scheduled tasks: it checks the package, then starts the PowerShell inside it with the right settings. Large first collections need several GB of memory.
@@ -77,12 +82,12 @@ What you get, and what to do:
 
 - [User guide](docs/ExchangeLogReport-UserGuide.html) - the guided path, step by step; the portal; the database maintenance
 - [Developer guide](docs/ExchangeLogReport-Guide.html) - the principles, configuration, correlation rules, data model, the portal, troubleshooting
-- [Change log](CHANGELOG.md) - what changed, with the upgrade steps from 2.1.1
-- [Security policy](SECURITY.md)
+- Change log: `CHANGELOG.md` in this folder - what changed, with the upgrade steps from 2.1.1
+- Security policy: `SECURITY.md` in this folder
 
 Project page and releases: https://github.com/Nico77600/ExchangeLogReport
 
-License: [MIT](LICENSE). Third-party components: [THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md).
+License: MIT (`LICENSE` in this folder). Third-party components: [THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md).
 
 ## Data handling
 

@@ -1,6 +1,6 @@
 {
   "name": "ExchangeLogReport",
-  "version": "3.0.0",
+  "version": "3.0.1",
   "visibility": "public",
   "status": "release",
   "runtimeIdentifier": "win-x64",

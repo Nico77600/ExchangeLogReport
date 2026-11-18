@@ -2,7 +2,7 @@
 //  Exchange Log Report - engine, part 7: sending the report by e-mail (SMTP)
 // -----------------------------------------------------------------------------
 //  Author  : Nicolas Fabert
-//  Version : 3.0.0
+//  Version : 3.0.1
 //
 //  A small SMTP client (RFC 5321) written for the tool, so that every option is
 //  explicit and checked:
