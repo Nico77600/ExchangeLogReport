@@ -2,7 +2,7 @@
 //  Exchange Log Report - engine, part 6: collection pipeline
 // -----------------------------------------------------------------------------
 //  Author  : Nicolas Fabert
-//  Version : 3.0.1
+//  Version : 3.1.0
 //
 //  1. Plan    the folders of every server and source are listed in parallel; a file
 //             is read when it is new (modified within BackfillDays) or has grown.

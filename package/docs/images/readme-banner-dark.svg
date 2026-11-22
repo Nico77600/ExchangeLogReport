@@ -19,7 +19,7 @@
     <text x="55" y="252" fill="#d1d1d1" font-size="23">Message routes, client timelines and SMTP evidence</text>
     <text x="55" y="286" fill="#d1d1d1" font-size="23">from a local SQLite history, read on demand.</text>
     <rect x="55" y="335" width="212" height="48" rx="24" fill="#ff89a5"/>
-    <text x="161" y="365" text-anchor="middle" fill="#242424" font-size="19" font-weight="600">3.0.1 release</text>
+    <text x="161" y="365" text-anchor="middle" fill="#242424" font-size="19" font-weight="600">3.1.0 release</text>
     <rect x="280" y="335" width="175" height="48" rx="24" fill="#262626" stroke="#535353"/>
     <text x="368" y="365" text-anchor="middle" fill="#d1d1d1" font-size="19">Local portal</text>
     <rect x="468" y="335" width="205" height="48" rx="24" fill="#262626" stroke="#535353"/>

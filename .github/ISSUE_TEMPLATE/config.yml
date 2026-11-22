@@ -1,0 +1,8 @@
+blank_issues_enabled: true
+contact_links:
+  - name: Report a security vulnerability (private)
+    url: https://github.com/Nico77600/ExchangeLogReport/security/advisories/new
+    about: Do not open a public issue for a vulnerability. Open the Security tab, then Report a vulnerability, to write to the maintainer privately.
+  - name: Contributing guide
+    url: https://github.com/Nico77600/ExchangeLogReport/blob/main/CONTRIBUTING.md
+    about: How bug reports, suggestions and pull requests are handled by this single-maintainer project.

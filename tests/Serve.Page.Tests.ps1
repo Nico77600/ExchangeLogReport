@@ -43,7 +43,7 @@ BeforeAll {
     [IO.File]::AppendAllText($ews.FullName, $(if ($text.EndsWith("`n")) { '' } else { "`r`n" }) + ($lines -join "`r`n") + "`r`n")
     $collect = Open-ExlStore -Settings $script:Settings
     try {
-        $run = $collect.StartRun('Collect', 'SYNTHETIC', 'SYNTHETIC', '3.0.1')
+        $run = $collect.StartRun('Collect', 'SYNTHETIC', 'SYNTHETIC', '3.1.0')
         $collection = Invoke-ExlCollection -Store $collect -Settings $script:Settings -RunId $run
         $collect.EndRun($run, 'Completed', $collection.Files, $collection.Bytes, $collection.Lines, $collection.Kept, $collection.Noise, $null)
     } finally { $collect.Dispose() }
@@ -79,7 +79,7 @@ BeforeAll {
     [IO.File]::AppendAllText($tracking.FullName, $(if ($trackingText.EndsWith("`n")) { '' } else { "`r`n" }) + ($externalLines -join "`r`n") + "`r`n")
     $collect = Open-ExlStore -Settings $script:Settings
     try {
-        $run = $collect.StartRun('Collect', 'SYNTHETIC', 'SYNTHETIC', '3.0.1')
+        $run = $collect.StartRun('Collect', 'SYNTHETIC', 'SYNTHETIC', '3.1.0')
         $collection = Invoke-ExlCollection -Store $collect -Settings $script:Settings -RunId $run
         $collect.EndRun($run, 'Completed', $collection.Files, $collection.Bytes, $collection.Lines, $collection.Kept, $collection.Noise, $null)
     } finally { $collect.Dispose() }
@@ -584,6 +584,36 @@ Describe 'The portal page in a browser' -Tag Browser -Skip:$script:NoEdge {
         @($requests | Where-Object { $_ -match '/api/' -or $_ -match '^https?:' }).Count | Should -Be 0
         (Invoke-ExlJs $script:Edge '!!window.__exlPortal || !!document.getElementById("day-bar")') | Should -BeFalse
         (Invoke-ExlJs $script:Edge '[...document.querySelectorAll("#tabs button")].some(b => b.firstChild.textContent === "Authentication")') | Should -BeTrue
+    }
+
+    It 'opens a static report from disk under its Content-Security-Policy in both layouts, and does not run a script that the report did not write' -ForEach @('SingleFile', 'Folder') {
+        $q = [ExchangeLogReport.ReportRequest]::new()
+        $q.EndMs = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds(); $q.StartMs = $q.EndMs - 3 * 86400000
+        $q.Detailed = $true; $q.WriteHtml = $true; $q.WriteCsv = $false; $q.MemoryBudgetMB = 64; $q.Parallelism = 1; $q.HtmlLayout = $_
+        $q.ConfiguredServers = [string[]]@($script:Settings.Servers.Name); $q.Zone = $script:Settings.Zone; $q.TimeZoneName = $script:Settings.Report.TimeZone
+        $q.TemplatePath = Join-Path $script:Root 'templates\Report.template.html'
+        $q.OutputFolder = Join-Path $script:Work "csp-report-$_"
+        $store = Open-ExlStore -Settings $script:Settings -ReadOnly
+        try { $report = [ExchangeLogReport.ReportBuilder]::Build($store, $q) } finally { $store.Dispose() }
+        [void](Invoke-ExlCdp $script:Edge 'Log.enable')
+        $violations = { @($script:Edge.Events | Where-Object { $_.method -eq 'Log.entryAdded' -and $_.params.entry.text -match 'Content Security Policy' }) }
+        $script:Edge.Events.Clear()
+        Open-ExlPage $script:Edge ([Uri]::new($report.HtmlPath).AbsoluteUri)
+        Wait-ExlJs $script:Edge 'window.__exlStats && __exlStats.seq > 0' 60 | Should -BeTrue
+        (Invoke-ExlJs $script:Edge 'document.querySelector("meta[http-equiv=Content-Security-Policy]").content') | Should -Match "^default-src 'none'; script-src 'nonce-[^']+' 'strict-dynamic'"
+        [int](Invoke-ExlJs $script:Edge 'document.querySelectorAll("#viewport .grid-row").length') | Should -BeGreaterThan 0
+        [int](Invoke-ExlJs $script:Edge 'document.querySelectorAll("#cards > *").length') | Should -BeGreaterThan 0
+        @(& $violations).Count | Should -Be 0
+        # The same page with a script and an event handler added by hand: neither runs.
+        $copy = Join-Path (Split-Path $report.HtmlPath -Parent) 'injected.html'
+        [IO.File]::WriteAllText($copy, [IO.File]::ReadAllText($report.HtmlPath).Replace('</body>', '<script>window.__injected = 1</script><img src="x" onerror="window.__injected2 = 1"></body>'))
+        $script:Edge.Events.Clear()
+        Open-ExlPage $script:Edge ([Uri]::new($copy).AbsoluteUri)
+        Wait-ExlJs $script:Edge 'window.__exlStats && __exlStats.seq > 0' 60 | Should -BeTrue
+        Start-Sleep -Milliseconds 500
+        (Invoke-ExlJs $script:Edge 'typeof window.__injected + "," + typeof window.__injected2') | Should -BeExactly 'undefined,undefined'
+        @(& $violations).Count | Should -BeGreaterThan 0
+        Remove-Item -LiteralPath $copy -Force
     }
 
     It 'stops the portal from its page, and the database is unchanged' {

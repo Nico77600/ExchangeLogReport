@@ -8,7 +8,7 @@
 #
 @{
     RootModule        = 'ExchangeLogReport.psm1'
-    ModuleVersion     = '3.0.1'
+    ModuleVersion     = '3.1.0'
     GUID              = '7b1cdb50-cb32-4c85-8c8d-9d7a7c8eec14'
     Author            = 'Nicolas Fabert'
     Description       = 'Exchange Log Report: collects the IIS / HTTP Proxy, SMTP protocol and message tracking logs of Exchange Server SE (on-premises) into a local SQLite database, without the noise of system mailboxes and probes, and produces usage and troubleshooting reports (CSV and HTML), sent by e-mail on request.'
@@ -16,8 +16,8 @@
 
     # Functions called by Invoke-ExchangeLogReport.ps1 and by the tests. The other functions stay internal.
     FunctionsToExport = @(
-        'Import-ExlConfiguration', 'Initialize-ExlEngine', 'Open-ExlStore', 'Enter-ExlLock', 'Exit-ExlLock', 'Start-ExlServe'
-        'Start-ExlLog', 'Stop-ExlLog', 'Write-ExlLog'
+        'Import-ExlConfiguration', 'Initialize-ExlEngine', 'Open-ExlStore', 'Resolve-ExlFailureMessage', 'Enter-ExlLock', 'Exit-ExlLock', 'Start-ExlServe'
+        'Start-ExlLog', 'Stop-ExlLog', 'Write-ExlLog', 'ConvertTo-ExlSafeText', 'Test-ExlPackageFolderSecurity', 'Write-ExlEvent', 'Set-ExlEventLog', 'Invoke-ExlReportRetention'
         'Write-ExlBanner', 'Write-ExlStep', 'Write-ExlItem', 'Write-ExlDetail', 'Write-ExlSummary'
         'Format-ExlNumber', 'Format-ExlDuration', 'Format-ExlBytes', 'Format-ExlRange', 'Format-ExlLocalTime'
         'Get-ExlTimeZone', 'Resolve-ExlRange', 'Resolve-ExlPeriod', 'Resolve-ExlReportCollection', 'Get-ExlIgnoredParameter', 'Get-ExlSources', 'Test-ExlServerAccess', 'Get-ExlPathOrigin', 'Test-ExlIisSites', 'Resolve-ExlServerRole'
@@ -29,8 +29,8 @@
 # SIG # Begin signature block
 # MIImKQYJKoZIhvcNAQcCoIImGjCCJhYCAQExDzANBglghkgBZQMEAgEFADB5Bgor
 # BgEEAYI3AgEEoGswaTA0BgorBgEEAYI3AgEeMCYCAwEAAAQQH8w7YFlLCE63JNLG
-# KX7zUQIBAAIBAAIBAAIBAAIBADAxMA0GCWCGSAFlAwQCAQUABCB603vru2S/bE7x
-# GO22be0GmGDNstyDjIKX0V9zD4KtfqCCDW8wggZyMIIEWqADAgECAghkM1HTxzif
+# KX7zUQIBAAIBAAIBAAIBAAIBADAxMA0GCWCGSAFlAwQCAQUABCAPSBXkWe+C4miL
+# TxfLmv2Ye5zMnPRQxp1zUIxPAuhPeaCCDW8wggZyMIIEWqADAgECAghkM1HTxzif
 # CDANBgkqhkiG9w0BAQsFADB8MQswCQYDVQQGEwJVUzEOMAwGA1UECAwFVGV4YXMx
 # EDAOBgNVBAcMB0hvdXN0b24xGDAWBgNVBAoMD1NTTCBDb3Jwb3JhdGlvbjExMC8G
 # A1UEAwwoU1NMLmNvbSBSb290IENlcnRpZmljYXRpb24gQXV0aG9yaXR5IFJTQTAe
@@ -107,23 +107,23 @@
 # A1UEAwwrU1NMLmNvbSBDb2RlIFNpZ25pbmcgSW50ZXJtZWRpYXRlIENBIFJTQSBS
 # MQIQBof4ljXihJpmCqqt2mhAWzANBglghkgBZQMEAgEFAKCBhDAYBgorBgEEAYI3
 # AgEMMQowCKACgAChAoAAMBkGCSqGSIb3DQEJAzEMBgorBgEEAYI3AgEEMBwGCisG
-# AQQBgjcCAQsxDjAMBgorBgEEAYI3AgEVMC8GCSqGSIb3DQEJBDEiBCBmO4K6jaOQ
-# mq6tnA+smNoNtqalpDdGb4WCRMiHpomSaTANBgkqhkiG9w0BAQEFAASCAgCFm63/
-# +TsFZztVDGVkfa/NQG5VWQbIemKchMQ+88xN02lfK9mj7lbNNX4zviqQNa3W605t
-# Eo3qvFtg5S8OQw6aT30IxrVLX9baVKbjCWPqB9ht4ZvoxJTdVNds4V2CN7rMwRbm
-# 0u7GkNkjcoWTBwlLFHWSox1upV7n/lGvl6I5VoxJy3VkUPc5F8t8sBUnhLKd+QMC
-# uhJW16edjd05IRJQSXSZWSlQ3nys8T1WUf7HPrObOOyCLQWDff6vPFNbRCvX1Dzc
-# zF8fJ+85PgFFt7myU2U8F16LJ8NC0Bv0wT6T6zvrujXsvtBHn09RWhUMlNBMgHGT
-# huUJ4RCp4Ij5ZZkGi9Ws2C9uQcpllzXpTRoCq0TmDHl6aTFPdl/4BFxytHumU4h/
-# 00GS7DuXLbKNi4zV84SPjS75wRLxH0IZKyKBb6YH0UMjryotgZDjCKCUGb8eInyA
-# FhBHQLU1FwcRBpdn5Sm+L4F5C8RM6yuGy40lUM5hqZcHbpxQ2aglAyMLKNBOEZ5x
-# Dk4i8gUt06LFaOBjmwB9sedo2jD7XTJak4fEqQSO1uSArxE0pkoGinDejVWQwddZ
-# ZVfjmtxZpRXzFcIZ7yyfCAUXdJ9BfTjq+Neqb5a6OrkRz2/ao3ehBew7DkOqC8cG
-# rLAbsdcOgFmqIN3EFE1ZA91h3BCrdDjZzLAdrKGCFM0wghTJBgorBgEEAYI3AwMB
+# AQQBgjcCAQsxDjAMBgorBgEEAYI3AgEVMC8GCSqGSIb3DQEJBDEiBCAJBM4A1Ahj
+# JhkKk5Shc8oBcpxKiZs0K5tz4iHhJVPS2DANBgkqhkiG9w0BAQEFAASCAgAUglzN
+# Jrv4Uy159A1ZJNDJKZp1GbpcnqZrWV9DqVksQ0FgnM9yTB4VJUZ6KD2wMRldm+1w
+# N9NLoSX5VfGOdyLayc6y2XAM0zpcjiu12hgBZdhCYwS0B6dkgUp90RvfQH2x+DGE
+# lR5PvaKsL5G2OhzGfUajAEWp8S7x9d/Rci0Uig5MkJe+mkj9vEwL0w4myoWyFQvt
+# 52KXP/9Yip2zmAZdUB5+QqkAuPIOgXtEhPn7fr+ZRiaAmWAtHAzyHrwFXVAvbXLN
+# KDBwHe7EvnvHnxUA2IAm6zBu73iACyEe6jRESjr87r0APC1SSmv81HIV4FMztM+w
+# qjdAqkYqTf5DmBpmUHYwOhh4VG+HfS75GBbRBrIOaXtw3A9stkeEMs6eytdBabRR
+# i7mn0icOssZDjM27uW0zT7lK+97gtxUqVfvVvTj85vv/vUVTz6Vz63OWnt6+Ntj8
+# hfpMy2g0/EizgbM+KW3PVCaUp6h8lFeDUFkzD9QjYYp04mE+jMnCsfinrP8pE38X
+# oLaTv1oAEOXT/87FLGw/KeOHlFHJwJ2dxA3sNy3vJJl/6RCwcuTYJdON0dqqGLRI
+# ird0yHulC4hDHfVnjw+2qvK8UwmgyEldckIPbveH11HTp24iZpKa7/PiwLuQk6sd
+# wph8hFwelnmuG9rj4MI1ZRNHtdvwf8xacjD8oaGCFM0wghTJBgorBgEEAYI3AwMB
 # MYIUuTCCFLUGCSqGSIb3DQEHAqCCFKYwghSiAgEDMQ0wCwYJYIZIAWUDBAIBMIGJ
 # BgsqhkiG9w0BCRABBKB6BHgwdgIBAQYMKwYBBAGCqTABAwYBMDEwDQYJYIZIAWUD
-# BAIBBQAEILgfAdVVANs2n6pe2IblPab9OCZRxcPhM+DC01XpyepyAghUIGYfwgWC
-# JBgPMjAyNjExMTcyMTA0NTJaMAMCAQECEDNMvA4UM1fYrM0wETbK9ZegghGnMIIE
+# BAIBBQAEIDULHbzWUrG/Cz0WV/Nxq5OqPdg/+IsbMHlBO/dRiqeoAgh3lC8+Yf53
+# NhgPMjAyNjExMjIxMTA5MTJaMAMCAQECEH3t+5VrKgJc8ejdJlRPVhmgghGnMIIE
 # 8zCCAtugAwIBAgIQVEP4N71a7hgBhHK4XNqO4zANBgkqhkiG9w0BAQsFADByMQsw
 # CQYDVQQGEwJVUzEOMAwGA1UECAwFVGV4YXMxEDAOBgNVBAcMB0hvdXN0b24xETAP
 # BgNVBAoMCFNTTCBDb3JwMS4wLAYDVQQDDCVTU0wuY29tIFRpbWVzdGFtcGluZyBJ
@@ -222,13 +222,13 @@
 # czEQMA4GA1UEBwwHSG91c3RvbjERMA8GA1UECgwIU1NMIENvcnAxLjAsBgNVBAMM
 # JVNTTC5jb20gVGltZXN0YW1waW5nIElzc3VpbmcgUlNBIENBIDICEFRD+De9Wu4Y
 # AYRyuFzajuMwCwYJYIZIAWUDBAIBoIIBYDAaBgkqhkiG9w0BCQMxDQYLKoZIhvcN
-# AQkQAQQwHAYJKoZIhvcNAQkFMQ8XDTI2MTExNzIxMDQ1MlowKAYJKoZIhvcNAQk0
-# MRswGTALBglghkgBZQMEAgGhCgYIKoZIzj0EAwIwLwYJKoZIhvcNAQkEMSIEIG6M
-# +glB1JW5i+hnbovA+pYY0J63J31PXPHbqLHHi2btMIHIBgsqhkiG9w0BCRACLzGB
+# AQkQAQQwHAYJKoZIhvcNAQkFMQ8XDTI2MTEyMjExMDkxMlowKAYJKoZIhvcNAQk0
+# MRswGTALBglghkgBZQMEAgGhCgYIKoZIzj0EAwIwLwYJKoZIhvcNAQkEMSIEIGmr
+# 7Endusit5qiz++s8/H63DGV1RHx5NjMVZEkSId2bMIHIBgsqhkiG9w0BCRACLzGB
 # uDCBtTCBsjCBrwQgV0/qF6r6XnxqK5sIyZixc15FCzhzykTmokygkw5j87AwgYow
 # dqR0MHIxCzAJBgNVBAYTAlVTMQ4wDAYDVQQIDAVUZXhhczEQMA4GA1UEBwwHSG91
 # c3RvbjERMA8GA1UECgwIU1NMIENvcnAxLjAsBgNVBAMMJVNTTC5jb20gVGltZXN0
 # YW1waW5nIElzc3VpbmcgUlNBIENBIDICEFRD+De9Wu4YAYRyuFzajuMwCgYIKoZI
-# zj0EAwIERjBEAiAzRY4nqVLdTTF/nILS+PE0SeuIMSvRuQA5iKnhLAJY7gIgI7m8
-# BwH3WyvaGJ9P8VdpMmLcYYhorXi3IM/Ce7asWxc=
+# zj0EAwIERjBEAiB0pd6uaK22SGqqtMt5Vp/O9sX5gsymdI2IJU2SgXFm/QIgDPcs
+# GgFVIhvIfj7k9GVOz7rSoBPx3QJs0auSn4op8Co=
 # SIG # End signature block

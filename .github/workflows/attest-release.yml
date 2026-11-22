@@ -18,7 +18,141 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  # Read-only job, no secret and no signing or attestation right. It is the only job that runs repository code: the comparison script of this
+  # workflow's own commit, which reads the tag (checked out as data) and the downloaded ZIPs. The attest job needs it and re-checks the bytes
+  # and the commit that it compared.
+  compare:
+    if: >-
+      github.repository_owner == 'Nico77600' &&
+      github.repository == 'Nico77600/ExchangeLogReport' &&
+      github.event.repository.private == false &&
+      (
+        (github.event_name == 'release' && github.event.action == 'published' && github.event.release.draft == false) ||
+        (github.event_name == 'workflow_dispatch' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch))
+      )
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    outputs:
+      commit: ${{ steps.compare.outputs.commit }}
+      zips: ${{ steps.compare.outputs.zips }}
+    steps:
+      - name: Check the release tag
+        shell: bash
+        env:
+          RELEASE_TAG: ${{ github.event.release.tag_name || inputs.tag }}
+        run: |
+          set -euo pipefail
+          if ! printf '%s' "$RELEASE_TAG" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$'; then
+            echo "An explicit v-prefixed semantic version release tag is required" >&2
+            exit 1
+          fi
+
+      - name: Check out the comparison script of this workflow's commit
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ github.sha }}
+          path: workflow-source
+          sparse-checkout: .github/scripts/compare_release_source.py
+          sparse-checkout-cone-mode: false
+          persist-credentials: false
+
+      - name: Check out the release tag as data
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: refs/tags/${{ github.event.release.tag_name || inputs.tag }}
+          path: tagged-source
+          persist-credentials: false
+
+      - name: Download the distributed ZIPs
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_HOST: github.com
+          RELEASE_TAG: ${{ github.event.release.tag_name || inputs.tag }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import hashlib
+          import json
+          import os
+          from pathlib import Path
+          import re
+          import subprocess
+          import time
+          from urllib.parse import quote
+
+          def fail(message):
+              raise SystemExit(message)
+
+          def api(endpoint, *, paginate=False, output=None):
+              command = ["gh", "api", "--hostname", "github.com", "--method", "GET", "-H", "X-GitHub-Api-Version: 2022-11-28",
+                         "-H", "Accept: application/octet-stream" if output is not None else "Accept: application/vnd.github+json"]
+              if paginate:
+                  command.extend(["--paginate", "--slurp"])
+              command.append(endpoint)
+              for attempt in range(4):
+                  if output is not None:
+                      output.seek(0)
+                      output.truncate()
+                  result = subprocess.run(command, stdout=output if output is not None else subprocess.PIPE)
+                  if result.returncode == 0:
+                      return None if output is not None else json.loads(result.stdout)
+                  time.sleep(5 * 2 ** attempt)
+              fail("The GitHub API did not answer after four attempts: " + endpoint)
+
+          tag = os.environ["RELEASE_TAG"]
+          base = f"repos/{os.environ['GITHUB_REPOSITORY']}"
+          metadata = api(f"{base}/releases/tags/{quote(tag, safe='')}")
+          if metadata.get("tag_name") != tag or metadata.get("draft") is not False:
+              fail("The release must be published and match the exact tag")
+          pages = api(f"{base}/releases/{metadata['id']}/assets?per_page=100", paginate=True)
+          assets = [asset for page in pages for asset in page if asset["name"].lower().endswith(".zip")]
+          if not assets:
+              fail("The release has no distributed ZIP assets")
+          Path("dist").mkdir()
+          compared = {}
+          for asset in assets:
+              if asset.get("state") != "uploaded":
+                  fail("A ZIP asset is not fully uploaded")
+              target = Path("dist") / f"{asset['id']}.zip"
+              with target.open("w+b") as output:
+                  api(f"{base}/releases/assets/{asset['id']}", output=output)
+              digest = hashlib.sha256(target.read_bytes()).hexdigest()
+              if target.stat().st_size != asset["size"] or (asset.get("digest") and asset["digest"].lower() != f"sha256:{digest}"):
+                  fail(f"Size or SHA-256 mismatch for ZIP asset {asset['id']}")
+              compared[asset["name"]] = digest
+          Path("compared-zips.json").write_text(json.dumps(compared, sort_keys=True), encoding="utf-8")
+          PY
+
+      - name: Compare the ZIPs with the tagged source and the pinned binaries
+        id: compare
+        shell: bash
+        env:
+          RELEASE_TAG: ${{ github.event.release.tag_name || inputs.tag }}
+        run: |
+          set -euo pipefail
+          for archive in dist/*.zip; do
+            python3 workflow-source/.github/scripts/compare_release_source.py --zip "$archive" --source tagged-source --tag "$RELEASE_TAG"
+          done
+          echo "commit=$(git -C tagged-source rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+          echo "zips=$(python3 -c 'import json; print(json.dumps(json.load(open("compared-zips.json")), sort_keys=True))')" >> "$GITHUB_OUTPUT"
+
+      - name: Say what a failure means
+        if: ${{ failure() }}
+        shell: bash
+        run: |
+          {
+            echo '### The release is published but NOT attested'
+            echo
+            echo 'The comparison of the release ZIP with the tagged source and the pinned binaries failed or could not run, so nothing was attested.'
+            echo 'If a step could not reach GitHub, re-run this workflow, or run it manually from the default branch with the exact tag.'
+            echo 'If the comparison names a difference, treat the release as suspect: do not announce it, investigate, and publish a corrected version (published assets cannot change).'
+          } >> "$GITHUB_STEP_SUMMARY"
+
   attest:
+    needs: compare
     if: >-
       github.repository_owner == 'Nico77600' &&
       github.repository == 'Nico77600/ExchangeLogReport' &&
@@ -35,6 +169,7 @@ jobs:
       attestations: write
     steps:
       - name: Download actual distributed ZIPs and verify their signed inventory
+        id: verify
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
@@ -43,6 +178,8 @@ jobs:
           EXPECTED_RELEASE_ID: ${{ github.event.release.id }}
           EVENT_ACTION: ${{ github.event.action }}
           DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          COMPARED_COMMIT: ${{ needs.compare.outputs.commit }}
+          COMPARED_ZIPS: ${{ needs.compare.outputs.zips }}
         run: |
           set -euo pipefail
           python3 - <<'PY'
@@ -261,7 +398,7 @@ jobs:
                   fail("Release ID does not match the published event")
               return release_id
 
-          def zip_assets(release_id):
+          def release_assets(release_id):
               pages = api(f"{base}/releases/{release_id}/assets?per_page=100", paginate=True)
               if not isinstance(pages, list) or any(not isinstance(page, list) for page in pages):
                   fail("Invalid paginated release asset response")
@@ -269,6 +406,7 @@ jobs:
               if not assets:
                   fail("The release has no distributed assets; no source archive fallback")
               selected = {}
+              sboms = {}
               seen = set()
               for asset in assets:
                   if not isinstance(asset, dict) or not isinstance(asset.get("name"), str):
@@ -277,25 +415,36 @@ jobs:
                   if asset_id in seen:
                       fail("Duplicate release asset ID")
                   seen.add(asset_id)
-                  if not asset["name"].lower().endswith(".zip"):
+                  name = asset["name"]
+                  is_zip = name.lower().endswith(".zip")
+                  is_sbom = name.lower().endswith(".zip.spdx.json")
+                  if not is_zip and not is_sbom:
                       continue
+                  if is_sbom and not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,200}\.zip\.spdx\.json", name):
+                      fail("Unsafe SBOM asset name")
                   if asset.get("state") != "uploaded":
-                      fail("A ZIP asset is not fully uploaded")
-                  size = positive_integer(asset.get("size"), "ZIP asset size")
+                      fail("A ZIP or SBOM asset is not fully uploaded")
+                  size = positive_integer(asset.get("size"), "asset size")
+                  if is_sbom and size > 16 * 1024 * 1024:
+                      fail("The SBOM asset exceeds the reviewed size")
                   digest = asset.get("digest")
                   if digest is not None and (
                       not isinstance(digest, str) or not re.fullmatch(r"sha256:[0-9a-fA-F]{64}", digest)
                   ):
-                      fail("Invalid or unsupported ZIP asset digest")
-                  selected[asset_id] = (asset["name"], size, digest.lower() if digest else None)
+                      fail("Invalid or unsupported asset digest")
+                  (sboms if is_sbom else selected)[asset_id] = (name, size, digest.lower() if digest else None)
               if not selected:
                   fail("The release has no distributed ZIP assets")
-              if len(selected) > 1024:
+              if len(selected) + len(sboms) > 1024:
                   fail("The release exceeds the attestation action's 1024-subject limit")
-              return selected
+              zip_names = {name for name, _, _ in selected.values()}
+              if any(name[:-len(".spdx.json")] not in zip_names for name, _, _ in sboms.values()):
+                  fail("An SBOM asset has no matching ZIP asset on the release")
+              return selected, sboms
 
           release_id = release()
-          assets = zip_assets(release_id)
+          assets, sbom_assets = release_assets(release_id)
+          zip_digests = {}
           Path("dist").mkdir()
           for asset_id, (name, expected_size, expected_digest) in sorted(assets.items()):
               target = Path("dist") / f"{asset_id}.zip"
@@ -312,6 +461,7 @@ jobs:
                   if expected_digest is not None and digest != expected_digest:
                       fail(f"SHA-256 mismatch for ZIP asset {asset_id}")
                   bundle = verify_bundle(target, expected_version=tag[1:])
+                  zip_digests[name] = digest[len("sha256:"):]
                   print(json.dumps({
                       "asset_id": asset_id, "release_name": name, "subject": str(target),
                       "size": expected_size, "digest": digest,
@@ -321,10 +471,57 @@ jobs:
               except BaseException:
                   target.unlink(missing_ok=True)
                   raise
-          if release() != release_id or zip_assets(release_id) != assets:
-              fail("Release ZIP assets changed during download; do not attest an unstable release")
+          # The SBOM of a ZIP is a subject too when the release carries it: SPDX 2.3 only, bound to the ZIP bytes it describes.
+          Path("dist-sbom").mkdir()
+          for asset_id, (name, expected_size, expected_digest) in sorted(sbom_assets.items()):
+              target = Path("dist-sbom") / name
+              try:
+                  with target.open("xb") as output:
+                      api(f"{base}/releases/assets/{asset_id}", output=output)
+                  if target.stat().st_size != expected_size:
+                      fail(f"Size mismatch for SBOM asset {asset_id}")
+                  hasher = hashlib.sha256()
+                  with target.open("rb") as stream:
+                      for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+                          hasher.update(chunk)
+                  digest = f"sha256:{hasher.hexdigest()}"
+                  if expected_digest is not None and digest != expected_digest:
+                      fail(f"SHA-256 mismatch for SBOM asset {asset_id}")
+                  document = json.loads(target.read_text(encoding="utf-8"))
+                  if not isinstance(document, dict) or document.get("spdxVersion") != "SPDX-2.3" or document.get("SPDXID") != "SPDXRef-DOCUMENT":
+                      fail("The SBOM asset is not an SPDX 2.3 document")
+                  described = [
+                      relationship.get("relatedSpdxElement") for relationship in document.get("relationships", [])
+                      if isinstance(relationship, dict) and relationship.get("relationshipType") == "DESCRIBES"
+                      and relationship.get("spdxElementId") == "SPDXRef-DOCUMENT"
+                  ]
+                  roots = [package for package in document.get("packages", []) if isinstance(package, dict) and package.get("SPDXID") in described]
+                  if len(described) != 1 or len(roots) != 1:
+                      fail("The SBOM must describe exactly one package")
+                  checksums = {item.get("checksumValue", "").lower() for item in roots[0].get("checksums", []) if item.get("algorithm") == "SHA256"}
+                  if zip_digests.get(name[:-len(".spdx.json")]) not in checksums or roots[0].get("versionInfo") != tag[1:]:
+                      fail("The SBOM does not describe the ZIP bytes and version of this release")
+                  print(json.dumps({"asset_id": asset_id, "release_name": name, "subject": str(target), "size": expected_size, "digest": digest,
+                                    "github_digest_verified": expected_digest is not None, "spdx_packages": len(document["packages"])}, ensure_ascii=True))
+              except BaseException:
+                  target.unlink(missing_ok=True)
+                  raise
+          if release() != release_id or release_assets(release_id) != (assets, sbom_assets):
+              fail("Release ZIP or SBOM assets changed during download; do not attest an unstable release")
           if api(f"{base}/git/ref/tags/{encoded_tag}") != reference:
               fail("The release tag changed during verification")
+          # The compare job checked the tagged source and the ZIP bytes. Attest only those bytes and only that commit.
+          tagged = reference.get("object", {})
+          for _ in range(4):
+              if tagged.get("type") != "tag":
+                  break
+              tagged = api(f"{base}/git/tags/{tagged.get('sha')}").get("object", {})
+          if tagged.get("type") != "commit" or tagged.get("sha") != os.environ["COMPARED_COMMIT"]:
+              fail("The commit of the release tag is not the commit that was compared with the ZIPs")
+          if json.loads(os.environ["COMPARED_ZIPS"]) != zip_digests:
+              fail("The ZIP bytes to attest are not the bytes that were compared with the tagged source")
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
+              output.write(f"sbom_count={len(sbom_assets)}\n")
           PY
 
       # The subject is the actual ZIP bytes; not proof of its original build. The Authenticode signatures are validated on Windows at launch.
@@ -334,3 +531,23 @@ jobs:
           subject-path: 'dist/*.zip'
           push-to-registry: false
           create-storage-record: false
+
+      - name: Generate attestation for the verified SPDX SBOM
+        if: ${{ steps.verify.outputs.sbom_count != '0' }}
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6
+        with:
+          subject-path: 'dist-sbom/*.spdx.json'
+          push-to-registry: false
+          create-storage-record: false
+
+      - name: Say what a failure means
+        if: ${{ failure() }}
+        shell: bash
+        run: |
+          {
+            echo '### The release is published but NOT attested'
+            echo
+            echo 'The verification or the attestation failed. The release and its ZIP are unchanged and immutable.'
+            echo 'If the cause was a transient GitHub error, re-run this workflow, or run it manually from the default branch with the exact tag.'
+            echo 'If a step names a difference between the ZIP and the tag, treat the release as suspect: do not announce it, investigate, and publish a corrected version.'
+          } >> "$GITHUB_STEP_SUMMARY"

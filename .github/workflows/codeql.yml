@@ -72,6 +72,13 @@
           }
         },
         {
+          "name": "Run .NET security analyzers (informational)",
+          "if": "${{ matrix.language == 'csharp' }}",
+          "continue-on-error": true,
+          "shell": "pwsh",
+          "run": "& .\\.github\\scripts\\Invoke-NetAnalyzers.ps1"
+        },
+        {
           "name": "Initialize language-specific analysis",
           "uses": "github/codeql-action/init@24c54180a607b1449ed407dd24f251e4e9147c8d",
           "with": {
@@ -104,7 +111,7 @@
           "uses": "actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02",
           "with": {
             "name": "codeql-production-build",
-            "path": ".github/codeql/out/build-manifest.json\n.github/codeql/out/compiled-sources.txt\n.github/codeql/out/compiler-references.txt",
+            "path": ".github/codeql/out/build-manifest.json\n.github/codeql/out/compiled-sources.txt\n.github/codeql/out/compiler-references.txt\n.github/codeql/out/netanalyzers/netanalyzers.sarif\n.github/codeql/out/netanalyzers/netanalyzers-summary.txt\n.github/codeql/out/netanalyzers/netanalyzers-build.log",
             "if-no-files-found": "warn",
             "include-hidden-files": true,
             "retention-days": 14

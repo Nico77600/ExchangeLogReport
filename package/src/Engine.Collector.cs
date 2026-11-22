@@ -2,7 +2,7 @@
 //  Exchange Log Report - engine, part 3: collector (log files -> SQLite)
 // -----------------------------------------------------------------------------
 //  Author  : Nicolas Fabert
-//  Version : 3.0.1
+//  Version : 3.1.0
 //
 //  A collection has two stages (Engine.Pipeline.cs runs them):
 //    1. PARSE  (several threads, one file each): reads the new part of a log file,
@@ -34,6 +34,7 @@ using System.IO;
 using System.Linq;
 using System.Text;
 using System.Text.RegularExpressions;
+using System.Threading;
 using Microsoft.Data.Sqlite;
 
 namespace ExchangeLogReport
@@ -135,7 +136,7 @@ namespace ExchangeLogReport
     {
         readonly Store _store;
         readonly CollectorOptions _o;
-        readonly Regex _systemUsers, _probeAgents, _probeUrls, _probeSenders, _longRunning;
+        readonly SafeRegex _systemUsers, _probeAgents, _probeUrls, _probeSenders, _longRunning;
         readonly HashSet<string> _ignoredEvents, _watched;
         readonly DayCache _days;
 
@@ -151,11 +152,11 @@ namespace ExchangeLogReport
         {
             _store = store;
             _o = options;
-            _systemUsers = Build(options.SystemUserPatterns);
-            _probeAgents = Build(options.ProbeUserAgentPatterns);
-            _probeUrls = Build(options.ProbeUrlPatterns);
-            _probeSenders = Build(options.ProbeSenderPatterns);
-            _longRunning = Build(options.LongRunningPatterns);
+            _systemUsers = Build(options.SystemUserPatterns, "Noise.SystemUserPatterns");
+            _probeAgents = Build(options.ProbeUserAgentPatterns, "Noise.ProbeUserAgentPatterns");
+            _probeUrls = Build(options.ProbeUrlPatterns, "Noise.ProbeUrlPatterns");
+            _probeSenders = Build(options.ProbeSenderPatterns, "Noise.ProbeSenderPatterns");
+            _longRunning = Build(options.LongRunningPatterns, "Collection.LongRunningPatterns");
             _ignoredEvents = new HashSet<string>((options.IgnoredTrackingEvents ?? new string[0]).Select(e => e.ToUpperInvariant()), StringComparer.Ordinal);
             _watched = new HashSet<string>((options.FullDetailUsers ?? new string[0]).Where(u => !string.IsNullOrWhiteSpace(u)).Select(u => u.Trim().ToLowerInvariant()), StringComparer.Ordinal);
             _days = new DayCache(options.Zone);
@@ -275,12 +276,56 @@ namespace ExchangeLogReport
             }
         }
 
-        static Regex Build(string[] patterns)
+        static SafeRegex Build(string[] patterns, string name)
         {
             var list = (patterns ?? new string[0]).Where(p => !string.IsNullOrWhiteSpace(p)).ToArray();
             if (list.Length == 0) return null;
-            return new Regex(string.Join("|", list.Select(p => "(?:" + p + ")")), RegexOptions.IgnoreCase | RegexOptions.CultureInvariant | RegexOptions.Compiled);
+            return new SafeRegex(new Regex(string.Join("|", list.Select(p => "(?:" + p + ")")), RegexOptions.IgnoreCase | RegexOptions.CultureInvariant | RegexOptions.Compiled, SafeRegex.MatchLimit), name);
         }
+
+        /// <summary>
+        /// A configured regular expression with a match time limit. A match that exceeds the limit is tried once more; a second timeout counts as no
+        /// match for that line, is counted, and is never remembered (the same value is tried again the next time it comes). An expression that
+        /// exceeds the limit MaxTimeouts times in the collection stops being tried for the rest of it (a catastrophic pattern must not stall every
+        /// line); that is reported with the name of its setting.
+        /// </summary>
+        sealed class SafeRegex
+        {
+            internal static TimeSpan MatchLimit = TimeSpan.FromSeconds(2);
+            internal static int MaxTimeouts = 10;
+            // Tests only: the number of first attempts of every match (and the one input they apply to, null: every input) that are taken as timeouts.
+            internal static int StallAttempts;
+            internal static string StallOnly;
+            /// <summary>The timeouts and dropped matches met by the current thread: a verdict computed while it moved is not remembered.</summary>
+            [ThreadStatic] internal static long ThreadTimeouts;
+            readonly Regex _regex;
+            long _timeouts;
+            internal readonly string Name;
+            internal SafeRegex(Regex regex, string name) { _regex = regex; Name = name; }
+            internal long Timeouts { get { return Interlocked.Read(ref _timeouts); } }
+            internal bool Disabled { get { return Timeouts >= MaxTimeouts; } }
+            internal bool IsMatch(string input)
+            {
+                if (Disabled) { ThreadTimeouts++; return false; }
+                for (int attempt = 0; attempt < 2; attempt++)
+                {
+                    try
+                    {
+                        if (attempt < StallAttempts && (StallOnly == null || StallOnly == input)) throw new RegexMatchTimeoutException();
+                        return _regex.IsMatch(input);
+                    }
+                    catch (RegexMatchTimeoutException) { }
+                }
+                Interlocked.Increment(ref _timeouts);
+                ThreadTimeouts++;
+                return false;
+            }
+        }
+        /// <summary>The matches of the configured regular expressions that exceeded their time limit in this collection, and the settings they belong to.</summary>
+        public long RegexTimeouts { get { return new[] { _systemUsers, _probeAgents, _probeUrls, _probeSenders, _longRunning }.Where(r => r != null).Sum(r => r.Timeouts); } }
+        /// <summary>The settings whose expression was dropped for the rest of the collection after too many timeouts.</summary>
+        public string[] RegexDroppedSources { get { return new[] { _systemUsers, _probeAgents, _probeUrls, _probeSenders, _longRunning }.Where(r => r != null && r.Disabled).Select(r => r.Name).ToArray(); } }
+        public string[] RegexTimeoutSources { get { return new[] { _systemUsers, _probeAgents, _probeUrls, _probeSenders, _longRunning }.Where(r => r != null && r.Timeouts > 0).Select(r => r.Name).ToArray(); } }
 
         // ================================================================ noise rules (read only: used by the parse threads)
 
@@ -349,8 +394,10 @@ namespace ExchangeLogReport
         {
             TValue v;
             if (d.TryGetValue(key, out v)) return v;
+            long timeouts = SafeRegex.ThreadTimeouts;
             v = compute(key);
-            d[key] = v;
+            // A verdict that a timeout or a dropped expression gave is not the verdict of the value: it is not remembered.
+            if (SafeRegex.ThreadTimeouts == timeouts) d[key] = v;
             return v;
         }
 
@@ -586,7 +633,7 @@ namespace ExchangeLogReport
                 if (c.EvidenceOnly && offset >= c.EvidenceLimit) break;
                 offset = line.NextOffset;
                 c.Result.Lines++;
-                if (line.Length == 0) { Noise(c, "Empty line", 1); continue; }
+                if (line.Length == 0) { Noise(c, line.Oversized ? LogLine.TooLong : "Empty line", 1); continue; }
                 if (line.First == '#')
                 {
                     if (line.StartsWith("#Fields:")) { string text = line.Text(); c.Map.Load(text); c.Fields = text; bind(); }
@@ -650,7 +697,7 @@ namespace ExchangeLogReport
             {
                 offset = line.NextOffset;
                 c.Result.Lines++;
-                if (line.Length == 0) { Noise(c, "Empty line", 1); continue; }
+                if (line.Length == 0) { Noise(c, line.Oversized ? LogLine.TooLong : "Empty line", 1); continue; }
                 if (line.First == '#')
                 {
                     if (line.StartsWith("#Fields:")) { string text = line.Text(); c.Map.Load(text); c.Fields = text; bind(); }
@@ -1236,7 +1283,7 @@ namespace ExchangeLogReport
                 lineStart = line.NextOffset;
                 offset = line.NextOffset;
                 c.Result.Lines++;
-                if (line.Length == 0) { Noise(c, "Empty line", 1); continue; }
+                if (line.Length == 0) { Noise(c, line.Oversized ? LogLine.TooLong : "Empty line", 1); continue; }
                 if (line.First == '#')
                 {
                     if (line.StartsWith("#Fields:")) { string text = line.Text(); c.Map.Load(text); c.Fields = text; bind(); }
@@ -1602,7 +1649,7 @@ namespace ExchangeLogReport
             {
                 offset = line.NextOffset;
                 c.Result.Lines++;
-                if (line.Length == 0) { Noise(c, "Empty line", 1); continue; }
+                if (line.Length == 0) { Noise(c, line.Oversized ? LogLine.TooLong : "Empty line", 1); continue; }
                 if (line.First == '#')
                 {
                     if (line.StartsWith("#Fields:")) { string text = line.Text(); c.Map.Load(text); c.Fields = text; bind(); }

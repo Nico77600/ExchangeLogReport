@@ -1,7 +1,7 @@
 ---
 title: Exchange Log Report
 subtitle: Developer guide
-version: 3.0.1
+version: 3.1.0
 author: Nicolas Fabert
 updated: 2026-10-30
 ---
@@ -14,7 +14,7 @@ updated: 2026-10-30
 > Windows marks files downloaded from the Internet. Check the publisher first (right-click a `.ps1`, Properties, Digital Signatures: `Nicolas Fabert`), then unblock the extracted folder once:
 >
 > ```powershell
-> Get-ChildItem "E:\Tools\ExchangeLogReport" -Recurse -File -Force | Unblock-File
+> Get-ChildItem "C:\Program Files\ExchangeLogReport" -Recurse -File -Force | Unblock-File
 > ```
 >
 > Replace the example path with the folder where you extracted the ZIP of the [latest release](https://github.com/Nico77600/ExchangeLogReport/releases/latest).
@@ -57,7 +57,7 @@ Every step with its exact command, on one example (EXCH01 to EXCH04, contoso.com
 > The tool is **read-only** for Exchange: it reads log files and, with `-Mode Discover`, settings (`Get-*` cmdlets and IIS `applicationHost.config`). It never changes a setting. Reports stay on the local disk, unless the `Mail` section sends them by e-mail (chapter 8.1).
 
 > [!WARNING]
-> Noise removal is not anonymisation. The database and reports can contain account names, e-mail and IP addresses, device identifiers, message subjects and SMTP transcripts. Restrict access to the output folders and review the recipients before enabling e-mail. Database retention does not delete exported HTML/CSV reports or e-mail copies; the operator must protect and delete them separately.
+> Noise removal is not anonymisation. The database and reports can contain account names, e-mail and IP addresses, device identifiers, message subjects and SMTP transcripts. Restrict access to the output folders and review the recipients before enabling e-mail. Database retention does not delete exported HTML/CSV reports or e-mail copies; the operator must protect and delete them separately (where the personal data goes and how to remove it: 10.1).
 
 > [!NOTE]
 > Report e-mail is disabled in the delivered configuration. `-SendMail` or `Mail.Enabled` enables it, while `-SendMail:$false` suppresses it for one report. `-Mode MailTest` sends a test message independently of `Mail.Enabled`.
@@ -153,7 +153,7 @@ key | Authentication challenges | The anonymous `401` that precedes every NTLM /
 |---|---|
 | PowerShell | **7.4 or later** (`pwsh`) for the tool. The release package carries PowerShell 7 (`powershell\`) and the launchers start it: no installation on the Exchange servers. **Windows PowerShell 5.1** (`powershell.exe`, part of Windows Server) for `-Mode Discover` only: the Exchange cmdlets are not supported in PowerShell 7, so the tool runs them in a Windows PowerShell 5.1 process. |
 | Account | SYSTEM on an Exchange server, or a domain account that is local administrator of every Exchange server (4.1). Edge Transport server: on the Edge itself, SYSTEM or a local administrator (4.2). |
-| Network | SMB (445) from the collector to every Exchange server. On a collector that is not an Exchange server, also HTTP (80) to one Exchange server for `-Mode Discover` (remote PowerShell `http://<server>/PowerShell/`, Kerberos). |
+| Network | SMB (445) from the collector to every Exchange server, with SMB signing required. On a collector that is not an Exchange server, also HTTP (80) to one Exchange server for `-Mode Discover` (remote PowerShell `http://<server>/PowerShell/`, Kerberos). What protects each link: 4.3. |
 | Protocol logging | SMTP: `ProtocolLoggingLevel Verbose` on the receive and send connectors whose traffic must be analysed (`Get-ReceiveConnector | ft Name,ProtocolLoggingLevel`). Verbose is also what the authenticated user of SMTP clients is read from. POP/IMAP (optional): `Set-PopSettings` / `Set-ImapSettings -ProtocolLogEnabled $true`, then restart the POP3/IMAP4 services. HttpProxy, IIS (front and back end), MAPI over HTTP and message tracking are on by default. `-Mode Discover` lists the connectors and services whose logging is off. |
 | Disk | The database is small (see chapter 12). Plan 1 GB per server and per month in large environments. |
 
@@ -181,7 +181,7 @@ Add-LocalGroupMember -Group 'Administrators' -Member 'CONTOSO\ELR-Collectors'
 Add-RoleGroupMember 'View-Only Organization Management' -Member 'ELR-Collectors'
 ```
 
-On the administration server, give `ELR-Collectors` the **Log on as a batch job** right (`secpol.msc` › Local Policies › User Rights Assignment, or a Group Policy) and write access to the `data`, `reports`, `logs` and `bin` folders of the tool.
+On the administration server, give `ELR-Collectors` the **Log on as a batch job** right (`secpol.msc` › Local Policies › User Rights Assignment, or a Group Policy) and the access to the tool folder that 5.2 describes: read and run the package, write only `data`, `reports` and `logs`.
 
 > [!IMPORTANT]
 > **A domain account, not a local account.** A local account of the administration server, even with the same name and password on every server, is filtered by UAC over the network: it gets no access to the administrative shares.
@@ -205,11 +205,22 @@ file | Report | An **Edge report** (9.6): mail flow only — messages, SMTP clie
 
 The Edge gets its own tool folder and database. Seen from a mailbox server, a subscribed Edge listed in the configuration is recorded by `-Mode Discover` with its role only: its log settings are in its own AD LDS instance, not in Active Directory.
 
+### 4.3 Network protection
+
+| Link | What carries it | What protects it, and what you must do |
+|---|---|---|
+| The collector reads the log files and the IIS settings of every Exchange server | SMB (445), through the administrative shares (`C$`, `D$`, `ADMIN$`) | Kerberos authenticates the account. The tool neither requires nor checks the signing or the encryption of SMB: **require SMB signing** on the collector and on the Exchange servers (Group Policy: *Microsoft network client* and *Microsoft network server: Digitally sign communications (always)*), and SMB encryption where your policy asks for it. Without signing, a device on the network path could change the log lines the tool reads. |
+| `-Mode Discover` from an administration server | Remote PowerShell over **HTTP (80)**, `http://<server>/PowerShell/`, with Kerberos | The content is encrypted by Kerberos message encryption of the remoting session: there is no HTTPS on this link, and none is needed. Use the **name** of the server, never its address: with an address, Kerberos is not used and the connection fails. |
+| The report by e-mail | SMTP (25, 587 or 465) | What is protected and what is not: 8.1. |
+| The portal | HTTP on `127.0.0.1` only | The traffic never leaves the computer; every request needs the access token (15.7). |
+
 <!-- icon: download -->
 ## 5. Installation
 
 ```steps
-Extract the package | Extract `ExchangeLogReport-3.0.1-win-x64.zip` to the collector, for example `E:\Tools\ExchangeLogReport` (no installer, no module to register; PowerShell 7 is inside the package). The scripts alone, from the `package` folder of the repository, run on an installed PowerShell 7.4 or later.
+Check the download | Before you extract the ZIP, check the publisher, the attestation and the SBOM of the release (5.3).
+Extract the package | Extract `ExchangeLogReport-3.1.0-win-x64.zip` to a folder that only the administrators can change, preferably under `%ProgramFiles%`: `C:\Program Files\ExchangeLogReport`, the folder used by every example of this guide (a folder elsewhere works the same, with its permissions set as in 5.2). No installer, no module to register; PowerShell 7 is inside the package. The scripts alone, from the `package` folder of the repository, run on an installed PowerShell 7.4 or later.
+Lock the folder down | Give write access on the package folder to the administrators and SYSTEM only (5.2).
 List the servers | Edit `config\ExchangeLogReport.config.psd1`: the server names are enough (chapter 6).
 Check the configuration and the engine | `.\Run-Collector.cmd -Mode Status` — a new installation answers **Ready for the first collection**.
 Find the log folders | `.\Run-Collector.cmd -Mode Discover` with an account of *View-Only Organization Management* (6.1). Check the warnings: folder not readable, logging off.
@@ -222,8 +233,115 @@ Schedule it | Hourly scheduled task (chapter 7), then build the first report (ch
 Every release is protected end to end. The owner signs (Authenticode with a timestamp) the six PowerShell files of the package (`Invoke-ExchangeLogReport.ps1`, `Database-Storage.ps1`, `ExchangeLogReport.psm1`, `ExchangeLogReport.psd1`, `src\Test-PackageIntegrity.ps1`, `src\Get-ExlExchangeSettings.ps1`) and a manifest, `PackageIntegrity.psd1`, which stays at the package root. The manifest has two lists. `Files` holds the raw SHA256 of the protected files that exist in the repository and in the package: the C# sources of the engine (`src\Engine.*.cs`) and of the storage tool (`src\Storage.*.cs`), all six SQLite DLLs (`lib\sqlite`, including both native architectures), `templates\Report.template.html` and its script `templates\Report.template.js`, both HTML guides, the three launchers (`.cmd` files cannot be signed, so they are hashed), `README.md`, `THIRD-PARTY-NOTICES.md` and, in a distribution, `CHANGELOG.md`, `LICENSE`, `SECURITY.md`, `product.json` and the notices of the bundled components. `DistributionFiles` holds the SHA256 of every file of the built folders `powershell\` (PowerShell 7) and `sqlite-tools\`; they exist in the package only. Before anything runs, the launchers, `Invoke-ExchangeLogReport.ps1`, `Database-Storage.ps1`, the module (at import and at every engine initialization) and the package builder call `src\Test-PackageIntegrity.ps1`. The verifier authenticates the whole parent package, not only `src`. It requires a valid, timestamped signature of the owner on itself, on the manifest and on every PowerShell file, then checks every file of the manifest. C# sources, libraries and binaries are protected by their hashes in the separately owner-signed manifest, not individually Authenticode-signed. A missing, changed, duplicate or unknown file in the package, or a link (reparse point) in the package tree, stops the tool before the module, the SQLite libraries or the engine are loaded. The launchers and the entry scripts use `-Distribution`, which hashes `DistributionFiles` too and checks that `powershell\pwsh.exe` carries a Microsoft signature and that `sqlite-tools\sqlite3.exe` is the pinned SQLite tool. The module itself verifies `Files` only. `-DevelopmentMode` (unsigned continuous-integration builds) still enforces `Files` and the signatures, and reports that the binaries were not verified; it cannot be combined with `-Distribution`. A tree without `PackageIntegrity.psd1` is an unverified source checkout: the entry scripts accept it only with `-DevelopmentMode`. The launchers start a signed release only; an unsigned build (CI artifact, `Build-Standalone.ps1 -Unsigned`, a source checkout) is started with `powershell\pwsh.exe -NoLogo -NoProfile -File Invoke-ExchangeLogReport.ps1 -Mode Serve -DevelopmentMode` (or another `-Mode`; `Database-Storage.ps1 -DevelopmentMode <arguments>` for the storage tool). A launcher that refuses the package prints the reason, what to do and *The package could not be verified. Read the message above.*; `Start-Portal.cmd`, and `Run-Collector.cmd` started without arguments, then wait for a key so that the message can be read (a scheduled task, which passes arguments, does not wait). Generate the final manifest hashes only after the six script signatures and their real timestamps have been finalized; sign and timestamp the manifest separately last.
 - **Not protected, on purpose:** `config\ExchangeLogReport.config.psd1`, `config\ExchangeLogReport.paths.psd1` and `config\ExchangeLogReport.mail.credential` (you edit or generate them: they are data, never executed), and the folders `bin\`, `data\`, `logs\` and `reports\` at the package root. Any other file in `config\` is refused. Repository-only files (the Markdown guides and `docs\images\`) are allowed by exact name and are not part of a distribution. The integrity check does not claim that every byte of the folder is immutable.
 - **No compiled cache.** The engine is compiled in memory from the verified sources at every start (a few seconds more than before). A DLL in `bin\` is never loaded: no unsigned checksum next to it could prove where it came from. An existing `bin\` is ignored and can be deleted.
-- **Residual limits.** The check protects the files, not the account: an attacker who can change the package files can also replace the verifier. The files are verified, then read; an administrator who can write to the package folder during that interval is outside this protection. The check needs the owner certificate to be trusted on the server (the certificate chain and timestamp of Windows).
+- **A server that does not trust the publisher root.** A server whose public root certificates were removed cannot build the certificate chain of the owner signature, and Windows then reports the signature with the status *UnknownError*. The tool accepts the package anyway, with **one warning** per run (*The publisher root certificate is not trusted on this server; the package was accepted on the pinned publisher certificate and the file hashes of the signed manifest*), when every condition holds: the signer is the pinned owner certificate (thumbprint in 5.3), the signature carries a timestamp and still verifies, the only chain problems are a missing root or intermediate certificate or a revocation list that cannot be read, and every file hash equals the signed manifest. It **never** accepts a modified file, an unsigned file, a file signed by another certificate, a revoked certificate or a certificate that an administrator has explicitly distrusted (status *NotTrusted*). The bundled `powershell\pwsh.exe` is still checked against its Microsoft certificate chain: a server without the Microsoft roots cannot start the package.
+- **Residual limits.** The check protects the files, not the account: an attacker who can change the package files can also replace the verifier. The files are verified, then read; an administrator who can write to the package folder during that interval is outside this protection. The signature check needs the owner certificate, compared by its thumbprint, and a timestamp. It also accepts a server that does not trust the publisher root (previous point).
+- **Run the package from a local folder.** It also runs from a network share (a UNC path or a mapped drive), but the integrity check reads every file of the package over SMB at each start: about a minute for the 700 files of the package, against a few seconds on a local disk. A UNC path with a host name or an address is also the *Internet* zone for Windows PowerShell (5.4).
+- **Links and reparse points.** The check decides on the type (the tag) of a reparse point, not on the attribute alone. A symbolic link, a junction or mount point, any other type that redirects to another path, and any unknown type are refused, for a file of the package and for each folder that holds it. Three Microsoft types that do not redirect are accepted: OneDrive cloud files (placeholders), data deduplication and WOF (CompactOS). The SHA256 of every file is still compared with the signed manifest, so a change made by a synchronisation is still refused. A OneDrive file that is not downloaded is downloaded when it is read; on a computer without a connection the check stops and asks you to reconnect, or to install the tool outside OneDrive.
 - Developers: after any change of a protected file, rebuild the guides (`tools\Build-Documentation.ps1`), sign the six scripts, then build in three steps: `tools\Build-Standalone.ps1` (builds the folder and refuses unsigned scripts), `tools\Build-Standalone.ps1 -Manifest <folder>` (writes the unsigned manifest; sign it, then copy it to `package\PackageIntegrity.psd1`) and `tools\Build-Standalone.ps1 -Seal <folder>` (verifies the signed package and the repository, then writes the ZIP). The builder never regenerates a protected file and never reads key material.
+
+### 5.2 Lock down the installation folder
+
+The collector runs with high rights: SYSTEM, or an account that is local administrator of every Exchange server. Whoever can change the files of the tool can run code with these rights. The package check (5.1) detects a changed file, but it cannot stop an account that can replace the files **and** the check. So the files must be writable by the administrators only.
+
+- **Where.** A folder under `%ProgramFiles%`, for example `C:\Program Files\ExchangeLogReport`: its default permissions already keep the write access to administrators and SYSTEM. On another drive, or under the root of `C:`, a new folder usually lets every authenticated user create files in it, and a folder that was copied or moved keeps the entries it had: set the permissions yourself, as below, on the package folder **and on every folder you created above it**, because the check (below) looks at the parents too.
+- **The package.** Write access on the package folder, and on every folder in it except `data`, `reports` and `logs`, for **Administrators** and **SYSTEM** only. An account that only runs the tool needs read and run access.
+- **Data, reports and logs.** `data` (the database), `reports` and `logs` are writable by the collector account only, with the administrators. They never hold code.
+- **The account that runs the tool must not be able to replace its own code.** A collector that is a domain account without administrator rights on the administration server gets read and run access on the package and Modify on the three data folders, never Modify on the package folder.
+- **Every copy.** Apply the same permissions to every copy of the tool, the Edge Transport copies included (4.2).
+
+```powershell
+$tool = 'C:\Program Files\ExchangeLogReport'
+
+# The package: Administrators (*S-1-5-32-544) and SYSTEM (*S-1-5-18) change it, the collector account reads and runs it.
+# The well-known SIDs work on any language of Windows. A collector that runs as SYSTEM needs no third entry.
+icacls $tool /inheritance:r /grant:r '*S-1-5-32-544:(OI)(CI)F' '*S-1-5-18:(OI)(CI)F' 'CONTOSO\ELR-Collectors:(OI)(CI)RX'
+
+# /inheritance:r drops the inherited entries only. A folder created outside %ProgramFiles%, or copied or moved with its permissions,
+# often holds Authenticated Users (*S-1-5-11) and Users (*S-1-5-32-545) itself: remove them.
+icacls $tool /remove:g '*S-1-5-11' '*S-1-5-32-545' /T
+
+# Data, reports and logs: the collector account writes them.
+foreach ($folder in 'data', 'reports', 'logs') {
+    New-Item -ItemType Directory -Force -Path (Join-Path $tool $folder) | Out-Null
+    icacls (Join-Path $tool $folder) /grant 'CONTOSO\ELR-Collectors:(OI)(CI)M'
+}
+```
+
+When the package is in a folder that you created, for example `C:\Tools\ExchangeLogReport`, protect that folder the same way, without the collector entry, and every other folder you created above the package:
+
+```powershell
+$parent = 'C:\Tools'
+icacls $parent /inheritance:r /grant:r '*S-1-5-32-544:(OI)(CI)F' '*S-1-5-18:(OI)(CI)F'
+icacls $parent /remove:g '*S-1-5-11' '*S-1-5-32-545'
+```
+
+Check the result with `.\Run-Collector.cmd -Mode Status` from an elevated prompt: no *Package folder* warning must remain.
+
+> [!NOTE]
+> The tool writes two files in `config`: the paths file of `-Mode Discover` and the mail credential file (8.1). A collector that is not an administrator needs Modify on `config` while it writes them; remove it afterwards.
+
+**What the tool checks.** At the start of every mode except the portal, when it runs elevated (as an administrator or SYSTEM), the tool lists the accounts that are not administrators and can change the package folder, one of its folders other than `data`, `reports`, `logs` and `bin`, or can delete or replace a parent folder (which would let them replace the whole package). It prints one **warning** per account and kind of access, with the account and the first folder, and the run goes on; the start summary says how many warnings were raised, and the log file keeps them. With `Security.RequireProtectedFolder = $true` the run is **refused** instead. A run that is not elevated is not checked. Accounts are compared by security identifier: SYSTEM, the administrators, TrustedInstaller, the creator-owner entry and the account that runs the tool are never reported.
+
+### 5.3 Verify the download
+
+Check a release before you extract it. Windows marks the file you downloaded; the signature and the attestation below tell who published it.
+
+```steps
+Publisher | The six PowerShell files of the release are signed by Nicolas Fabert. The thumbprint of the publisher certificate is `0F28E442889F17B5F4D251E8F96E7CC6E2C9C6D6`.
+Attestation | The release ZIP has a GitHub attestation: `gh attestation verify <zip> --repo Nico77600/ExchangeLogReport`.
+Hash | The SHA-256 of the ZIP is in the release notes: `Get-FileHash <zip> -Algorithm SHA256`.
+SBOM | Next to the ZIP, `ExchangeLogReport-<version>-win-x64.zip.spdx.json` lists what the ZIP contains, each component with its SHA-256 (SPDX 2.3).
+```
+
+```powershell
+# After the extraction: the status and the thumbprint of the signature of a script
+Get-AuthenticodeSignature .\Invoke-ExchangeLogReport.ps1 | Format-List Status, @{ n = 'Thumbprint'; e = { $_.SignerCertificate.Thumbprint } }
+
+# The attestation of the ZIP (GitHub CLI)
+gh attestation verify .\ExchangeLogReport-3.1.0-win-x64.zip --repo Nico77600/ExchangeLogReport
+```
+
+The thumbprint must be the one above. The status is *Valid* on a server that trusts the publisher root; on a server that does not, it is *UnknownError* with the right thumbprint, and the package check accepts it with a warning (5.1). The status *NotTrusted*, which Windows gives to a certificate that an administrator has explicitly distrusted, is refused. An attestation ties these exact bytes to the project's repository and release workflow; it does not prove how the ZIP was built, and it is not a review of its content. The SBOM is an inventory for your vulnerability scanner and your own records: it does not sign anything.
+
+### 5.4 The execution policy and hardened servers
+
+**The discovery helper.** The launchers start the bundled PowerShell on the signed scripts and change no execution policy. Only `-Mode Discover` starts something else: a helper in Windows PowerShell 5.1 (`src\Get-ExlExchangeSettings.ps1`) for the Exchange cmdlets. The helper starts under the execution policy of the computer. When that policy would stop it (*AllSigned* or *RemoteSigned* with a ZIP that was downloaded and not unblocked, or an owner certificate that is not in the Trusted Publishers store), the tool still starts it with the *Bypass* policy, **only** after it has checked that the helper is the file that the signed manifest lists and that its signature is the owner's, and with a warning (*The execution policy of this computer would not let the discovery helper run...*). A modified helper, an unsigned one or one signed by another certificate is never started. The tool decides from the zone of the helper, which is the larger of two values: the *Zone.Identifier* mark that a download left on the file, and the zone that the Windows URL zone manager gives to the place of the file. A package that runs from a network share is therefore classified by its place, with or without a mark: a UNC path with a host name or an IP address is the *Internet* zone, a share with a short name is *Intranet*, and a mapped drive is read as its UNC path. When the zone cannot be determined, the tool does not guess: it takes the policy as unknown and applies the same checks before it uses *Bypass*. If the policy still refuses the helper (Windows reports *UnauthorizedAccess* or *PSSecurityException*), the helper is started once more with *Bypass* under the same checks and the same warning. A second failure is reported as it is. To avoid the fallback, run `Unblock-File` on the ZIP before you extract it (or on the extracted files, as in the box at the top of this guide), or add the owner certificate to the Trusted Publishers store of the computer.
+
+**A policy set by Group Policy.** When the execution policy of Windows PowerShell comes from Group Policy (the *MachinePolicy* or *UserPolicy* scope of `Get-ExecutionPolicy -List`), the *Bypass* policy of a started process cannot override it. The tool then does not use Bypass, says nothing about it and writes no event 2003: it warns (*The execution policy of this computer is set by Group Policy …*) and starts the helper under that policy. If the policy refuses the helper, `-Mode Discover` ends with exit code 1 and a message that gives the three ways out: run `-Mode Discover` on a computer whose policy accepts the package files (with *RemoteSigned*, `Unblock-File` on the files is enough), ask for the policy to be changed, or write the log folders in the `Servers` block of the configuration instead (6.1).
+
+**AllSigned.** `-Mode Discover` is not supported where the execution policy is *AllSigned*, even with the owner certificate in the Trusted Publishers store and the files unblocked: the Exchange Management Shell itself loads scripts and format files that the policy then refuses, so the discovery ends with exit code 1. When the error comes from the Exchange Management Shell, the message says so and does not blame the package; it names *RemoteSigned*, the Windows Server default, as a policy under which the Exchange Management Shell runs. The collection, the report and the portal do not start Windows PowerShell (only `-Mode Discover` does): they run in the bundled PowerShell on the signed scripts of the package.
+
+**A task on files that were not unblocked.** A scheduled task has no console to answer the question of Windows PowerShell about a publisher that is not trusted, and Windows may stop a launcher that carries a download mark before it prints anything. Run `Unblock-File` on the extracted folder (box at the top of this guide) **before** you create the task. A launcher that is started with arguments passes `-NonInteractive` to the integrity check, so that a prompt fails with an exit code instead of waiting; when it finds the download mark on the entry script, it prints the `Unblock-File` command with the folder.
+
+**What the tool needs on a hardened server** (Constrained Language Mode, App Control for Business, AppLocker), on the collector and on every Edge copy. These are the items the tool needs, taken from how it works: it has not been tested under an App Control or AppLocker policy, so test such a policy before production. The policy must allow the publisher certificate, and the root certificate of the signature must be trusted on the server, or the scripts may be refused or run in Constrained Language mode. Microsoft documents that application control rules apply whatever the execution policy: the *Bypass* start of `-Mode Discover` described above is not expected to help there.
+
+
+| Item | Why |
+|---|---|
+| The bundled `powershell\pwsh.exe` and its runtime, signed by Microsoft | Every launcher starts it. |
+| The owner certificate (thumbprint in 5.3): the six signed scripts of the package | They are the code that runs. Allow the publisher, or the folder, in the policy. |
+| `lib\sqlite\runtimes\win-x64\e_sqlite3.dll` | The native SQLite library that the engine loads. |
+| `sqlite-tools\sqlite3.exe` | The read-only measure of `Database-Storage.cmd`. |
+| PowerShell in Full Language mode | The C# engine is compiled in memory at every start (5.1). A policy that forces the Constrained Language mode on these scripts, or a signer root that is not trusted, may stop it. |
+| Windows PowerShell 5.1 (`powershell.exe`) | `-Mode Discover` only. |
+
+### 5.5 Remove the tool
+
+The tool installs no service and changes no firewall rule or URL reservation, so removing it is a matter of deleting what you created. Read the paths in the configuration file **before** you delete the package folder: the data may have been moved.
+
+```steps
+Tasks | Delete the scheduled tasks by name and stop the portal if it runs: `Get-ScheduledTask -TaskName 'Exchange Log Report*' | Unregister-ScheduledTask -Confirm:$false`.
+Package folder | Delete the package folder, `C:\Program Files\ExchangeLogReport` in this guide, and every other copy of the tool (an Edge Transport server has its own).
+Data, reports and logs | Delete the folders that hold them where you put them: `Storage.DatabasePath` (the database and its `-wal` and `-shm` files), `Report.OutputPath`, `Logging.Path` and `Report.ScratchFolder` when it is set. By default they are `data`, `reports` and `logs` in the package folder.
+Credential and paths files | Delete the mail credential file (`Mail.CredentialFile`) and the paths file of `-Mode Discover` (`config\ExchangeLogReport.paths.psd1`), and the identity file (`Collection.IdentityMapFile`) if you wrote one. They hold a protected password and the log folders of your servers.
+Owner certificate | If you added the owner certificate to the Trusted Publishers store (5.4), remove it, unless other software of the same publisher needs it: `Remove-Item Cert:\LocalMachine\TrustedPublisher\0F28E442889F17B5F4D251E8F96E7CC6E2C9C6D6`.
+Event log source | If `Logging.EventLog` was on, remove the source `ExchangeLogReport` (Windows PowerShell 5.1, as administrator): `Remove-EventLog -Source ExchangeLogReport`, or `[Diagnostics.EventLog]::DeleteEventSource('ExchangeLogReport')`. The entries already written stay in the Application log until it is cleared.
+Accounts | Remove the collector group and what it was given (4.1): its membership of the local Administrators group of every Exchange server, the *View-Only Organization Management* role group, the *Log on as a batch job* right, and the service account itself when only this tool used it.
+```
+
+What stays outside the reach of the tool, and is yours to find and delete (10.1): the CSV exports in the download folder of the browser, the copies of the database made with `Database-Storage.cmd`, the e-mails that carried a report, and the backups of all of these.
+
+**Deleted does not mean wiped.** Deleting a file removes its name from the disk; the content can be recovered until the space is reused. For a database or reports that held personal data, use the secure erase of your organisation, or keep these folders on an encrypted volume and destroy its key (Annex D).
 
 <!-- icon: settings -->
 ## 6. Configuration
@@ -239,6 +357,8 @@ Servers = @(
     @{ Name = 'EXCH03' }
 )
 ```
+
+Each name is checked at every start. An IP address, a UNC name (`\\EXCH01`), a name with a path or a port, or a name that is not a host name gets a **warning** that names the entry, and so does a name that the last `-Mode Discover` did not find (compared by its first label, in any case: `exch01.contoso.com` matches `EXCH01`). Nothing is refused: the logs are read from `\\<name>\C$` and the tool connects to that name, so check a name that is flagged.
 
 The names are enough: where each server really writes its logs is found by **`-Mode Discover`**. Exchange can be installed on another drive, and every log folder can be moved (`Set-TransportService -MessageTrackingLogPath`, `Set-FrontEndTransportService -ReceiveProtocolLogPath`, IIS log folder of a site...): the default folders are then wrong, and the old folder still exists with old files, so nothing looks broken.
 
@@ -322,13 +442,16 @@ Servers = @(
 > [!CAUTION]
 > Never put in `ExcludedClientIps` a load balancer that hides the client addresses (SNAT): every real request would be removed.
 
+**The patterns have a time limit.** Every regular expression of this table and `Collection.LongRunningPatterns` is matched with a limit of 2 seconds per match, so that a badly written pattern cannot stall the collection. A match that exceeds it is tried once more; a second timeout counts as no match for that line, and the verdict is not remembered, so the same value is tried again when it comes back. A pattern that exceeds the limit 10 times in one collection is no longer tried for the rest of that collection. The collection then warns and ends with exit code 2. The warning counts the timeouts and names the setting, for example `Noise.SystemUserPatterns`: *<n> match(es) of the regular expressions of Noise.SystemUserPatterns exceeded the time limit twice: those lines were not tested by them (counted as no match, not remembered).* When a pattern was dropped, it adds: *The expression of Noise.SystemUserPatterns was dropped for the rest of this collection: simplify it.* Simplify the pattern (avoid nested repetitions such as `(a+)+`). The same limit of 2 seconds applies to `Collection.InternalConnectors` when a report is built: a connector name whose match times out twice is taken as internal.
+
 Built-in rules that need no configuration:
 
 - an **anonymous request** is not a user: a `401` without user is the normal first step of NTLM/Kerberos authentication (*Authentication challenge*), it is neither stored nor counted as a failure;
 - an **SMTP session without any `MAIL FROM`** (connect, banner, EHLO, QUIT) is a probe or a scanner: it is counted as *Connection without message (address)*, never as a message;
 - an **authenticated submission (port 587)** is handed over by the front end to a mailbox server right after `AUTH`: the front-end part is counted as *Client submission proxied to a mailbox server*, and the message is recorded on the mailbox server with the real client read from `XPROXY` (address, HELO);
 - a **POP/IMAP connection without logon** (load balancer TCP check) is *connection without logon*; a failed logon whose account Exchange does not log is *logon failed (the account is not logged)*;
-- **back-end lines older than the detail retention** are not parsed (they only enrich sessions).
+- **back-end lines older than the detail retention** are not parsed (they only enrich sessions);
+- a **log line longer than 8 MB** is not read: its bytes are skipped up to the end of the line and counted as *Line too long (skipped)* among the noise reasons. The collection warns, names the server and the source, and ends with exit code 2.
 
 ### 6.4 Collection, storage, report, logging
 
@@ -344,7 +467,7 @@ Built-in rules that need no configuration:
 | `Collection.MaxSessionSteps` | 80 | Timeline steps written per session and log file; the other successes are folded into batches. |
 | `Collection.SlowRequestMs` | 5000 | Successful requests slower than this are kept as **Slow** (0 = never). Applied at collection: changing it does not recompute the history. |
 | `Collection.LongRunningPatterns` | NotificationWait, Ping, RPC/HTTP, OWA notifications, PowerShell, IMAP IDLE | Long-polling requests (regex on `Protocol|Action|Url`): never slow. |
-| `Collection.StaleSourceHours` | 24 | HttpProxy, IIS front end or back end whose newest file is older than this is **stale** (warning, exit code 2). 0 = no check. SMTP and message tracking are not checked: a server without mail flow writes nothing there. |
+| `Collection.StaleSourceHours` | 24 | HttpProxy, IIS front end or back end whose newest file is older than this is **stale** (warning, exit code 2). 0 = no check. SMTP, message tracking, the MAPI HTTP back end and POP/IMAP are not checked: a server without mail flow writes nothing there, so a stopped source looks the same as an unused server (chapter 9). |
 | `Collection.Parallelism` | 0 | Log files read at the same time (one thread each, every server and source together); one more thread writes the database. 0 = one per processor, 2 to 16. The read threads run at below-normal priority (the write thread at normal priority): on an Exchange server, Exchange keeps the processors it needs. Lower it on a collector that does other work (chapter 12). |
 | `Collection.MaxFilesPerServer` | 4 | Files of one server read at the same time (0 = no limit). Whatever the number of servers, at most `Parallelism` files are read at once; this spreads them over the servers, so that no server - nor the local disk when the tool runs on an Exchange server - serves all of them. |
 | `Collection.ResolveSids` | `$true` | Exchange logs token (OAuth) requests under the security identifier (SID) of the account. `$true`: the collector pairs each SID with the account from the logs themselves and merges its rows with the account's (9.3). `$false`: the SIDs stay as logged, nothing is gathered or renamed. No directory is queried in either case. |
@@ -366,22 +489,56 @@ Built-in rules that need no configuration:
 | `Report.MemoryBudgetMB` | 512 | Estimated report buffers and SQLite caches, 64 to 16,384 MB. Retained datasets spill to disk as the shared budget fills; this is not a hard process RAM limit. |
 | `Report.TimeZone` | Romance Standard Time | Native Windows Paris zone, with winter/summer rules; also used when this setting is absent. Explicit IANA IDs remain supported. On Windows without ICU/IANA lookup, `Europe/Paris` falls back to `Romance Standard Time`. |
 | `Report.Parallelism` | 0 | Independent report CPU workers, 0 to 16. 0 uses up to four workers, leaving one processor when possible; 1 is sequential. Does not change collection parallelism or multiply database connections. |
-| `Logging.RetentionDays` | **14** | Daily execution log files. |
+| `Report.RetentionDays` | 0 | `0`: the tool never deletes a report. 1 to 36,500: a report run removes the report folders of `Report.OutputPath` that this tool created more than N days ago (10.1). |
+| `Logging.RetentionDays` | **14** | Daily execution log files. The tool deletes the older ones. |
+| `Logging.EventLog` | `$false` | `$true`: the security-relevant events of a run go to the Windows Application log too (6.5). |
+| `Security.RequireProtectedFolder` | `$false` | `$false`: an elevated start that finds an account that is not an administrator able to change the package folder warns and goes on. `$true`: it refuses to run (5.2). |
 
 **Very large reports.** Large Detailed reports keep rows in a shared memory allowance and temporarily spool them to disk when it fills. `Report.MemoryBudgetMB` defaults to 512 MB for report buffers and SQLite caches; it is not a hard limit on the PowerShell process. `Report.Parallelism` controls report CPU workers (0 = automatic, up to four; 1 = sequential). On an Exchange server, start with one or two workers and leave memory available for Exchange. These settings do not change collection.
 
 Allow extra free space in the report folder (or on the drive of `Report.ScratchFolder` when it is set) for the temporary work file, and in the report folder for the report itself; slower disks may take longer when rows spill. HTML transcripts are loaded only for the rows shown, while the complete SMTP CSV is streamed separately. The temporary file is removed when the report finishes or reports an error. CSV files remain complete, even when the HTML row limit is reached. A `.partial` file indicates an interrupted export, not a ready report. `-NoCollect` skips collection, but still builds these details from one consistent database snapshot.
 
+### 6.5 The Windows event log
+
+With `Logging.EventLog = $true` the tool also writes its security-relevant events to the **Application** log of Windows, source `ExchangeLogReport`, so that your monitoring sees them without reading the files of `logs\`. It is off by default. The text is English whatever the language of Windows, and it holds no e-mail address and no account name: accounts appear as security identifiers, and everything else as counts.
+
+| Id | Level | Event |
+|---|---|---|
+| 1000 | Information | A run started (mode, version, security identifier of the account). |
+| 1001 | Information | A run ended (mode, exit code, seconds). Warning when the exit code is 2, Error when it is 1. |
+| 2000 | Error | The package was refused by the verifier. |
+| 2001 | Warning | A non-administrator can change the package folder (security identifier, folder). |
+| 2002 | Warning | The package was accepted without the publisher root certificate. |
+| 2003 | Warning | The discovery helper was started with the Bypass policy. |
+| 3000 | Information | The mail credential file was written. |
+| 3001 | Information | An e-mail was sent (server, number of recipients, TLS). |
+| 4000 | Information | The portal started. |
+| 4001 | Information | The portal stopped. |
+
+**The source.** The tool registers the source itself when its account may. An account that may not (a collector that is not an administrator) cannot create it: the tool then warns **once** (*Windows event log: the events are not written…*) and carries on, and the events are lost. Register the source once, in advance, as an administrator:
+
+```powershell
+# Windows PowerShell 5.1, as administrator, once
+New-EventLog -LogName Application -Source ExchangeLogReport
+
+# or, in PowerShell 7, the same call in .NET
+[Diagnostics.EventLog]::CreateEventSource('ExchangeLogReport', 'Application')
+```
+
+**Forwarding.** The events are ordinary entries of the Application log: collect them with Windows Event Forwarding or your SIEM agent, filtering on the source `ExchangeLogReport` and, for an alert, on the ids 2000 to 2003 and on the level Error. The log file of the day stays the complete record.
+
 <!-- icon: clock -->
 ## 7. Scheduled collection
 
-Run the collection every hour (Exchange closes HttpProxy files every hour), with the account of chapter 4.1. The task starts `Run-Collector.cmd`: it verifies the package, then starts the PowerShell of the package with the server garbage collector (`DOTNET_gcServer=1`, `DOTNET_GCHeapCount=4`, `DOTNET_GCNoAffinitize=1`) that the collection was measured with. A task that starts `powershell\pwsh.exe -File Invoke-ExchangeLogReport.ps1` directly works too, with the workstation garbage collector: a large collection is slower and uses less memory (a large first collection needs several GB).
+Run the collection every hour (Exchange closes HttpProxy files every hour), with the account of chapter 4.1. The task starts `Run-Collector.cmd`: it verifies the package, then starts the PowerShell of the package with the server garbage collector (`DOTNET_gcServer=1`, `DOTNET_GCHeapCount=4`, `DOTNET_GCNoAffinitize=1`) that the collection was measured with. **A task must start the `.cmd` launcher, not `powershell\pwsh.exe -File ...`.** The launcher verifies the package and sets the environment the tool is meant to run in. A task that starts `pwsh.exe` directly still runs, but with the workstation garbage collector (a large collection is slower and uses less memory; a large first collection needs several GB) and without the launcher's environment settings: set the machine environment variables `POWERSHELL_TELEMETRY_OPTOUT=1` and `POWERSHELL_UPDATECHECK=Off` yourself, otherwise the bundled PowerShell can contact Microsoft from your Exchange server (outbound connections: Annex D). The tool registers no scheduled task itself: the tasks below are yours.
+
+The program path has a space, so the examples below quote it for `schtasks` (`\"...\"`): type them in Windows PowerShell 5.1, as everywhere in this guide.
 
 **A. On an Exchange server**, as SYSTEM:
 
 ```powershell
-$action  = New-ScheduledTaskAction -Execute 'E:\Tools\ExchangeLogReport\Run-Collector.cmd' `
-           -Argument '-Mode Collect' -WorkingDirectory 'E:\Tools\ExchangeLogReport'
+$action  = New-ScheduledTaskAction -Execute 'C:\Program Files\ExchangeLogReport\Run-Collector.cmd' `
+           -Argument '-Mode Collect' -WorkingDirectory 'C:\Program Files\ExchangeLogReport'
 $trigger = New-ScheduledTaskTrigger -Once -At (Get-Date).Date.AddHours(1) -RepetitionInterval (New-TimeSpan -Hours 1)
 Register-ScheduledTask -TaskName 'Exchange Log Report - collect' -Action $action -Trigger $trigger -User 'SYSTEM' -RunLevel Highest
 ```
@@ -401,7 +558,7 @@ The account needs the **Log on as a batch job** right on the administration serv
 **C. Scheduled reports (recurring reporting)**, with the account of the collection:
 
 ```powershell
-$run = 'E:\Tools\ExchangeLogReport\Run-Collector.cmd'
+$run = '\"C:\Program Files\ExchangeLogReport\Run-Collector.cmd\"'
 
 # Every day at 07:00: the last 24 hours (Detailed report)
 schtasks /Create /F /RU SYSTEM /RL HIGHEST /TN "Exchange Log Report - daily report" `
@@ -417,7 +574,7 @@ Each run writes a new report folder under `Report.OutputPath`. The reports read 
 ```cards
 check | Exit code 0 | Success.
 wrench | Exit code 1 | Failure: see the error and the log file.
-info | Exit code 2 | Finished with warnings: a server, a folder or a file could not be read, a source is stale, the IIS log folders changed since `-Mode Discover`, or the report could not be sent by e-mail (see the console and the log file).
+info | Exit code 2 | Finished with warnings: a server, a folder or a file could not be read, a source is stale, the IIS log folders changed since `-Mode Discover`, a log line over 8 MB was skipped, a configured regular expression exceeded its time limit (6.3), or the report could not be sent by e-mail (see the console and the log file). The warnings of the start (package folder, server names, package check) do not change the exit code.
 shield | Lock | A lock file prevents two collections at the same time. A report never waits for it: while a collection runs, it uses the data already collected.
 ```
 
@@ -514,9 +671,12 @@ Mail = @{
 | `Authentication` | `Anonymous` (default) | No account: a receive connector that accepts the collector (anonymous or by address). |
 | | `Basic` | `AUTH LOGIN` (or `PLAIN`) with the account of `CredentialFile`; refused without TLS. |
 | | `Kerberos` | `AUTH GSSAPI` (RFC 4752), Kerberos only (no NTLM fallback): the account of `CredentialFile` when it exists, else the account that runs the tool. SPN `SMTPSVC/<SmtpServer>`, or `TargetName` behind a load balancer. |
-| `CredentialFile`, `CredentialScope` | `.\config\ExchangeLogReport.mail.credential`, `User` | The account and its password, protected by **DPAPI**: `User` = readable only by the Windows account that wrote it, on this computer; `Computer` = by any account of this computer. The file is restricted to SYSTEM, the administrators and its writer. |
+| `CredentialFile`, `CredentialScope` | `.\config\ExchangeLogReport.mail.credential`, `User` | The account and its password, protected by **DPAPI**: `User` = readable only by the Windows account that wrote it, on this computer; `Computer` = by any account of this computer. The file is restricted to SYSTEM, the administrators and its writer: it is created with that access in one step, so it never exists with the permissions of its folder. A file that inherits the permissions of its folder, or that gives access to an account other than SYSTEM, the administrators, TrustedInstaller, its writer, its owner and the account that runs the tool, still works, with a warning that says to write it again. A file written again by the tool, whatever account wrote it, does not warn. An interrupted write can leave a work file `.<name>.<32 hexadecimal digits>.tmp` in `config\`: the package check ignores it, and the next write deletes it once it is older than ten minutes. |
 | `CertificateThumbprint` | 40 hexadecimal characters | Pins the certificate of the server (the self-signed certificate of an Exchange server) instead of checking its chain and name. |
-| `From`, `FromName`, `To`, `Cc`, `Bcc` | addresses | Addresses only (`'team@contoso.com'`), checked at start. A refused recipient is reported (exit code 2), the others receive the report. |
+| `MinimumTls` | `None` | `None` (default), `Tls12` or `Tls13`, in any case. A session that negotiates an older protocol is **refused after the handshake, before the authentication**: nothing is sent, not even a password. An error together with `Encryption = 'None'`. With `None`, a session below TLS 1.2 is still sent, with a warning (Annex A). |
+| `CheckRevocation` | `$false` | `$true`: also checks, online, that the certificate of the server is not revoked. The send fails when the status cannot be read (no access to the revocation list). Not used with `CertificateThumbprint`. |
+| `From`, `FromName`, `To`, `Cc`, `Bcc` | addresses | Addresses only (`'team@contoso.com'`), checked at start. A refused recipient is reported (exit code 2), the others receive the report. Every send writes one line in the log file with the server and the **To, Cc and Bcc** recipients. |
+| `AllowedRecipientDomains` | `@()` | Optional allow-list, for example `@('contoso.com')`: every address of `To`, `Cc` and `Bcc` must belong to one of these domains (exact domain, any case; `contoso.com` does not allow `mail.contoso.com`), otherwise the configuration is refused and nothing is sent. Empty: no restriction. |
 | `Subject` | `{Title} - {Type} report - {Period}` | Also `{Range}`, `{Servers}`, `{Computer}`. |
 | `Attach`, `MaxAttachmentMB` | `Html`, 7 | See above. Exchange accepts 25 MB by default (`MaxSendSize`, 33 % more once encoded). |
 | `HeloName`, `TimeoutSeconds` | the computer name, 60 | EHLO name; network timeout. |
@@ -545,12 +705,27 @@ Mail = @{
 > [!NOTE]
 > **Kerberos and Exchange.** On the client receive connector of a front end (*Client Frontend*, port 587), Exchange hands the authenticated session over to the mailbox server of the account: the account needs a **mailbox**. The computer account (SYSTEM) has none and is refused (`535 5.7.3 Unable to proxy authenticated session`): save a mailbox account with `-Mode MailTest -Credential`. The default front-end connector (port 25) offers no Kerberos (`AUTH NTLM` only): use it anonymously, from an address that it accepts.
 
+**What the e-mail protects, and what it does not.**
+
+| | Protected | Not protected |
+|---|---|---|
+| The message on the network | `StartTls` (required: nothing is sent when the server does not offer it) and `Tls` encrypt it. `MinimumTls` sets the lowest protocol you accept. | `Encryption = 'None'`: the message, the report and the headers travel in clear. With `MinimumTls = 'None'` the version is the one Windows negotiates, which on Windows Server 2016 and 2019 can still be TLS 1.0 or 1.1: the tool warns, and sends. |
+| The identity of the server | The certificate is checked: trusted chain, and name equal to `SmtpServer`. | Its **revocation is not checked** unless `CheckRevocation = $true`. A pinned `CertificateThumbprint` **replaces** the validation of the chain and of the name: the certificate with that thumbprint is accepted whatever its name, issuer or dates, and its revocation is not checked. |
+| The account | `Kerberos` authenticates the account and the server to each other, with no NTLM fallback. `Basic` is refused without TLS. | `Kerberos` with `Encryption = 'None'` **authenticates but does not encrypt**: the account is proven, the message is still readable on the network. |
+| The password | The credential file is protected by DPAPI and by its access control (restricted to SYSTEM, the administrators and its writer). | Anyone who runs as the account that wrote it (or, with `CredentialScope = 'Computer'`, as any account of this computer that can read the file) can use the password. |
+| The recipients | `AllowedRecipientDomains` limits the domains; the log file names every recipient of every send. | An empty list allows any domain. The report, once delivered, is in the recipients' mailboxes and in the copies of your mail system: the tool does not control them (10.1). |
+
+**Cryptography in the tool.** It implements none of its own; it uses what Windows and .NET provide. E-mail: TLS as negotiated by Windows, with the floor you set in `Mail.MinimumTls` (`Tls12` is the one to choose when your SMTP server allows it) and a warning below TLS 1.2. The saved e-mail password: **DPAPI**, tied to a Windows account or to the computer. Integrity of the package: **SHA-256** hashes in the signed manifest, in the pins of the bundled SQLite files and in the SBOM, and an Authenticode signature with a timestamp. The access token of the portal: 256 random bits from the system generator. Kerberos protects the SMB and remote PowerShell links (4.3).
+
 <!-- icon: chart -->
 ## 9. Reading the report
 
 ![Overview](images/report-overview.png)
 
-- **Servers really used**: a server is *In use*, *Client access only*, *Mail flow only* or *No real usage* — the answer to "can this server be decommissioned?".
+- **Servers really used**: a server is *In use*, *Client access only*, *Mail flow only* or *No real usage* — the evidence for "can this server be decommissioned?", not the decision (next warning).
+> [!WARNING]
+> **A verdict is evidence, not an authorisation.** *No real usage*, and the absence of warnings, do not by themselves authorise the decommissioning of a server. The verdict covers the sources that were collected, over the period of the data: logging that was off or moved, a period shorter than a quarterly or yearly job, or an incomplete collection make it wrong. A source that stopped writing is reported as **stale** only for HttpProxy and the IIS front and back end. **SMTP protocol logs, message tracking, the MAPI HTTP back end and POP/IMAP have no stale check**: a server whose mail logging stopped looks like a server with no mail. Before a decommissioning, check in `-Mode Status` the dates of the data and the last read of every source of the server, that protocol logging is on for the connectors, that the period covers a full business cycle, and the other roles of the server (DAG member, send and receive connectors, hybrid, load balancer).
+
 - **Server cards**: real users, requests, unresolved failures, SMTP in/out, messages, protocol bars and a daily trend. Click a card for details.
 - **Activity by day**: client requests and messages per day.
 - **Tabs**: search box, filters, sortable columns, virtual scrolling (hundreds of thousands of rows), *Export view to CSV*. Click a row for all its details.
@@ -625,7 +800,7 @@ A SID resolved to a system account (`Noise.SystemUserPatterns`) has its requests
 
 When SIDs were stored before any evidence was gathered (`ResolveSids = $false`, or a database collected by a build without it), the collector reads the ActiveSync, OWA and ECP HttpProxy lines already collected once more, for their evidence only: at most `Collection.EvidenceRescanMBPerRun` per collection, continued by the next ones until every file is done or every stored SID is resolved. Only the files of configured servers are read, and the files of a server whose log folder the listing did not find wait for a collection that finds it. A database that never had a SID marks this as done at its first collection.
 
-A SID that nothing names stays a SID, marked **unresolved SID** in the tables. The **Identifiers** table of the user shows its status, its evidence and its hints; one line of `Collection.IdentityMapFile` names it. In practice, an account that only ever signs in with a token (OAuth) stays a SID until it signs in once to OWA, ECP or ActiveSync with a password (that gives anchor evidence), or until you name it in `Collection.IdentityMapFile`. `-Mode Status` counts the resolved SIDs, the SIDs paired in advance, and lists the unresolved and ambiguous ones with their hints, the back-end name that waits for a second day, and the account a SID no longer resolved was merged with.
+A SID that nothing names stays a SID, marked **unresolved SID** in the tables. The **Identifiers** table of the user shows its status, its evidence and its hints; one line of `Collection.IdentityMapFile` names it. In practice, an account that only ever signs in with a token (OAuth) stays a SID until it signs in once to OWA, ECP or ActiveSync with a password (that gives anchor evidence), or until you name it in `Collection.IdentityMapFile` (6.4). An account that uses only modern authentication tokens (OAuth) on ActiveSync or EWS, with no Outlook on MAPI and no password sign-in, may therefore stay a SID: `Collection.IdentityMapFile` maps it to its account. `-Mode Status` counts the resolved SIDs, the SIDs paired in advance, and lists the unresolved and ambiguous ones with their hints, the back-end name that waits for a second day, and the account a SID no longer resolved was merged with.
 
 **OAuth possible** follows Microsoft's table of the protocols that support (hybrid) modern authentication ([Configure Exchange Server to use Hybrid Modern Authentication](https://learn.microsoft.com/en-us/microsoft-365/enterprise/configure-exchange-server-for-hybrid-modern-authentication)): *Yes* for MAPI over HTTP (`Mapi`), EWS, ActiveSync (`Eas`), OWA, ECP and OAB (the table) and for Autodiscover (the same page configures OAuth on its virtual directory); *No* for Outlook Anywhere (`RpcHttp`: move those clients to MAPI over HTTP), IMAP4 and POP3; blank for the protocols the table does not name (REST, remote PowerShell). A user or a device that used two types in the period is counted once under each (the Users table shows both types on one row, so nobody is listed twice there). Rows aggregated before 3.0 have no type and stay *Unknown* until the retention removes them; nothing is back-filled.
 
@@ -724,6 +899,43 @@ Edge report (9.6): `Servers` and `Daily` without the client access columns, `Smt
 
 > [!TIP]
 > The CSV files are always complete; the HTML file shows up to `MaxHtmlRows` rows per tab. `SmtpSessions.csv` has every SMTP hop: in the HTML report, these transactions are in the route of their message and in the detail of their SMTP client.
+
+> [!NOTE]
+> **Cells that a spreadsheet would run.** In the CSV files, in the *Export view to CSV* of a report and in the export of the portal, a cell that starts with `=`, `+`, `-` or `@` after any blanks, or with a tab or a line break, gets a leading apostrophe, so that Excel shows it as text instead of running it as a formula. The rule is the same everywhere.
+
+> [!NOTE]
+> **The console and the log file.** Text that comes from the logs, the command line or the network (user names, URLs, subjects, server names) is printed with every control character (line breaks and escape sequences included; a tab is kept) replaced by `?`: a hostile value cannot move the cursor, change the colours or forge a line of the log file.
+
+> [!NOTE]
+> **The static HTML report.** It carries a Content-Security-Policy: the page cannot load anything from outside the file, and it runs only its own scripts (each report has a new random nonce). It needs a current **Edge, Chrome or Firefox**; an older browser may show it empty. The portal sends its own policy as a header.
+
+### 10.1 Personal data and its removal
+
+> [!NOTE]
+> **For the operator.** The organisation that runs the tool decides why and for how long the data is kept: it is the controller of what the tool stores. The database is a processing in its own right, with a purpose you define and a retention you can justify; it is not only the log of a server. The defaults are short (60 days of usage, 14 days of detail, 14 days of execution logs, and reports kept until you delete them, or until `Report.RetentionDays` does): lengthen them only for a reason, and set `Report.RetentionDays` so that the reports do not outlive it. A report about one named person (their sessions, messages and devices) is a use to agree with your data protection officer and, where the law requires it, with the staff representatives, before you produce it. The settings are in 6.4, the access restriction in 5.2 and the removal in this section and in 5.5. This is information, not legal advice.
+
+Noise removal is not anonymisation. The tool keeps account names, e-mail and IP addresses, device identifiers, message subjects and SMTP transcripts, and it writes them in several places. It deletes some of them by itself, not all:
+
+| Where | What it holds | Deleted by the tool |
+|---|---|---|
+| `data\ExchangeLogReport.sqlite` (`Storage.DatabasePath`) | The collected history. | Yes: after `Storage.RetentionDays` (60 days) for the usage, the messages and the SMTP transactions, after `Storage.DetailRetentionDays` (14 days) for the sessions, the failed and slow requests and the transcripts. |
+| `logs\` | The execution log of each day: server and account names, warnings, and every recipient (To, Cc, Bcc) of every e-mail sent. | Yes: after `Logging.RetentionDays` (14 days). |
+| `reports\` | The HTML and CSV files of every report (`Report.OutputPath`). | **Only if you ask.** `Report.RetentionDays` is `0` by default: the tool never deletes a report. With N days, a report run removes the report folders that it created more than N days ago: a folder counts only when its name is the one the tool gives (the case of the file prefix and of the report type does not matter) **and** it holds the `.exl-report` mark file that 3.1 writes when it creates it. The mark is not authenticated: anyone who can write in `reports\` can make a folder removable, so protect that folder (5.2). Reports of earlier versions have no mark and are never deleted; a folder that is or holds a junction or a link is skipped; every removal is logged. Delete the rest yourself. |
+| The Windows event log | The security events of 6.5 (`Logging.EventLog`): no address, no account name. | No: the Application log follows its own size and retention settings. |
+| The download folder of the browser | The CSV of *Export view to CSV*, from a report or from the portal. | **No.** The file is the browser's. |
+| Copies made with `Database-Storage.cmd` | A complete copy of the database as it was when you made it, wherever you wrote it. | **No.** |
+| E-mail | The body (summary and main problems: users, SMTP clients) and the attached report, then their copies in the mailboxes of the recipients and in your mail system. | **No.** |
+| The portal | The access token on the command line of the browser at launch (15.7). | When the portal stops, the token is useless. |
+
+Protect these folders (5.2) and remove what you no longer need. The reports are the usual leftover: set `Report.RetentionDays`, and prune the folders it does not cover (the reports of an earlier version, the other leftovers) on a schedule, for example the report folders older than 90 days:
+
+```powershell
+Get-ChildItem 'C:\Program Files\ExchangeLogReport\reports' -Directory -Filter 'ExchangeLogs_*' |
+    Where-Object LastWriteTime -lt (Get-Date).AddDays(-90) |
+    Remove-Item -Recurse -Force
+```
+
+Add `-WhatIf` to `Remove-Item` to list what would go. Do the same for the copies of the database, the exports in the download folders and the e-mail in your mail system.
 
 # Part IV · Maintain
 
@@ -1150,6 +1362,15 @@ Shadow-event exclusions configured in the collector are preserved: extra trackin
 For local automation only: `-NoBrowser -ReadyFile <unused private path> -ReadyFileWithToken`. The readiness file belongs to the current Windows identity; success has `status` `ready`, a bind failure has `status` `blocked` and a diagnostic code but no token, and an existing file is never replaced. The token travels as the `X-Portal-Token` header. **Stop portal** or Ctrl+C stops the listener, not the scheduled collection; closing the browser tab alone leaves it running.
 
 For a view that fails, check in this order: the console message, `-Mode Status`, the selected database and schema, the retained coverage, the filters and the end bound. An access error needs the private link of this instance. An unsupported schema needs the new-copy procedure (user guide, chapter 11). A timeout or a row bound needs a narrower selection, never a higher limit. Results measured on a small synthetic database do not prove the latency of a database of tens of GB or of an operating system cache that is cold: record the size, the row counts, the exact filters, the query plans and the timings of the real database.
+### 15.7 Who can read the portal
+
+- **It listens on this computer only.** `127.0.0.1`, on port **8765** by default (`-Port` chooses another; `-Port 0` takes a free one). Nothing is exposed on the network, and the launcher changes no firewall rule.
+- **The token is the only key.** Every request needs a random access token (256 bits, new at each start). **Anyone who has the token reads everything the portal reads**: the accounts, addresses, subjects and SMTP transcripts of every day in the database. The portal is read-only: it never changes the database or Exchange.
+- **The token is on the command line of the browser at launch.** `Start-Portal.cmd` opens the browser on `http://127.0.0.1:<port>/#token=<token>`: the address, with the token, is the command line of the browser process that receives it, which any administrator of the computer (and any account allowed to list the command lines of processes) can read. Start the portal in your own session, on a computer whose administrators you trust, and not on a shared terminal server. The token is never written to the log.
+- **`-NoBrowser`** keeps the token off the command line, but then nothing opens the page: the mode is for local automation with `-ReadyFile <private path> -ReadyFileWithToken` (15.6), and the file then holds the token: keep it private.
+- **Browser isolation and idle stop.** The portal sends `Cross-Origin-Opener-Policy: same-origin` and `Cross-Origin-Resource-Policy: same-origin`, so that another site cannot reach the page or embed its answers. `-IdleMinutes <n>` (default `0`, no limit; up to 10,080) stops the portal after n minutes without a request, so that a forgotten portal does not stay open with its token valid.
+- **Never share the address** (the link of a ticket, a chat or a screenshot), and stop the portal when you are done (**Stop portal**, or Ctrl+C): the token dies with it.
+
 # Annexes
 
 <!-- icon: lifebuoy -->
@@ -1171,6 +1392,7 @@ For a view that fails, check in this order: the console message, `-Mode Status`,
 | A source is **stale** | No new HttpProxy or IIS file for `StaleSourceHours`: the server was stopped, logging was turned off, or the logs were moved and the old folder is read. Check the folder on the server, then run `-Mode Discover`. |
 | `The paths file was written on …` | The paths file comes from another collector: run `-Mode Discover` on this one. |
 | A server is *No real usage* but users say they use it | Check the load balancer (are requests reaching it?) and the noise counters in `-Mode Status`: a too broad `SystemUserPatterns` or `ExcludedClientIps` rule can remove real users. |
+| A server is *No real usage*, and you want to decommission it | The verdict is evidence, not an authorisation: SMTP, message tracking, MAPI and POP/IMAP sources have no stale check. Read the warning of chapter 9 first. |
 | Every user comes from the same IP | The load balancer uses SNAT. Usage is right; for client addresses enable `X-Forwarded-For` on the load balancer (HttpProxy logs it in `ClientIpAddress`). |
 | No IMAP / POP session | `Sources.PopImap` is `$false`, or protocol logging is off (`Get-ImapSettings | fl ProtocolLogEnabled`): enable it and restart the IMAP4 / POP3 services (front end and back end). |
 | A session ends *Failed* although the client works | Look at the timeline: an `OPTIONS` / `LOGOUT` success says nothing about the session; a back-end error behind HTTP 200 counts as a failure. A long-polling request not listed in `LongRunningPatterns` can also appear as *Slow*. |
@@ -1186,6 +1408,34 @@ For a view that fails, check in this order: the console message, `-Mode Status`,
 | `Package integrity: …` | A protected file is missing, changed or unknown, or a signature is not valid: see "Package integrity" in chapter 5. Extract the release ZIP again and unblock it; do not edit protected files. An unsigned build (CI artifact, `-Unsigned`, a source checkout) is refused by the launchers by design: start it with `powershell\pwsh.exe -File Invoke-ExchangeLogReport.ps1 … -DevelopmentMode` (5.1). |
 | The report is slow to open | More than ~200,000 rows: lower `MaxHtmlRows` and use the CSV, or narrow the period / users. |
 | Collection slow | The statistics line of the execution log says what limits it (chapter 12.3): processors, write thread or disk. Administrative shares are slower than local disks: run one collector per site, and schedule hourly so that each run reads one hour only. |
+
+### Warnings of the security checks
+
+These are warnings: the run goes on, and the first four never change the exit code. The log file of the day keeps every one of them.
+
+| Warning | Cause and action |
+|---|---|
+| `Package folder: <account> can change <folder> …` or `… can delete or replace <folder>, a parent of the package folder` | The run is elevated and an account that is not an administrator can change the package. Restrict the write access to the administrators and SYSTEM (5.2). `Security.RequireProtectedFolder = $true` turns the warning into a refusal. |
+| `Package integrity: The publisher root certificate is not trusted on this server …` | The server lacks the root certificate of the publisher. The package was accepted on the pinned certificate and the signed hashes (5.1). Install the root, or accept the warning. |
+| `Package integrity: reparse point that is not accepted (tag 0x…)` | A file of the package, or a folder that holds it, is a link: a symbolic link, a junction or another type that redirects, or a type the check does not know (the tag is shown). Install the package in a normal folder. OneDrive, data deduplication and CompactOS are accepted (5.1). |
+| `Package integrity: this cloud file (OneDrive) is not downloaded …` | The package is in a OneDrive folder, a file was not downloaded and this computer cannot reach OneDrive now. Reconnect the computer so that the file can be downloaded, then start the tool again, or install the tool outside OneDrive. |
+| `Servers[n].Name '…' is an IP address` (or `contains a slash…`, `is not a host name…`) | The name is not a plain host name: the logs are read from `\\<name>\C$` and the tool connects to that name. Use the name of the server (6.1). |
+| `Servers[n].Name '…' was not found by the last -Mode Discover` | The name differs from the servers that discovery found: its log folders are the default ones. Check the spelling, or run `-Mode Discover` again. |
+| `Mail credential file: <file>: it inherits the permissions of its folder; it grants access to <account> …` | One warning per run, naming the file and everything that is wrong: the file inherits the permissions of its folder, or other accounts can read or change it (those that are not SYSTEM, the administrators, its writer, its owner or the account that runs the tool). A file written by an earlier version under `Program Files` has these entries. It still works. Write it again once, with the account that runs the tool: `.\Run-Collector.cmd -Mode MailTest -Credential (Get-Credential)`. |
+| `The e-mail session negotiated TLS 1.0, older than TLS 1.2 …` | The message was sent, over an obsolete protocol. Enable TLS 1.2 on the SMTP server (or on Windows), then set `Mail.MinimumTls = 'Tls12'` so that an older session is refused (8.1). |
+| `The server negotiated TLS 1.0, below Mail.MinimumTls (Tls12): nothing was sent.` | The server does not offer the protocol you require. Nothing was sent, no password either. Enable the protocol on the server, or lower `MinimumTls` knowingly. |
+| `Mail.MinimumTls = '…' needs Mail.Encryption = 'StartTls' or 'Tls'.` | `MinimumTls` has no meaning without TLS: configuration refused. |
+| `Windows event log: the events are not written (…)` | `Logging.EventLog` is on, and this account cannot register the source or write to the log. Warned once; the run goes on. Register the source as an administrator (6.5), or set `Logging.EventLog` to `$false`. |
+| `Report folder … could not be removed` / `… holds a reparse point: it is not removed` | `Report.RetentionDays` found an old folder it may not or will not delete (a file in use, a junction inside). Warning only: the other folders are handled. |
+| `The password was not saved: the file … could not be created with its access restricted …` | The credential file could not be created with its protected access control (a folder that refuses it, no right to write). Nothing was written. |
+| `Mail: '<address>' is not in a domain of Mail.AllowedRecipientDomains …` | A recipient is outside the allow-list: the configuration is refused (8.1). Correct the address or the list. |
+| `the certificate of the server is not trusted (…: UntrustedRoot …)` | The message is not sent. The names after the colon are the reasons Windows gives for the chain. Use the name of the certificate in `Mail.SmtpServer`, or pin its thumbprint (8.1). |
+| `The execution policy of this computer would not let the discovery helper run …` | `-Mode Discover` started its helper with the Bypass policy, after checking the manifest and the owner signature (5.4). Run `Unblock-File` on the ZIP before you extract it, or add the owner certificate to the Trusted Publishers store. |
+| `The execution policy of this computer is set by Group Policy (…)` / `-Mode Discover cannot start its helper: the execution policy of this computer is set by Group Policy …` | No Bypass can override a Group Policy (5.4). Run `-Mode Discover` where the policy accepts the package files, ask for the policy to be changed, or write the log folders in the `Servers` block (6.1). Exit code 1 when the helper is refused. |
+| `The Exchange Management Shell was refused by the execution policy of this computer …` / `The execution policy of this computer is AllSigned, which is not supported for -Mode Discover …` | The Exchange Management Shell does not run under *AllSigned*: the package files are not the cause. Use a policy such as *RemoteSigned* for `-Mode Discover` (5.4). Exit code 1. |
+| `The discovery helper is not the file listed by the signed manifest` (or `The signature of the discovery helper does not match its content`, `… is signed by a certificate other than the owner certificate`) | The helper was modified: it is not started. Extract the release again. |
+| `<n> line(s) longer than 8 MB skipped on <server> (<source>)` | Exit code 2. A log line over 8 MB was not read (6.3). Look at the file that holds it: it is not an Exchange log line. |
+| `<n> match(es) of the regular expressions of <setting> exceeded the time limit twice …` | Exit code 2. A pattern of the noise rules or of `Collection.LongRunningPatterns` needed more than 2 seconds for a line, twice. Those lines were counted as no match. After 10 such timeouts the pattern is dropped for the rest of the collection, and the warning says so (*The expression of <setting> was dropped …*). Simplify it (6.3). |
 
 <!-- icon: file -->
 ## Annex B — Exchange log fields used
@@ -1205,4 +1455,37 @@ The columns are found by name in the `#Fields:` header of each file: a different
 <!-- icon: tag -->
 ## Annex C — Versioning
 
-MAJOR.MINOR.PATCH: MAJOR for a database or configuration change that needs action, MINOR for a new feature, PATCH for a fix. Every change is listed in `CHANGELOG.md`. Version 3.0.0 (database schema 13, the portal, the launchers, the storage tool in the bundled PowerShell) follows 2.1.1 directly: a MAJOR change because the database schema upgrades once, the status words changed and the package layout gained the launchers and the built folders. Version 3.0.1 changes the documentation only.
+MAJOR.MINOR.PATCH: MAJOR for a database or configuration change that needs action, MINOR for a new feature, PATCH for a fix. Every change is listed in `CHANGELOG.md`. Version 3.0.0 (database schema 13, the portal, the launchers, the storage tool in the bundled PowerShell) follows 2.1.1 directly: a MAJOR change because the database schema upgrades once, the status words changed and the package layout gained the launchers and the built folders. Version 3.0.1 changed the documentation only. Version 3.1.0 adds security checks that warn and a few optional settings (`Security`, `Mail.CheckRevocation`, `Mail.AllowedRecipientDomains`, `Mail.MinimumTls`, `Logging.EventLog`, `Report.RetentionDays`), with no migration.
+
+<!-- icon: checklist -->
+## Annex D — Deployment security checklist
+
+Everything a deployment needs for security, in one place, with where each point is explained. Tick it before the first scheduled collection and after every change of server or account.
+
+| Area | Check | Where |
+|---|---|---|
+| Download | The publisher thumbprint, the attestation and the SBOM of the ZIP were checked. | 5.3 |
+| Folder | The package is under `%ProgramFiles%` (or another folder with the same permissions); only Administrators and SYSTEM can write it; every copy, the Edge copies included. | 5.2 |
+| Folder | `data`, `reports` and `logs` are writable by the collector account only. `Security.RequireProtectedFolder` can be `$true` once the start shows no warning. | 5.2 |
+| Accounts | The collector is SYSTEM, or a domain account that is local administrator of the Exchange servers only through a group; password in a vault, no interactive logon. *View-Only Organization Management* is for `-Mode Discover` only. | 4.1 |
+| Tasks | Every scheduled task starts the `.cmd` launcher, not `pwsh.exe -File`. | 7 |
+| Network | SMB signing is required between the collector and the Exchange servers (and SMB encryption where your policy asks). `-Mode Discover` uses the server name, never its address. | 4.3 |
+| E-mail | `Encryption` is `StartTls` or `Tls`; Kerberos is not taken for encryption; `CertificateThumbprint` is understood to replace the certificate validation; `AllowedRecipientDomains` is set; `CheckRevocation` is decided. | 8.1 |
+| Portal | Started in your own session, not on a shared terminal server; its address is never shared. | 15.7 |
+| Hardened server | The publisher certificate is allowed by the App Control or AppLocker policy and its root is trusted; the policy is tested before production (not tested by the tool). | 5.4 |
+| Clocks | The clocks of the collector and of **every** Exchange server are synchronised (domain time or the same NTP source): sessions and messages are correlated by time, and a skew splits or misplaces them. | 11.1 |
+| Encryption at rest | The volume that holds `data` and `reports` is encrypted (for example BitLocker), and so are the backups of that volume. | 10.1 |
+| Where data lives | When your policy keeps data off the system disk, leave the package under `%ProgramFiles%` and set `Storage.DatabasePath`, `Report.OutputPath`, `Logging.Path` and `Report.ScratchFolder` to a folder of a protected data volume, with the permissions of 5.2. | 6.4, 5.2 |
+| Retention | The retention settings fit your purpose; `Report.RetentionDays` is set, and the exports and the older reports are pruned on a schedule. | 6.4, 10.1 |
+| Monitoring | `Logging.EventLog` is on if you want the events in your SIEM, and the source is registered in advance. | 6.5 |
+| TLS | `Mail.MinimumTls` is `Tls12` or `Tls13` once the SMTP server allows it. | 8.1 |
+| Decisions | *No real usage* is not taken as the authorisation to decommission a server. | 9 |
+| End of life | You know how to remove the tool and its data. | 5.5 |
+
+**Outbound connections.** The tool itself needs **no Internet access**: it reads files over SMB, uses remote PowerShell over HTTP to one Exchange server for `-Mode Discover`, sends SMTP to your server when you enable the e-mail, and the portal stays on `127.0.0.1`. These are the connections of the platform that it runs on, which you may meet in a firewall log:
+
+| From | To | Why | If blocked |
+|---|---|---|---|
+| Windows, when it checks a signature or a certificate | The CRL distribution points, the OCSP responders and the issuer certificates (AIA) named in the certificates | Revocation and chain of the owner signature, and of the SMTP server certificate when `CheckRevocation` is `$true` | The package check accepts the signature with the warning of 5.1; with `CheckRevocation`, the e-mail is not sent when the status cannot be read. |
+| Windows | The automatic root certificate update of Microsoft | A missing public root certificate is downloaded on demand | A server without the publisher root gets the warning of 5.1. |
+| The bundled PowerShell | A Microsoft address, once a day (update check); Microsoft (telemetry) | Both are on by default in PowerShell | The launchers switch both off (`POWERSHELL_TELEMETRY_OPTOUT`, `POWERSHELL_UPDATECHECK`); a task that does not use a launcher must have them set for the machine (7). |

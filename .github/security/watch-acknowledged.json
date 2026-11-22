@@ -1,0 +1,38 @@
+{
+  "schemaVersion": 1,
+  "comment": "Findings of the vulnerability watch that the owner has triaged. An entry is reported by the watch but does not fail the run, until its reviewAfter date has passed. Fields: id (CVE, GHSA or watch id), component (as in the watch table), decision (not-affected, fixed-in-next-release or accepted), reason, date and reviewAfter (yyyy-MM-dd).",
+  "acknowledgements": [
+    {
+      "id": "CVE-2026-119586",
+      "component": "SQLite tools (sqlite3.exe)",
+      "decision": "not-affected",
+      "reason": "The vulnerable code is the .recover command of the sqlite3 command-line shell. The package runs sqlite3.exe only from Database-Storage (Storage.Audit.cs): -safe -readonly -batch -json with one fixed SELECT, no .recover or any other dot-command, and only its JSON output is read. The operator supplies a database path and a tool path that must hash to the pinned executable. 3.54.1 is the latest release and has no fix.",
+      "date": "2026-11-18",
+      "reviewAfter": "2027-02-16"
+    },
+    {
+      "id": "CVE-2026-119586",
+      "component": "SQLite library (e_sqlite3)",
+      "decision": "not-affected",
+      "reason": "The vulnerable code is the .recover command of the sqlite3 command-line shell, which is not part of the e_sqlite3 library that the collector loads. 3.54.1 is the latest SQLite release and has no fix.",
+      "date": "2026-11-18",
+      "reviewAfter": "2027-02-16"
+    },
+    {
+      "id": "CVE-2022-31631",
+      "component": "SQLite tools (sqlite3.exe)",
+      "decision": "not-affected",
+      "reason": "A PHP PDO::quote() flaw (PHP before 8.0.27, 8.1.15 and 8.2.2) that NVD matched to the SQLite CPE. It is not SQLite code and the package contains no PHP.",
+      "date": "2026-11-18",
+      "reviewAfter": "2027-02-16"
+    },
+    {
+      "id": "CVE-2022-31631",
+      "component": "SQLite library (e_sqlite3)",
+      "decision": "not-affected",
+      "reason": "A PHP PDO::quote() flaw (PHP before 8.0.27, 8.1.15 and 8.2.2) that NVD matched to the SQLite CPE. It is not SQLite code and the package contains no PHP.",
+      "date": "2026-11-18",
+      "reviewAfter": "2027-02-16"
+    }
+  ]
+}

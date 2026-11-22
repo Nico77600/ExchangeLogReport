@@ -93,7 +93,7 @@ Describe 'Public workflow contracts' {
         $product.visibility | Should -BeExactly 'public'
         $product.status | Should -BeExactly 'release'
         $product.name | Should -BeExactly 'ExchangeLogReport'
-        $product.version | Should -BeExactly '3.0.1'
+        $product.version | Should -BeExactly '3.1.0'
     }
 
     It 'declares the actual package runtime and existing validation paths without inventing required checks' {
@@ -191,7 +191,9 @@ Describe 'Public workflow contracts' {
         @($steps | Where-Object { $_.PSObject.Properties['run'] } | ForEach-Object run)[0] | Should -Match 'Initialize-CIModules\.ps1'
         Test-Path -LiteralPath (Join-Path $script:Root '.github\scripts\Test-NodeEngine.ps1') | Should -BeFalse
         Test-Path -LiteralPath (Join-Path $script:Root 'frontend') | Should -BeFalse
-        foreach ($name in 'package.json', 'package-lock.json', 'dependabot.yml') {
+        # Dependabot is configured for the GitHub Actions pins only (and with no pull request for the declared NuGet packages): no Node.js ecosystem.
+        (Get-Content -LiteralPath (Join-Path $script:Root '.github\dependabot.yml') -Raw) | Should -Not -Match '(?i)npm|node'
+        foreach ($name in 'package.json', 'package-lock.json') {
             @(Get-ChildItem -LiteralPath $script:Root -Filter $name -File -Recurse -Depth 2 -ErrorAction SilentlyContinue |
                 Where-Object { $_.FullName -notlike '*\artifacts\*' }).Count | Should -Be 0 -Because $name
         }
@@ -207,17 +209,16 @@ Describe 'Public workflow contracts' {
         })
         $download = @($ast.FindAll({
             param($node)
-            $node -is [Management.Automation.Language.CommandAst] -and $node.GetCommandName() -ceq 'Save-Module'
+            $node -is [Management.Automation.Language.CommandAst] -and $node.GetCommandName() -ceq 'Invoke-WebRequest'
         }, $true))
         $create.Count | Should -Be 1
-        $download.Count | Should -Be 2
+        $download.Count | Should -Be 1
         $create[0].Extent.StartOffset | Should -BeLessThan $download[0].Extent.StartOffset
         $initializer.IndexOf('if (Test-Path -LiteralPath $Destination)') |
             Should -BeLessThan $create[0].Extent.StartOffset
         $download[0].Extent.Text |
-            Should -BeExactly 'Save-Module -Name Pester -RequiredVersion 6.1.0 -Repository PSGallery -Path $Destination -ErrorAction Stop'
-        $download[1].Extent.Text |
-            Should -BeExactly 'Save-Module -Name PSScriptAnalyzer -RequiredVersion 1.25.0 -Repository PSGallery -Path $Destination -ErrorAction Stop'
+            Should -BeExactly "Invoke-WebRequest -Uri ('https://www.powershellgallery.com/api/v2/package/{0}/{1}' -f `$module.Name, `$module.Version) -OutFile `$package"
+        $initializer.IndexOf('Install-PinnedModule -Name $module.Name') | Should -BeGreaterThan $download[0].Extent.StartOffset
         $Destination = Join-Path $TestDrive 'new-module-parent\ci-modules'
         Test-Path -LiteralPath $Destination | Should -BeFalse
         . ([scriptblock]::Create($create[0].Extent.Text))
@@ -301,10 +302,13 @@ Describe 'Public workflow contracts' {
         $script:Attestation | Should -Match 'repository_metadata\.get\("private"\) is not False'
         $script:Attestation | Should -Match 'github.event.repository.default_branch'
         $script:Attestation | Should -Match 'no source archive fallback'
-        $script:Attestation | Should -Match 'Release ZIP assets changed during download'
+        $script:Attestation | Should -Match 'Release ZIP or SBOM assets changed during download'
         $script:Attestation | Should -Match 'The release tag changed during verification'
         $script:Attestation | Should -Match "subject-path: 'dist/\*\.zip'"
-        $script:Attestation | Should -Not -Match 'uses: actions/checkout|dotnet build|npm ci|gh release create|gh release upload'
+        $attestText = $script:Attestation -replace "`r`n", "`n"
+        $attestJob = $attestText.Substring($attestText.IndexOf("`n  attest:`n"))
+        $attestJob | Should -Not -Match 'uses: actions/checkout|dotnet build|npm ci|gh release create|gh release upload'
+        $script:Attestation | Should -Not -Match 'dotnet build|npm ci|gh release create|gh release upload'
     }
 
     It 'syntax-parses every CI PowerShell helper without executing it' {
@@ -334,6 +338,7 @@ import sys
 import zipfile
 
 text = Path(sys.argv[1]).read_text(encoding="utf-8")
+text = text[text.index("\n  attest:\n"):]
 match = re.search(r"(?ms)^          import hashlib\r?\n.*?^          PY\r?$", text)
 assert match, "The reviewed inline verifier must remain inspectable"
 lines = match.group(0).splitlines()
@@ -355,14 +360,14 @@ base = {
     "powershell/pwsh.exe": b"synthetic executable placeholder",
     "sqlite-tools/sqlite3.exe": b"synthetic sqlite tool",
     "config/ExchangeLogReport.config.psd1": b"@{Synthetic=$true}",
-    "product.json": json.dumps({"name": "ExchangeLogReport", "version": "3.0.1"}).encode(),
+    "product.json": json.dumps({"name": "ExchangeLogReport", "version": "3.1.0"}).encode(),
 }
 for script in SCRIPTS:
     base[script] = b"# synthetic script" + signature
 MUTABLE = "config/ExchangeLogReport.config.psd1"
 BINARY = ("powershell/", "sqlite-tools/")
 
-def manifest_text(files, *, bad_schema=False, thumbprint="0F28E442889F17B5F4D251E8F96E7CC6E2C9C6D6", version="3.0.1", sign=True, unix_inventory=False, traversal=False):
+def manifest_text(files, *, bad_schema=False, thumbprint="0F28E442889F17B5F4D251E8F96E7CC6E2C9C6D6", version="3.1.0", sign=True, unix_inventory=False, traversal=False):
     lines = ["@{", f"    SchemaVersion = {2 if bad_schema else 1}", "    Algorithm = 'SHA256'",
              f"    SignerThumbprint = '{thumbprint}'", f"    Version = '{version}'"]
     entries = [(name, data) for name, data in files.items() if name != MUTABLE]
@@ -390,7 +395,7 @@ def make_zip(files=None, *, prefix="release/", manifest=True, changed=False, ext
         files["Database-Storage.ps1"] = b"# synthetic script without a signature"
     manifest_bytes = manifest_text(files, bad_schema=bad_schema, sign=not unsigned_manifest, unix_inventory=unix_inventory, traversal=traversal,
                                    thumbprint="0000000000000000000000000000000000000000" if wrong_signer else "0F28E442889F17B5F4D251E8F96E7CC6E2C9C6D6",
-                                   version="3.0.0" if wrong_version else "3.0.1")
+                                   version="3.0.0" if wrong_version else "3.1.0")
     result = io.BytesIO()
     with zipfile.ZipFile(result, "w", zipfile.ZIP_DEFLATED) as archive:
         for name, data in files.items():
@@ -419,7 +424,7 @@ def make_changed():
     result.seek(0)
     return result
 
-assert verify(make_zip(), expected_version="3.0.1")["report_script_bytes"] == len(base[MAIN])
+assert verify(make_zip(), expected_version="3.1.0")["report_script_bytes"] == len(base[MAIN])
 assert verify(make_zip(prefix=""))["verified_files"] == len(base) - 1
 missing_script = {name: data for name, data in base.items() if name != MAIN}
 missing_page = {name: data for name, data in base.items() if name != PAGE}
@@ -437,7 +442,7 @@ cases = [
 ]
 for number, fixture in enumerate(cases):
     try:
-        verify(fixture, expected_version="3.0.1")
+        verify(fixture, expected_version="3.1.0")
     except (SystemExit, ValueError, zipfile.BadZipFile):
         continue
     raise AssertionError(f"Invalid bundle fixture {number} was accepted")

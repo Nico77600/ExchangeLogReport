@@ -2,7 +2,7 @@
 //  Exchange Log Report - engine, part 1: text helpers
 // -----------------------------------------------------------------------------
 //  Author  : Nicolas Fabert
-//  Version : 3.0.1
+//  Version : 3.1.0
 //  The src\Engine.*.cs files are compiled together by ExchangeLogReport.psm1
 //  the first time they are used (and again whenever one of them changes).
 //
@@ -64,6 +64,10 @@ namespace ExchangeLogReport
         public byte[] Buffer;
         public int Start, Length;
         public long NextOffset;          // byte offset that follows the line: the resume point
+        /// <summary>The line was longer than MaxBytes: its content is not kept (Length is 0) and TooLong is the reason to count.</summary>
+        public bool Oversized;
+        public const int MaxBytes = 8 << 20;
+        public const string TooLong = "Line too long (skipped)";
 
         public int First { get { return Length > 0 ? Buffer[Start] : -1; } }
 
@@ -139,6 +143,7 @@ namespace ExchangeLogReport
                         int begin = 0, end = 0;          // unread data: buffer[begin..end)
                         long position = offset;          // file offset of buffer[begin]
                         bool first = offset == 0;
+                        bool discarding = false;         // inside a line longer than LogLine.MaxBytes: its bytes are dropped up to its end of line
                         while (true)
                         {
                             int nl = end > begin ? Array.IndexOf(buffer, (byte)'\n', begin, end - begin) : -1;
@@ -146,6 +151,7 @@ namespace ExchangeLogReport
                             {
                                 // Move the partial line to the start of the buffer (grow it for a very long line), then read more.
                                 int pending = end - begin;
+                                if (discarding || pending >= LogLine.MaxBytes) { discarding = true; position += pending; begin = end = 0; pending = 0; }
                                 if (pending > 0 && begin > 0) Buffer.BlockCopy(buffer, begin, buffer, 0, pending);
                                 else if (pending == buffer.Length) { Array.Resize(ref buffer, buffer.Length * 2); line.Buffer = buffer; }
                                 begin = 0; end = pending;
@@ -199,6 +205,16 @@ namespace ExchangeLogReport
                                     if (end + read >= 3 && buffer[0] == 0xEF && buffer[1] == 0xBB && buffer[2] == 0xBF) { begin = 3; position += 3; }
                                 }
                                 end += read;
+                                continue;
+                            }
+                            if (discarding)
+                            {
+                                discarding = false;
+                                position += nl + 1 - begin;
+                                begin = nl + 1;
+                                line.Buffer = buffer; line.Start = begin; line.Length = 0; line.Oversized = true; line.NextOffset = position;
+                                yield return line;
+                                line.Oversized = false;
                                 continue;
                             }
                             int length = nl - begin;

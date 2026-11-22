@@ -1602,7 +1602,7 @@
 
   // ---- Export of the current view -----------------------------------------------------------------
   el("export").addEventListener("click", () => {
-    const esc = v => { v = v == null ? "" : String(v); if (/^[=+\-@\t\r]/.test(v)) v = "'" + v; return /[";\r\n]/.test(v) ? `"${v.replace(/"/g, '""')}"` : v; };
+    const esc = v => { v = v == null ? "" : String(v); if (/^(?:[\t\r\n]|[ \t\r\n]*[=+\-@])/.test(v)) v = "'" + v; return /[";\r\n]/.test(v) ? `"${v.replace(/"/g, '""')}"` : v; };
     if (!tab) return;
     // A list browsed on the server is exported by the server (the same columns and cells), every row of the selection with its filters.
     if (served && portal.remote(tab.name)) { portal.exportRemote(tab.name); return; }

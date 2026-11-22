@@ -2,7 +2,7 @@
 //  Exchange Log Report - engine, part 7: sending the report by e-mail (SMTP)
 // -----------------------------------------------------------------------------
 //  Author  : Nicolas Fabert
-//  Version : 3.0.1
+//  Version : 3.1.0
 //
 //  A small SMTP client (RFC 5321) written for the tool, so that every option is
 //  explicit and checked:
@@ -46,6 +46,10 @@ namespace ExchangeLogReport
         public string Encryption = "StartTls";        // None | StartTls | Tls
         public string Authentication = "Anonymous";   // Anonymous | Basic | Kerberos
         public string UserName, Password;             // Basic; Kerberos with another account
+        /// <summary>Check the revocation of the certificate of the server (online; the send fails when the status cannot be read). Not used with a pinned thumbprint.</summary>
+        public bool CheckRevocation;
+        /// <summary>None (default) | Tls12 | Tls13: a session that negotiates an older protocol is refused before anything is sent. Empty or None: no minimum.</summary>
+        public string MinimumTls = "None";
         public string[] To = new string[0], Cc = new string[0], Bcc = new string[0];
     }
 
@@ -72,6 +76,8 @@ namespace ExchangeLogReport
         public List<string> Refused = new List<string>();
         public string[] ServerCapabilities = new string[0];
         public long MessageBytes;
+        /// <summary>Warnings about the session that did not stop it (a TLS version older than 1.2).</summary>
+        public List<string> Warnings = new List<string>();
     }
 
     public sealed class SmtpException : Exception
@@ -280,10 +286,11 @@ namespace ExchangeLogReport
                     return false;
                 }
                 if (errors == SslPolicyErrors.None) return true;
-                problem = "the certificate of the server is not trusted (" + errors + "). Use the name of the certificate in Mail.SmtpServer, or pin its thumbprint in Mail.CertificateThumbprint";
+                string chainDetail = chain == null ? "" : string.Join(", ", chain.ChainStatus.Select(x => x.Status.ToString()).Distinct());
+                problem = "the certificate of the server is not trusted (" + errors + (chainDetail.Length > 0 ? ": " + chainDetail : "") + "). Use the name of the certificate in Mail.SmtpServer, or pin its thumbprint in Mail.CertificateThumbprint";
                 return false;
             });
-            try { ssl.AuthenticateAsClient(new SslClientAuthenticationOptions { TargetHost = s.Server, EnabledSslProtocols = SslProtocols.None, CertificateRevocationCheckMode = X509RevocationMode.NoCheck }); }
+            try { ssl.AuthenticateAsClient(new SslClientAuthenticationOptions { TargetHost = s.Server, EnabledSslProtocols = SslProtocols.None, CertificateRevocationCheckMode = s.CheckRevocation && pinned == null ? X509RevocationMode.Online : X509RevocationMode.NoCheck }); }
             catch (AuthenticationException ex) { throw new SmtpException("TLS failed: " + (problem ?? ex.Message)); }
             c.Stream = ssl;
             string protocol;
@@ -291,10 +298,29 @@ namespace ExchangeLogReport
             {
                 case SslProtocols.Tls13: protocol = "TLS 1.3"; break;
                 case SslProtocols.Tls12: protocol = "TLS 1.2"; break;
-                default: protocol = ssl.SslProtocol.ToString(); break;
+                default:
+                    protocol = ssl.SslProtocol.ToString();
+                    if (protocol == "Tls") protocol = "TLS 1.0"; else if (protocol == "Tls11") protocol = "TLS 1.1"; else if (protocol == "Ssl3") protocol = "SSL 3.0";
+                    break;
             }
+            string minimum = (s.MinimumTls ?? "None").Trim();
+            if (BelowMinimum(ssl.SslProtocol, minimum))
+                throw new SmtpException("The server negotiated " + protocol + ", below Mail.MinimumTls (" + minimum + "): nothing was sent.");
+            if (IsBelowTls12(ssl.SslProtocol))
+                result.Warnings.Add("The e-mail session negotiated " + protocol + ", older than TLS 1.2: the message is protected by an obsolete protocol. Enable TLS 1.2 on the SMTP server (Mail.MinimumTls refuses older versions).");
             result.Tls = protocol + ", " + ssl.NegotiatedCipherSuite;
             result.Transcript.Add("* " + result.Tls + (result.Certificate != null ? ", certificate " + result.Certificate : ""));
+        }
+
+        /// <summary>A protocol older than TLS 1.2 (SSL 2.0 and 3.0, TLS 1.0 and 1.1).</summary>
+        internal static bool IsBelowTls12(SslProtocols p) { return p != SslProtocols.None && p != SslProtocols.Tls12 && p != SslProtocols.Tls13; }
+
+        /// <summary>The negotiated protocol is older than Mail.MinimumTls (Tls12 or Tls13; anything else is no minimum).</summary>
+        internal static bool BelowMinimum(SslProtocols p, string minimum)
+        {
+            if (string.Equals(minimum, "Tls13", StringComparison.OrdinalIgnoreCase)) return p != SslProtocols.Tls13;
+            if (string.Equals(minimum, "Tls12", StringComparison.OrdinalIgnoreCase)) return IsBelowTls12(p);
+            return false;
         }
 
         static void AuthBasic(Connection c, MailSettings s, List<string> mechanisms, MailResult result)

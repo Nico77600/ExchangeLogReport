@@ -21,7 +21,7 @@
 
 .NOTES
     Author  : Nicolas Fabert
-    Version : 3.0.1
+    Version : 3.1.0
     History : see CHANGELOG.md
 
     This Script is a Personal project.
@@ -32,8 +32,99 @@
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
-$script:ToolVersion = '3.0.1'
+$script:ToolVersion = '3.1.0'
 $script:ToolRoot = $PSScriptRoot
+# The owner certificate pinned by the verifier (src\Test-PackageIntegrity.ps1) and by the entry script; PackageVerified is set once the
+# verifier has accepted the tree in this process.
+$script:OwnerThumbprint = '0F28E442889F17B5F4D251E8F96E7CC6E2C9C6D6'
+$script:PackageVerified = $false
+$script:VerifiedManifest = $null
+function Get-OwnerSignatureVerdict {
+    <#
+        Whether a PowerShell file of the package carries the owner's signature, from a Get-AuthenticodeSignature result. The same text is in
+        the verifier, the module and both entry scripts: each judges the verifier before it runs, so none can borrow the code of another.
+        Accepted when the signer is the pinned certificate, the signature is timestamped and either the status is Valid, or the status is
+        UnknownError (what Windows reports when the certificate chain cannot be built on this computer; the signature itself still verifies,
+        which Windows reports as HashMismatch otherwise) and the chain fails because the root or an intermediate certificate is missing
+        (Relaxed). Never accepted: HashMismatch, NotSigned, NotTrusted (a certificate that an administrator explicitly distrusts), another
+        signer, a missing timestamp, a chain that fails for any other reason (Revoked, NotSignatureValid, ExplicitDistrust...) or only because
+        no revocation source is reachable. Only names of enumerations are read, never message text. -ChainFlags (names of
+        X509ChainStatusFlags) replaces the chain built here.
+    #>
+    param([Parameter(Mandatory)]$Signature, [Parameter(Mandatory)][string]$Pinned, [string[]]$ChainFlags)
+    $status = [string]$Signature.Status
+    $certificate = $Signature.SignerCertificate
+    $verdict = { param([bool]$Accepted, [bool]$Relaxed, [string]$Reason) [pscustomobject]@{ Accepted = $Accepted; Relaxed = $Relaxed; Reason = $Reason; Status = $status } }
+    if ($status -cne 'Valid' -and $status -cne 'UnknownError') { return & $verdict $false $false $status }
+    if ($null -eq $certificate -or $certificate.Thumbprint -cne $Pinned) { return & $verdict $false $false 'UnknownSigner' }
+    if ($null -eq $Signature.TimeStamperCertificate) { return & $verdict $false $false 'NotTimestamped' }
+    if ($status -ceq 'Valid') { return & $verdict $true $false 'Valid' }
+    if ($null -eq $ChainFlags) {
+        # Revocation is read from what this computer already holds and no certificate is downloaded: no network wait on a server without Internet access.
+        $chain = [Security.Cryptography.X509Certificates.X509Chain]::new()
+        try {
+            $chain.ChainPolicy.RevocationMode = [Security.Cryptography.X509Certificates.X509RevocationMode]::Offline
+            $chain.ChainPolicy.DisableCertificateDownloads = $true
+            [void]$chain.Build($certificate)
+            $ChainFlags = @($chain.ChainStatus | ForEach-Object { ([string]$_.Status) -split ',\s*' } | Where-Object { $_ -and $_ -cne 'NoError' } | Select-Object -Unique)
+        }
+        finally { $chain.Dispose() }
+    }
+    $allowed = 'UntrustedRoot', 'PartialChain', 'RevocationStatusUnknown', 'OfflineRevocation', 'NotTimeValid'
+    if (-not @($ChainFlags | Where-Object { $_ -ceq 'UntrustedRoot' -or $_ -ceq 'PartialChain' }).Count -or @($ChainFlags | Where-Object { $_ -cnotin $allowed }).Count) { return & $verdict $false $false 'ChainStatus' }
+    return & $verdict $true $true 'RootNotTrusted'
+}
+function Get-PathReparseTag {
+    <#
+        The tag of the reparse point at Path, or $null when Path is not one. WIN32_FIND_DATAW.dwReserved0 holds the tag when FILE_ATTRIBUTE_REPARSE_POINT
+        is set; FindFirstFileW reads it from the directory entry without opening the item, so a cloud placeholder is not downloaded. The two calls are
+        declared with Reflection.Emit: no C# is compiled, because this runs before the engine exists. Layout of the 592-byte structure: dwFileAttributes
+        at offset 0, dwReserved0 at offset 36. The same text is in the verifier, the module and both entry scripts.
+    #>
+    param([Parameter(Mandatory)][string]$Path)
+    $api = Get-Variable -Name FindFileApi -Scope Script -ValueOnly -ErrorAction Ignore
+    if ($null -eq $api) {
+        $module = [Reflection.Emit.AssemblyBuilder]::DefineDynamicAssembly([Reflection.AssemblyName]::new('ReparseTag'), [Reflection.Emit.AssemblyBuilderAccess]::Run).DefineDynamicModule('ReparseTag')
+        $native = $module.DefineType('Native', 'Public, Abstract, Sealed')
+        foreach ($call in @(@('FindFirstFileW', [IntPtr], @([string], [IntPtr])), @('FindClose', [bool], @([IntPtr])))) {
+            $method = $native.DefinePInvokeMethod($call[0], 'kernel32.dll', $call[0], 'Public, Static, PinvokeImpl', 'Standard', $call[1], [type[]]$call[2], 'Winapi', 'Unicode')
+            $method.SetImplementationFlags('PreserveSig')
+        }
+        $api = $native.CreateType()
+        Set-Variable -Name FindFileApi -Scope Script -Value $api
+    }
+    $full = [IO.Path]::GetFullPath($Path)
+    $full = if ($full.StartsWith('\\?\', [StringComparison]::Ordinal)) { $full } elseif ($full.StartsWith('\\', [StringComparison]::Ordinal)) { '\\?\UNC\' + $full.Substring(2) } else { '\\?\' + $full }
+    $data = [Runtime.InteropServices.Marshal]::AllocHGlobal(592)
+    try {
+        $handle = $api::FindFirstFileW($full, $data)
+        if ($handle -eq [IntPtr]::new(-1)) { throw "Package integrity: the reparse tag of this path cannot be read (Windows error $([Runtime.InteropServices.Marshal]::GetLastSystemError())): $Path" }
+        [void]$api::FindClose($handle)
+        if (([Runtime.InteropServices.Marshal]::ReadInt32($data, 0) -band 0x400) -eq 0) { return $null }
+        return [uint32]([long][Runtime.InteropServices.Marshal]::ReadInt32($data, 36) -band 0xFFFFFFFFL)
+    }
+    finally { [Runtime.InteropServices.Marshal]::FreeHGlobal($data) }
+}
+function Test-ReparseTagAllowed {
+    <#
+        The rule for the tag of a reparse point, not for the bare attribute. Refused: every tag that redirects to another path, that is every tag with the
+        name-surrogate bit 0x20000000 (symbolic link 0xA000000C, junction and mount point 0xA0000003, and the others), and every tag that is not in the closed
+        list below (fail closed). Accepted, the Microsoft types that do not redirect: the cloud files of OneDrive (0x9000001A and its variants 0x9000101A to
+        0x9000F01A, that is the tag with the bits 0x0000F000 cleared), data deduplication 0x80000013 and WOF (Windows Overlay Filter, CompactOS) 0x80000017.
+        The SHA256 of the signed manifest still detects any change of content, including one made by a synchronisation.
+    #>
+    param([Parameter(Mandatory)][uint32]$Tag)
+    if ($Tag -band 0x20000000u) { return $false }
+    return (($Tag -band 0xFFFF0FFFu) -eq 0x9000001Au) -or $Tag -eq 0x80000013u -or $Tag -eq 0x80000017u
+}
+function Get-RefusedReparseTag {
+    <# $null when the item (from Get-Item -Force) is not a reparse point or its tag is accepted by Test-ReparseTagAllowed; otherwise the refused tag as eight hexadecimal digits. #>
+    param([Parameter(Mandatory)]$Item)
+    if (-not ($Item.Attributes -band [IO.FileAttributes]::ReparsePoint)) { return $null }
+    $tag = [uint32](Get-PathReparseTag $Item.FullName)
+    if (Test-ReparseTagAllowed $tag) { return $null }
+    return $tag.ToString('X8')
+}
 # Package integrity. A package carries the owner-signed PackageIntegrity.psd1 manifest; when it is present, the signed
 # verifier (src\Test-PackageIntegrity.ps1) must accept the tree before any engine code is compiled. A source tree
 # without a manifest is an unverified development tree: the entry scripts refuse it unless -DevelopmentMode is given.
@@ -67,24 +158,31 @@ function Assert-ExlPackageIntegrity {
     while ($cursor) {
         if (-not (Test-Path -LiteralPath $cursor)) { throw 'Package integrity: the verifier is missing; no engine or SQLite library was loaded.' }
         $item = Microsoft.PowerShell.Management\Get-Item -LiteralPath $cursor -Force -ErrorAction Stop
-        if ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) {
-            throw "Package integrity: reparse point: $cursor"
+        $refused = Get-RefusedReparseTag $item
+        if ($refused) {
+            throw "Package integrity: reparse point that is not accepted (tag 0x$refused): $cursor"
         }
         $cursor = [IO.Path]::GetDirectoryName($cursor)
     }
     $signature = Microsoft.PowerShell.Security\Get-AuthenticodeSignature -LiteralPath $verifier -ErrorAction Stop
-    if ([string]$signature.Status -cne 'Valid' -or $null -eq $signature.SignerCertificate -or
-        $signature.SignerCertificate.Thumbprint -cne '0F28E442889F17B5F4D251E8F96E7CC6E2C9C6D6' -or
-        $null -eq $signature.TimeStamperCertificate) {
+    if (-not (Get-OwnerSignatureVerdict -Signature $signature -Pinned $script:OwnerThumbprint).Accepted) {
         throw 'Package integrity: verifier must have the trusted, timestamped owner signature.'
     }
-    $arguments = @{ Root = $packageRoot }
+    # The warning of a root certificate that is not trusted here is written once by the entry script, not by every check.
+    $arguments = @{ Root = $packageRoot; SuppressTrustWarning = $true }
     if ($Distribution) { $arguments.Distribution = $true }
     if ($DevelopmentMode) { $arguments.DevelopmentMode = $true }
     $result = @(& $verifier @arguments)
     if ($result.Count -ne 1 -or -not $result[0].PSObject.Properties['Status'] -or $result[0].Status -notlike 'Valid*') {
         throw 'Package integrity: the verifier did not return an explicit Valid result; engine initialization is blocked.'
     }
+    $script:PackageVerified = $true
+    # The hashes the signed manifest listed when the verifier accepted the tree: the helper is compared with these, not with a manifest read again later.
+    $script:VerifiedManifest = $null
+    try {
+        $listed = Microsoft.PowerShell.Utility\Import-PowerShellDataFile -LiteralPath $manifest -ErrorAction Stop
+        if ([string]$listed.SignerThumbprint -ceq $script:OwnerThumbprint) { $script:VerifiedManifest = [pscustomobject]@{ Root = $packageRoot; Files = @($listed.Files) } }
+    } catch { $script:VerifiedManifest = $null }
 }
 Assert-ExlPackageIntegrity
 $script:LogWriter = $null
@@ -96,6 +194,8 @@ $script:ServerPathKeys = @('HttpProxyPath', 'MapiHttpPath', 'ImapLogPath', 'PopL
     'FrontEndReceivePath', 'FrontEndSendPath', 'HubReceivePath', 'HubSendPath', 'MailboxReceivePath', 'MailboxSendPath',
     'EdgeReceivePath', 'EdgeSendPath', 'MessageTrackingPath')
 $script:PathsFileName = 'ExchangeLogReport.paths.psd1'
+# NT SERVICE\TrustedInstaller: owns the system folders and is never an unexpected writer.
+$script:TrustedInstallerSid = 'S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464'
 # Entropy of the DPAPI protection of the mail password (Mail.CredentialFile).
 $script:MailEntropy = [Text.Encoding]::UTF8.GetBytes('Exchange Log Report - mail credential')
 Add-Type -AssemblyName System.Security.Cryptography.ProtectedData -ErrorAction SilentlyContinue
@@ -222,7 +322,8 @@ function Format-ExlRange {
 
 function Start-ExlLog {
     <# Opens (or continues) today's log file and deletes the log files older than the retention. #>
-    param([Parameter(Mandatory)][string]$Directory, [int]$RetentionDays = 14)
+    param([Parameter(Mandatory)][string]$Directory, [int]$RetentionDays = 14, [switch]$EventLog)
+    $script:EventLogEnabled = [bool]$EventLog
     [void][IO.Directory]::CreateDirectory($Directory)
     $script:LogPath = Join-Path $Directory ('ExchangeLogReport_{0:yyyyMMdd}.log' -f (Get-Date))
     $stream = [IO.FileStream]::new($script:LogPath, [IO.FileMode]::Append, [IO.FileAccess]::Write, [IO.FileShare]::ReadWrite)
@@ -234,18 +335,82 @@ function Start-ExlLog {
     return $script:LogPath
 }
 
-function Stop-ExlLog { if ($script:LogWriter) { $script:LogWriter.Dispose(); $script:LogWriter = $null } }
+function Stop-ExlLog { if ($script:LogWriter) { $script:LogWriter.Dispose(); $script:LogWriter = $null }; $script:EventLogEnabled = $false }
+
+function ConvertTo-ExlSafeText {
+    <#
+        Text that came from a log file, the command line or the network, made safe to print: the control characters (C0 and C1, ESC, DEL) and the
+        Unicode line separators become '?', so that a value cannot move the cursor, recolour the console or forge a line. A tab is kept.
+        -KeepLineBreaks keeps CR and LF (the log writes each line of a message with its own time stamp and level).
+    #>
+    param([AllowNull()][AllowEmptyString()][string]$Text, [switch]$KeepLineBreaks)
+    if ([string]::IsNullOrEmpty($Text)) { return $Text }
+    $pattern = if ($KeepLineBreaks) { '[\x00-\x08\x0B\x0C\x0E-\x1F\x7F-\x9F\u2028\u2029]' } else { '[\x00-\x08\x0A-\x1F\x7F-\x9F\u2028\u2029]' }
+    return [regex]::Replace($Text, $pattern, '?')
+}
 
 function Write-ExlLog {
     <# One line in the log file only. The log never contains colours or icons. #>
     param([ValidateSet('INFO', 'OK', 'WARN', 'ERROR', 'STEP', 'DEBUG')][string]$Level = 'INFO', [Parameter(Mandatory)][AllowEmptyString()][string]$Message)
-    if ($script:LogWriter) { $script:LogWriter.WriteLine(('{0:yyyy-MM-ddTHH:mm:ss.fffzzz} [{1,-5}] {2}' -f (Get-Date), $Level, $Message)) }
+    if (-not $script:LogWriter) { return }
+    foreach ($line in [regex]::Split((ConvertTo-ExlSafeText $Message -KeepLineBreaks), '\r\n|\r|\n')) {
+        $script:LogWriter.WriteLine(('{0:yyyy-MM-ddTHH:mm:ss.fffzzz} [{1,-5}] {2}' -f (Get-Date), $Level, $line))
+    }
+}
+
+# Windows event log (Logging.EventLog, off by default): one source in the Application log, fixed ids, invariant English text, no personal data
+# (no address, no account name: security identifiers and counts only).
+#   1000 Information  run started (mode, version, account SID)
+#   1001 Information  run ended (mode, exit code, seconds); Warning when the exit code is 2, Error when it is 1
+#   2000 Error        package refused by the verifier
+#   2001 Warning      package folder can be changed by a non-administrator (security identifier, folder)
+#   2002 Warning      package accepted without the publisher root certificate
+#   2003 Warning      discovery helper started with -ExecutionPolicy Bypass
+#   3000 Information  mail credential file written
+#   3001 Information  e-mail sent (server, recipient count, TLS)
+#   4000 Information  portal started
+#   4001 Information  portal stopped
+$script:EventSource = 'ExchangeLogReport'
+$script:EventLogEnabled = $false
+$script:EventLogWarned = $false
+
+function Set-ExlEventLog {
+    <# Turns the Windows event log on or off for this process (Logging.EventLog of the configuration). #>
+    param([Parameter(Mandatory)][bool]$Enabled)
+    $script:EventLogEnabled = $Enabled
+}
+
+function Write-ExlEventEntry {
+    <# The one call that writes to the Windows event log; the source is registered here when it does not exist and this account may do it. #>
+    param([Parameter(Mandatory)][int]$Id, [Parameter(Mandatory)][ValidateSet('Information', 'Warning', 'Error')][string]$Level, [Parameter(Mandatory)][string]$Message)
+    $exists = try { [Diagnostics.EventLog]::SourceExists($script:EventSource) } catch { $true }
+    if (-not $exists) { [Diagnostics.EventLog]::CreateEventSource($script:EventSource, 'Application') }
+    [Diagnostics.EventLog]::WriteEntry($script:EventSource, $Message, [Diagnostics.EventLogEntryType]$Level, $Id)
+}
+
+function Write-ExlEvent {
+    <# One event when Logging.EventLog is on. A failure (no right to register the source, a full log) is a warning once and never stops the run. #>
+    param([Parameter(Mandatory)][int]$Id, [Parameter(Mandatory)][ValidateSet('Information', 'Warning', 'Error')][string]$Level, [Parameter(Mandatory)][string]$Message)
+    if (-not $script:EventLogEnabled) { return }
+    try {
+        $text = ConvertTo-ExlSafeText $Message -KeepLineBreaks
+        if ($text.Length -gt 8000) { $text = $text.Substring(0, 8000) }
+        Write-ExlEventEntry -Id $Id -Level $Level -Message $text
+    }
+    catch {
+        Write-ExlLog 'DEBUG' "Windows event log: event $Id not written: $($_.Exception.Message)"
+        if (-not $script:EventLogWarned) {
+            $script:EventLogWarned = $true
+            Write-ExlItem Warn ("Windows event log: the events are not written (the source cannot be registered or the log cannot be written, HRESULT 0x{0:X8}). Register the event source '{1}' once as an administrator, or set Logging.EventLog to `$false." -f $_.Exception.HResult, $script:EventSource)
+        }
+    }
 }
 
 function Write-ExlBanner {
     <# Title card at the start of an execution, followed by the context rows (label -> @(Icon, Text)). #>
     param([Parameter(Mandatory)][string]$Title, [string]$Subtitle, [System.Collections.Specialized.OrderedDictionary]$Details)
     $C = $script:C; $F = Get-ExlFrame; $width = 74
+    $Title = ConvertTo-ExlSafeText $Title; $Subtitle = ConvertTo-ExlSafeText $Subtitle
     $right = "v$($script:ToolVersion) $([char]0x00B7) Nicolas Fabert"
     $iconWidth = if ($script:IconStyle -eq 'Emoji') { 2 } else { 1 }
     $left = "  $($script:Icons.Logo)  $Title"
@@ -263,6 +428,7 @@ function Write-ExlBanner {
         foreach ($key in $Details.Keys) {
             $value = $Details[$key]
             $icon, $text = if ($value -is [array]) { (Get-ExlIcon $value[0]), $value[1] } else { '   ', $value }
+            $text = ConvertTo-ExlSafeText ([string]$text)
             Write-Host ("     {0}{1}{2,-10}{3} {4}" -f $icon, $C.Dim, $key, $C.Reset, $text)
         }
     }
@@ -274,6 +440,7 @@ function Write-ExlStep {
     <# Step header with a coloured number pill and an icon:  ─ 3/5 ─ 📥  Reading the logs #>
     param([Parameter(Mandatory)][int]$Number, [Parameter(Mandatory)][int]$Total, [Parameter(Mandatory)][string]$Title, [string]$Icon = 'Info')
     $C = $script:C
+    $Title = ConvertTo-ExlSafeText $Title
     Write-Host ''
     Write-Host ("  {0} {1}/{2} {3} {4}{5}{6}{3}" -f $C.AccentBg, $Number, $Total, $C.Reset, (Get-ExlIcon $Icon), $C.Bold, $Title)
     Write-ExlLog 'STEP' "[$Number/$Total] $Title"
@@ -282,6 +449,7 @@ function Write-ExlStep {
 function Write-ExlItem {
     <# One indented result line with a status icon, also written to the log. #>
     param([ValidateSet('Ok', 'Warn', 'Fail', 'Info', 'Skip')][string]$Status = 'Info', [Parameter(Mandatory)][AllowEmptyString()][string]$Text, [string]$Icon)
+    $Text = ConvertTo-ExlSafeText $Text
     $color = @{ Ok = $script:C.Green; Warn = $script:C.Yellow; Fail = $script:C.Red; Info = ''; Skip = $script:C.Dim }[$Status]
     $level = @{ Ok = 'OK'; Warn = 'WARN'; Fail = 'ERROR'; Info = 'INFO'; Skip = 'INFO' }[$Status]
     $symbol = Get-ExlIcon $(if ($Icon) { $Icon } else { $Status })
@@ -293,6 +461,7 @@ function Write-ExlItem {
 function Write-ExlDetail {
     <# A dimmed detail line under an item (an SMTP conversation for instance), also written to the log. #>
     param([Parameter(Mandatory)][AllowEmptyString()][string]$Text)
+    $Text = ConvertTo-ExlSafeText $Text
     Write-Host ("          {0}{1}{2}" -f $script:C.Dim, $Text, $script:C.Reset)
     Write-ExlLog 'INFO' $Text
 }
@@ -302,6 +471,7 @@ function Write-ExlTableRow {
     param([switch]$Header, [ValidateSet('Ok', 'Warn', 'Fail', 'Skip')][string]$Status = 'Ok', [string]$Server, [string]$Source, [string]$Files,
         [string]$Read, $Lines, $Kept, [string]$Noise, [string]$Duration, [string]$Rate)
     $C = $script:C
+    $Server = ConvertTo-ExlSafeText $Server; $Source = ConvertTo-ExlSafeText $Source
     if ($Header) {
         Write-Host ("      {0}{1}{2,-10} {3,-19} {4,9} {5,10} {6,12} {7,10} {8,7} {9,10} {10,10}{11}" -f $C.Dim, ('  ' + $script:IconPad), 'Server', 'Source', 'Files', 'Read', 'Lines', 'Kept', 'Noise', 'Duration', 'Rate', $C.Reset)
         return
@@ -328,6 +498,7 @@ function Write-ExlSummary {
     foreach ($key in $Values.Keys) {
         $value = $Values[$key]
         $rowIcon, $text = if ($value -is [array]) { (Get-ExlIcon $value[0]), $value[1] } else { '   ', $value }
+        $text = ConvertTo-ExlSafeText ([string]$text)
         Write-Host ("    {0}{1}{2,-10}{3} {4}" -f $rowIcon, $C.Dim, $key, $C.Reset, $text)
         Write-ExlLog 'INFO' ("Summary - {0}: {1}" -f $key, $text)
     }
@@ -338,6 +509,93 @@ function Write-ExlSummary {
 #endregion
 
 #region 2. Configuration ------------------------------------------------------------------
+
+#region 1b. Package folder permissions ------------------------------------------------------
+
+function Test-ExlElevated {
+    <# The account that runs the tool is an administrator (an elevated token) or SYSTEM. #>
+    $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
+    return $identity.IsSystem -or [Security.Principal.WindowsPrincipal]::new($identity).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+}
+
+function Get-ExlAccountText {
+    <# A security identifier with the name of its account when Windows knows it (the name is for reading only: nothing is compared by name). #>
+    param([Parameter(Mandatory)][string]$Sid)
+    $name = try { [Security.Principal.SecurityIdentifier]::new($Sid).Translate([Security.Principal.NTAccount]).Value } catch { $null }
+    if ($name) { return "$name ($Sid)" }
+    return $Sid
+}
+
+function Get-ExlFolderWriters {
+    <#
+        The allow entries of one folder that let an account outside the trusted set change what the folder holds (-Parent: replace the folder itself).
+        Compared by security identifier. An entry that only applies to the children of the folder (inherit only) is not an access to the folder.
+    #>
+    param([Parameter(Mandatory)][string]$Path, [switch]$Parent, [Parameter(Mandatory)][string[]]$TrustedSid)
+    # CreateFiles, CreateDirectories, DeleteSubdirectoriesAndFiles, Delete, ChangePermissions, TakeOwnership, GenericWrite, GenericAll
+    $mask = if ($Parent) { 0x40 -bor 0x10000 -bor 0x40000 -bor 0x80000 -bor 0x10000000 } else { 0x2 -bor 0x4 -bor 0x40 -bor 0x10000 -bor 0x40000 -bor 0x80000 -bor 0x40000000 -bor 0x10000000 }
+    $security = [IO.FileSystemAclExtensions]::GetAccessControl([IO.DirectoryInfo]::new($Path))
+    foreach ($rule in $security.GetAccessRules($true, $true, [Security.Principal.SecurityIdentifier])) {
+        $sid = $rule.IdentityReference.Value
+        if ($rule.AccessControlType -ne 'Allow' -or ($rule.PropagationFlags -band [Security.AccessControl.PropagationFlags]::InheritOnly)) { continue }
+        if ($sid -in $TrustedSid -or $sid -match '^S-1-5-21-\d+-\d+-\d+-(500|512|519)$') { continue }
+        $granted = [int]$rule.FileSystemRights -band $mask
+        if ($granted) { [pscustomobject]@{ Sid = $sid; Path = $Path; Rights = [string][Security.AccessControl.FileSystemRights]$granted } }
+    }
+}
+
+function Get-ExlPackageFolderFindings {
+    <#
+        The accounts that are not administrators and can change the package folder, one of its code folders (src, lib, templates, config...) or
+        a parent folder (which would let them replace the package). Empty when the account running the tool is not elevated: the check is about
+        what an elevated run executes. -Elevated and -StopAt are for the tests.
+    #>
+    param([Parameter(Mandatory)][string]$Root, [Nullable[bool]]$Elevated, [string]$StopAt)
+    if ($null -eq $Elevated) { $Elevated = Test-ExlElevated }
+    if (-not $Elevated) { return }
+    $trusted = @('S-1-5-18', 'S-1-5-32-544', $script:TrustedInstallerSid, 'S-1-3-0', [Security.Principal.WindowsIdentity]::GetCurrent().User.Value)
+    $rootPath = [IO.Path]::TrimEndingDirectorySeparator([IO.Path]::GetFullPath($Root))
+    $generated = 'bin', 'data', 'logs', 'reports'
+    $folders = @([pscustomobject]@{ Path = $rootPath; Parent = $false })
+    foreach ($d in [IO.Directory]::EnumerateDirectories($rootPath)) {
+        if ([IO.Path]::GetFileName($d) -notin $generated) { $folders += [pscustomobject]@{ Path = $d; Parent = $false } }
+    }
+    $cursor = [IO.Path]::GetDirectoryName($rootPath)
+    $stop = if ($StopAt) { [IO.Path]::TrimEndingDirectorySeparator([IO.Path]::GetFullPath($StopAt)) } else { $null }
+    while ($cursor) {
+        $folders += [pscustomobject]@{ Path = $cursor; Parent = $true }
+        if ($stop -and [string]::Equals([IO.Path]::TrimEndingDirectorySeparator($cursor), $stop, [StringComparison]::OrdinalIgnoreCase)) { break }
+        $cursor = [IO.Path]::GetDirectoryName($cursor)
+    }
+    foreach ($folder in $folders) {
+        try { Get-ExlFolderWriters -Path $folder.Path -Parent:$folder.Parent -TrustedSid $trusted | ForEach-Object { $_ | Add-Member -NotePropertyName Parent -NotePropertyValue $folder.Parent -PassThru } }
+        catch { Write-ExlLog 'DEBUG' "Permissions of $($folder.Path) not readable: $($_.Exception.Message)" }
+    }
+}
+
+function Test-ExlPackageFolderSecurity {
+    <#
+        The warnings of Get-ExlPackageFolderFindings as text, one per account and kind of access (the first folder, and how many more).
+        What it does not see: only the first level of folders under the package folder is read; an access control entry on a single file, or one that
+        is inherit-only for files, is not read; an administrator known only through a domain group other than Domain Admins (512) and Enterprise
+        Admins (519) is reported as an account that can write.
+    #>
+    param([Parameter(Mandatory)][string]$Root, [Nullable[bool]]$Elevated, [string]$StopAt)
+    $findings = @(Get-ExlPackageFolderFindings -Root $Root -Elevated $Elevated -StopAt $StopAt)
+    foreach ($group in ($findings | Group-Object { '{0}|{1}' -f $_.Sid, $_.Parent })) {
+        $first = $group.Group[0]
+        Write-ExlEvent 2001 Warning ("Package folder: the security identifier {0} can {1} {2} ({3})." -f $first.Sid, $(if ($first.Parent) { 'delete or replace the parent folder' } else { 'change the package folder' }), $first.Path, $first.Rights)
+        $more = if ($group.Count -gt 1) { " and $($group.Count - 1) more folder(s) of the package" } else { '' }
+        if ($first.Parent) {
+            "Package folder: $(Get-ExlAccountText $first.Sid) can delete or replace $($first.Path), a parent of the package folder ($($first.Rights)). This tool runs elevated: restrict write access to the administrators and SYSTEM (installation chapter of the guide)."
+        }
+        else {
+            "Package folder: $(Get-ExlAccountText $first.Sid) can change $($first.Path)$more ($($first.Rights)). This tool runs elevated, so an account that can change its files can run code with these rights: restrict write access to the administrators and SYSTEM (installation chapter of the guide)."
+        }
+    }
+}
+
+#endregion
 
 function Resolve-ExlPath {
     param([Parameter(Mandatory)][string]$Path, [Parameter(Mandatory)][string]$Root)
@@ -357,6 +615,15 @@ function Get-ExlTimeZone {
     throw "Unknown time zone '$Id' (Report.TimeZone). On Windows without IANA support, use a Windows ID such as 'Romance Standard Time' (Paris); otherwise an IANA ID such as 'Europe/Paris'."
 }
 
+function Get-ExlServerNameProblem {
+    <# Why a configured server name is not a plain host name (it is used in \\<name>\c$\ paths and for remote PowerShell); $null when it is one. #>
+    param([Parameter(Mandatory)][string]$Name)
+    if ($Name -match '^\s*\[?[0-9a-fA-F:.]*:[0-9a-fA-F:.]*\]?\s*$' -or $Name -match '^\s*\d{1,3}(\.\d{1,3}){3}\s*$') { return 'is an IP address' }
+    if ($Name -match '[\\/:]') { return 'contains a slash, a backslash or a colon (a path, a UNC name or an address with a port)' }
+    if ($Name -notmatch '^[A-Za-z0-9_]([A-Za-z0-9_.-]{0,253}[A-Za-z0-9_])?$') { return 'is not a host name (letters, digits, hyphen and dots, 255 characters at most)' }
+    return $null
+}
+
 function Import-ExlConfiguration {
     <#
     .SYNOPSIS
@@ -370,6 +637,7 @@ function Import-ExlConfiguration {
     catch { throw "The configuration file is not valid PowerShell data ($Path): $($_.Exception.Message)" }
 
     $errors = [Collections.Generic.List[string]]::new()
+    $warnings = [Collections.Generic.List[string]]::new()
     foreach ($section in 'Sources', 'Noise', 'Collection', 'Storage', 'Report', 'Logging') {
         if (-not $config.ContainsKey($section) -or $config[$section] -isnot [hashtable]) { $errors.Add("Section '$section' is missing.") }
     }
@@ -415,6 +683,8 @@ function Import-ExlConfiguration {
         if ($s -isnot [hashtable]) { $errors.Add("Servers[$index] must be a @{ } block."); continue }
         if (-not [string]$s['Name']) { $errors.Add("Servers[$index].Name is required."); continue }
         foreach ($key in $s.Keys) { if ($key -notin $allowed) { $errors.Add("Servers[$index].$key is not a known setting. Allowed: $($allowed -join ', ').") } }
+        $nameProblem = Get-ExlServerNameProblem ([string]$s['Name'])
+        if ($nameProblem) { $warnings.Add("Servers[$index].Name '$($s['Name'])' $nameProblem. Check it: the logs are read from this name and the tool connects to it.") }
         if ($s.ContainsKey('Role') -and [string]$s['Role'] -notin $script:ServerRoles) { $errors.Add("Servers[$index].Role must be $($script:ServerRoles -join ' or ') (current value: '$($s['Role'])').") }
         $blocks.Add($s)
     }
@@ -497,11 +767,13 @@ function Import-ExlConfiguration {
             ScratchFolder         = ([string](Get-Value $r 'Report' 'ScratchFolder' '')).Trim()
             MemoryBudgetMB        = Test-Int (Get-Value $r 'Report' 'MemoryBudgetMB' 512) 'Report.MemoryBudgetMB' 64 16384
             Parallelism           = Test-Int (Get-Value $r 'Report' 'Parallelism' 0) 'Report.Parallelism' 0 16
+            RetentionDays         = Test-Int (Get-Value $r 'Report' 'RetentionDays' 0) 'Report.RetentionDays' 0 36500
             MaxDataAgeMinutes     = Test-Int (Get-Value $r 'Report' 'MaxDataAgeMinutes' 90) 'Report.MaxDataAgeMinutes' 0 525600
             Title                 = [string](Get-Value $r 'Report' 'Title' $script:DefaultReportTitle)
             TemplatePath          = Join-Path $Root 'templates\Report.template.html'
         }
         Logging    = [ordered]@{
+            EventLog      = Test-Bool (Get-Value $l 'Logging' 'EventLog' $false) 'Logging.EventLog'
             Path          = Resolve-ExlPath ([string](Get-Value $l 'Logging' 'Path' '.\logs')) $Root
             RetentionDays = Test-Int (Get-Value $l 'Logging' 'RetentionDays' 14) 'Logging.RetentionDays' 1 3650
         }
@@ -519,6 +791,9 @@ function Import-ExlConfiguration {
         CredentialScope       = [string](Get-Value $ml 'Mail' 'CredentialScope' 'User')
         TargetName            = ([string](Get-Value $ml 'Mail' 'TargetName' '')).Trim()
         CertificateThumbprint = ([string](Get-Value $ml 'Mail' 'CertificateThumbprint' '')).Replace(' ', '').ToUpperInvariant()
+        CheckRevocation       = Test-Bool (Get-Value $ml 'Mail' 'CheckRevocation' $false) 'Mail.CheckRevocation'
+        MinimumTls            = [string](Get-Value $ml 'Mail' 'MinimumTls' 'None')
+        AllowedRecipientDomains = [string[]]@(Test-Domains (Get-Value $ml 'Mail' 'AllowedRecipientDomains' @()) 'Mail.AllowedRecipientDomains' | ForEach-Object { $_.TrimStart('@').ToLowerInvariant() })
         HeloName              = ([string](Get-Value $ml 'Mail' 'HeloName' '')).Trim()
         From                  = ([string](Get-Value $ml 'Mail' 'From' '')).Trim()
         FromName              = [string](Get-Value $ml 'Mail' 'FromName' 'Exchange Log Report')
@@ -531,11 +806,12 @@ function Import-ExlConfiguration {
         TimeoutSeconds        = Test-Int (Get-Value $ml 'Mail' 'TimeoutSeconds' 60) 'Mail.TimeoutSeconds' 5 600
     }
     foreach ($key in $ml.Keys) { if ($key -notin $mail.Keys) { $errors.Add("Mail.$key is not a known setting. Allowed: $($mail.Keys -join ', ').") } }
-    $enum = @{ Encryption = 'None', 'StartTls', 'Tls'; Authentication = 'Anonymous', 'Basic', 'Kerberos'; CredentialScope = 'User', 'Computer'; Attach = 'Html', 'Zip', 'None' }
+    $enum = @{ Encryption = 'None', 'StartTls', 'Tls'; Authentication = 'Anonymous', 'Basic', 'Kerberos'; CredentialScope = 'User', 'Computer'; Attach = 'Html', 'Zip', 'None'; MinimumTls = 'None', 'Tls12', 'Tls13' }
     foreach ($key in $enum.Keys) {
         $match = @($enum[$key] | Where-Object { $_ -eq $mail[$key] }) | Select-Object -First 1
         if ($match) { $mail[$key] = $match } else { $errors.Add("Mail.$key must be $($enum[$key] -join ', ') (current value: '$($mail[$key])').") }
     }
+    if ($mail.MinimumTls -ne 'None' -and $mail.Encryption -eq 'None') { $errors.Add("Mail.MinimumTls = '$($mail.MinimumTls)' needs Mail.Encryption = 'StartTls' or 'Tls'.") }
     if ($mail.Port -eq 0) { $mail.Port = if ($mail.Encryption -eq 'Tls') { 465 } else { 25 } }
     if ($mail.Authentication -eq 'Basic' -and $mail.Encryption -eq 'None') { $errors.Add("Mail.Authentication = 'Basic' sends a password: it needs Mail.Encryption = 'StartTls' or 'Tls'.") }
     if ($mail.CertificateThumbprint -and $mail.CertificateThumbprint -notmatch '^[0-9A-F]{40}$') { $errors.Add('Mail.CertificateThumbprint must be the 40 hexadecimal characters of the SHA-1 thumbprint of the certificate of the SMTP server.') }
@@ -543,8 +819,22 @@ function Import-ExlConfiguration {
     foreach ($a in @(@($mail.From | Where-Object { $_ }) + $mail.To + $mail.Cc + $mail.Bcc)) {
         try { $parsed = [Net.Mail.MailAddress]::new($a); if ($parsed.Address -ne $a) { throw 'display name' } } catch { $errors.Add("Mail: '$a' is not an e-mail address (write the address only, for example 'team@contoso.com').") }
     }
+    if ($mail.AllowedRecipientDomains.Count) {
+        foreach ($a in @($mail.To + $mail.Cc + $mail.Bcc)) {
+            $recipientDomain = try { [Net.Mail.MailAddress]::new($a).Host } catch { $null }
+            if ($recipientDomain -and -not @($mail.AllowedRecipientDomains | Where-Object { [string]::Equals($_, $recipientDomain, [StringComparison]::OrdinalIgnoreCase) }).Count) {
+                $errors.Add("Mail: '$a' is not in a domain of Mail.AllowedRecipientDomains ($($mail.AllowedRecipientDomains -join ', ')).")
+            }
+        }
+    }
     if ($mail.Enabled) { foreach ($p in @(Test-ExlMailReady -Settings ([pscustomobject]@{ Mail = $mail }))) { $errors.Add("Mail.Enabled is `$true but $p") } }
     $settings['Mail'] = $mail
+    # ---- security (optional section) ----------------------------------------------------------------------
+    $sec = if ($config.ContainsKey('Security') -and $config.Security -is [hashtable]) { $config.Security } else { @{} }
+    if ($config.ContainsKey('Security') -and $config.Security -isnot [hashtable]) { $errors.Add('Security must be a @{ } block.') }
+    $security = [ordered]@{ RequireProtectedFolder = Test-Bool (Get-Value $sec 'Security' 'RequireProtectedFolder' $false) 'Security.RequireProtectedFolder' }
+    foreach ($key in $sec.Keys) { if ($key -notin $security.Keys) { $errors.Add("Security.$key is not a known setting. Allowed: $($security.Keys -join ', ').") } }
+    $settings['Security'] = $security
     if ($settings.Storage.DetailRetentionDays -gt $settings.Storage.RetentionDays) { $errors.Add('Storage.DetailRetentionDays cannot be greater than Storage.RetentionDays.') }
     foreach ($role in $settings.Sources.TransportRoles) { if ($role -notin 'FrontEnd', 'Hub', 'Mailbox') { $errors.Add("Sources.TransportRoles accepts FrontEnd, Hub and Mailbox (current value: '$role').") } }
     if ($settings.Report.DefaultRange -notin 'Last24Hours', 'Last7Days', 'Last30Days', 'PreviousMonth') { $errors.Add('Report.DefaultRange must be Last24Hours, Last7Days, Last30Days or PreviousMonth.') }
@@ -580,12 +870,25 @@ function Import-ExlConfiguration {
     if (-not $settings.Report.FilePrefix -or$settings.Report.FilePrefix.IndexOfAny([IO.Path]::GetInvalidFileNameChars()) -ge 0) { $errors.Add('Report.FilePrefix must be a valid file name part.') }
     try { $settings['Zone'] = Get-ExlTimeZone $settings.Report.TimeZone } catch { $errors.Add($_.Exception.Message) }
     $found = if ($discovery -and $discovery['Servers'] -is [hashtable]) { $discovery['Servers'] } else { @{} }
+    if ($found.Count) {
+        $firstLabel = { param([string]$n) $n.Trim().Split('.')[0] }
+        $known = @($found.Keys | ForEach-Object { & $firstLabel ([string]$_) })
+        $index = 0
+        foreach ($b in $blocks) {
+            $index++
+            $label = & $firstLabel ([string]$b['Name'])
+            if (-not @($known | Where-Object { [string]::Equals($_, $label, [StringComparison]::OrdinalIgnoreCase) }).Count) {
+                $warnings.Add("Servers[$index].Name '$($b['Name'])' was not found by the last -Mode Discover (servers found: $(@($found.Keys | Sort-Object) -join ', ')): its log folders are the default ones. Check the name, or run -Mode Discover again.")
+            }
+        }
+    }
     $settings.Servers = @(foreach ($b in $blocks) {
             $name = ([string]$b['Name']).ToUpperInvariant()
             $match = @($found.Keys | Where-Object { $_ -eq $name })
             Resolve-ExlServerPaths -Name $name -Configured $b -Discovered $(if ($match.Count) { $found[$match[0]] }) -Sources $settings.Sources
         })
     if ($errors.Count) { throw ("Invalid configuration ($Path):`n - " + ($errors -join "`n - ")) }
+    $settings['Warnings'] = $warnings.ToArray()
     return $settings
 }
 
@@ -752,8 +1055,13 @@ function Start-ExlServe {
         [ValidateRange(10000, 1000000)][int]$ClientRowsMax = 50000,
         # The time budget of one scan request of the portal, in milliseconds.
         [ValidateRange(100, 120000)][int]$ScanBudgetMs = 2000,
+        # The portal stops after this many minutes without a request (0: no limit).
+        [ValidateRange(0, 10080)][double]$IdleMinutes = 0,
+        # Logging.EventLog of the configuration: the portal writes its start and stop to the Windows event log.
+        [switch]$EventLog,
         [switch]$DevelopmentMode
     )
+    $script:EventLogEnabled = [bool]$EventLog
     Assert-ExlPackageIntegrity -Root $script:ToolRoot -RequireManifest -DevelopmentMode:$DevelopmentMode
     Initialize-ExlEngine
     $options = [ExchangeLogReport.ServeOptions]::new()
@@ -769,7 +1077,10 @@ function Start-ExlServe {
     $options.ClientRowsMax = $ClientRowsMax
     $options.ScanBudgetMs = $ScanBudgetMs
     if ($TimeZone) { $options.Zone = $TimeZone }
-    [ExchangeLogReport.ServeHost]::Run($options)
+    $options.IdleMinutes = $IdleMinutes
+    Write-ExlEvent 4000 Information ("The portal started (loopback only{0})." -f $(if ($IdleMinutes -gt 0) { ", idle limit $($IdleMinutes.ToString([Globalization.CultureInfo]::InvariantCulture)) minute(s)" } else { '' }))
+    try { [ExchangeLogReport.ServeHost]::Run($options) }
+    finally { Write-ExlEvent 4001 Information 'The portal stopped.' }
 }
 
 function Resolve-ExlReportCollection {
@@ -833,6 +1144,28 @@ function Open-ExlStore {
         finally { Exit-ExlLock $lock }
     }
     return [ExchangeLogReport.Store]::new($path, [bool]$ReadOnly, $script:ToolVersion)
+}
+
+function Resolve-ExlFailureMessage {
+    <#
+        The text of a failure for the console and the log. A full disk is recognised by its error code, never by its message: SQLite error 13
+        (SQLITE_FULL) and the Windows errors ERROR_DISK_FULL (HRESULT 0x80070070) and ERROR_HANDLE_DISK_FULL (0x80070027) in the chain of
+        inner exceptions. Any other failure keeps its own message.
+    #>
+    param([Parameter(Mandatory)][Exception]$Exception, [string]$DatabasePath)
+    $current = $Exception
+    for ($depth = 0; $null -ne $current -and $depth -lt 8; $depth++) {
+        $code = $current.PSObject.Properties['SqliteErrorCode']
+        if ($code -and ([int]$code.Value -band 0xFF) -eq 13) {
+            $where = if ($DatabasePath) { " ($DatabasePath)" } else { '' }
+            return "The volume that holds the database is full$where. Free some space on it and run again: the database is not damaged and the next run resumes where this one stopped."
+        }
+        if ($current -is [IO.IOException] -and $current.HResult -in -2147024784, -2147024857) {
+            return 'The disk is full: a file could not be written. Free some space on the volume of the database, the logs or the reports and run again.'
+        }
+        $current = $current.InnerException
+    }
+    return $Exception.Message
 }
 
 #endregion
@@ -1198,7 +1531,7 @@ function Invoke-ExlCollection {
     $collector = New-ExlCollector -Store $Store -Settings $Settings -RunId $RunId
     $identityLog = { foreach ($l in $collector.TakeMessages()) { $level, $text = $l.Split('|', 2); Write-ExlLog $level $text } }
     $since = [DateTime]::UtcNow.AddDays(-$Settings.Collection.BackfillDays)
-    $totals = [ordered]@{ Files = 0L; Bytes = 0L; Lines = 0L; Kept = 0L; Noise = 0L; Stored = 0L; Errors = 0L; Recovered = 0L; Seconds = 0.0; Threads = 0; Statistics = $null; Unreachable = [Collections.Generic.List[string]]::new(); Stale = [Collections.Generic.List[string]]::new(); NoiseReasons = @{} }
+    $totals = [ordered]@{ Files = 0L; Bytes = 0L; Lines = 0L; Kept = 0L; Noise = 0L; Stored = 0L; Errors = 0L; Recovered = 0L; Seconds = 0.0; Threads = 0; Statistics = $null; Unreachable = [Collections.Generic.List[string]]::new(); Stale = [Collections.Generic.List[string]]::new(); Warnings = [Collections.Generic.List[string]]::new(); NoiseReasons = @{} }
     $clock = [Diagnostics.Stopwatch]::StartNew()
 
     # ---- plan: the folders of every server, listed in parallel ------------------------------------------------
@@ -1258,6 +1591,11 @@ function Invoke-ExlCollection {
         param($job)
         $stale = $staleOf[$job.Index]
         foreach ($kv in $job.NoiseReasons.GetEnumerator()) { $totals.NoiseReasons[$kv.Key] = [long]$totals.NoiseReasons[$kv.Key] + $kv.Value }
+        if ($job.NoiseReasons.ContainsKey([ExchangeLogReport.LogLine]::TooLong)) {
+            $text = "{0} line(s) longer than {1} skipped on {2} ({3}): they are not read, the collection goes on." -f (Format-ExlNumber $job.NoiseReasons[[ExchangeLogReport.LogLine]::TooLong]), (Format-ExlBytes ([ExchangeLogReport.LogLine]::MaxBytes)), $job.Server, $job.Label
+            Write-ExlItem Warn $text
+            $totals.Warnings.Add($text)
+        }
         $totals.Stored += $job.Stored; $totals.Errors += $job.Errors
         if (-not $job.FilesRead -and -not $job.Errors) {
             # Only empty files, or files not grown since the listing (IIS writes its buffer every minute).
@@ -1303,6 +1641,12 @@ function Invoke-ExlCollection {
     }
     $watch = [Diagnostics.Stopwatch]::StartNew()
     $totals.Recovered = $collector.Complete()
+    if ($collector.RegexTimeouts) {
+        $text = "{0} match(es) of the regular expressions of {1} exceeded the time limit twice: those lines were not tested by them (counted as no match, not remembered)." -f (Format-ExlNumber $collector.RegexTimeouts), (@($collector.RegexTimeoutSources) -join ', ')
+        if (@($collector.RegexDroppedSources).Count) { $text += " The expression of {0} was dropped for the rest of this collection: simplify it." -f (@($collector.RegexDroppedSources) -join ', ') }
+        Write-ExlItem Warn $text
+        $totals.Warnings.Add($text)
+    }
     Write-ExlLog 'INFO' ("Back-end IMAP/POP connections, recoveries ({0}) and identities written in {1:0.0} s; WAL {2}" -f $totals.Recovered, $watch.Elapsed.TotalSeconds, (Format-ExlBytes $Store.WalBytes))
     & $identityLog
     $totals.Seconds = $clock.Elapsed.TotalSeconds
@@ -1324,6 +1668,7 @@ function New-ExlReport {
     param([Parameter(Mandatory)]$Store, [Parameter(Mandatory)]$Settings, [Parameter(Mandatory)]$Period,
         [ValidateSet('Usage', 'Detailed')][string]$ReportType = 'Usage', [string[]]$User, [string[]]$Server, [bool]$IncludeRoutingDetails = $true, [bool]$IncludeSessionDetails = $true)
     $zone = $Settings.Zone
+    $ReportType = if ($ReportType -ieq 'Detailed') { 'Detailed' } else { 'Usage' }
     $scope = @($Settings.Servers | Where-Object { -not $Server -or $_.Name -in $Server })
     $edge = $scope.Count -gt 0 -and @($scope | Where-Object { -not (Test-ExlEdgeServer $_) }).Count -eq 0
     $stamp = (Format-ExlLocalTime $Period.StartMs $zone 'yyyyMMdd-HHmm') + '_' + (Format-ExlLocalTime $Period.EndMs $zone 'yyyyMMdd-HHmm')
@@ -1381,6 +1726,43 @@ function New-ExlReport {
 
 #region 8. Status and maintenance ------------------------------------------------------------------
 
+function Invoke-ExlReportRetention {
+    <#
+        Report.RetentionDays (0: never): removes the report folders of Report.OutputPath that this tool created and that are older than the limit.
+        A folder counts only with the name this tool gives (Report.FilePrefix, type, period, time, 8 hexadecimal digits) and the mark file written
+        when it was created; its age is the creation time in that mark. Old folders without a mark are never removed (said once in the log). A folder
+        that holds a reparse point, or is one, is left alone. Each removal is logged; a failure is a warning and never stops the run.
+    #>
+    param([Parameter(Mandatory)]$Settings, [datetime]$Now = [datetime]::UtcNow)
+    $days = [int]$Settings.Report.RetentionDays
+    $root = $Settings.Report.OutputPath
+    if ($days -le 0 -or -not (Test-Path -LiteralPath $root -PathType Container)) { return }
+    $pattern = '^' + [regex]::Escape($Settings.Report.FilePrefix) + '_(?:Edge)?(?:Usage|Detailed)_\d{8}-\d{4}_\d{8}-\d{4}_(?:.+_)?\d{6}_[0-9a-f]{8}$'
+    $limit = $Now.ToUniversalTime().AddDays(-$days)
+    $unmarked = 0
+    foreach ($folder in [IO.Directory]::EnumerateDirectories($root)) {
+        $name = [IO.Path]::GetFileName($folder)
+        if ($name -notmatch $pattern) { continue }
+        try {
+            if ([IO.File]::GetAttributes($folder) -band [IO.FileAttributes]::ReparsePoint) { continue }
+            $mark = Join-Path $folder '.exl-report'
+            if (-not [IO.File]::Exists($mark) -or (Get-Item -LiteralPath $mark -Force).LinkType -in 'SymbolicLink', 'Junction') { $unmarked++; continue }
+            $created = [regex]::Match([IO.File]::ReadAllText($mark), '(?m)^Created=(\S+)\s*$')
+            $when = [datetime]::MinValue
+            if (-not $created.Success -or -not [datetime]::TryParse($created.Groups[1].Value, [Globalization.CultureInfo]::InvariantCulture, [Globalization.DateTimeStyles]::AdjustToUniversal -bor [Globalization.DateTimeStyles]::AssumeUniversal, [ref]$when)) { continue }
+            if ($when -ge $limit) { continue }
+            # A link (junction or symbolic link, or any directory reparse point) is a reason to keep the folder; a file that a deduplicated volume
+            # optimised is a reparse point too, and is not one.
+            $hasLink = @(Get-ChildItem -LiteralPath $folder -Recurse -Force -Attributes ReparsePoint -ErrorAction Stop | Where-Object { $_.PSIsContainer -or $_.LinkType -in 'SymbolicLink', 'Junction' }).Count -gt 0
+            if ($hasLink) { Write-ExlItem Warn "Report folder $name holds a reparse point: it is not removed."; continue }
+            [IO.Directory]::Delete($folder, $true)
+            Write-ExlItem Info ("Report folder removed: {0} (created {1:yyyy-MM-dd}, Report.RetentionDays {2})." -f $name, $when, $days) -Icon Broom
+        }
+        catch { Write-ExlItem Warn "Report folder $name could not be removed: $($_.Exception.Message)" }
+    }
+    if ($unmarked) { Write-ExlLog 'INFO' "Report.RetentionDays: $unmarked report folder(s) without the mark of this tool are never removed." }
+}
+
 function Show-ExlStatus {
     <# Database content per server and source, and the noise set aside by the last collection. #>
     [CmdletBinding()]
@@ -1403,7 +1785,7 @@ function Show-ExlStatus {
         $old = $Settings.Collection.StaleSourceHours -gt 0 -and [string]$r[1] -in $script:AlwaysActiveKinds -and $null -ne $r[8] -and [long]$r[8] -lt $staleMs
         if ($old) { $stale.Add("$($r[0]) $($r[1])") }
         $state = if ($old) { 'Warn' } else { 'Ok' }
-        Write-Host ('      {0}{1}{2}{3,-10} {4,-12} {5,7} {6,10} {7,13} {8,11} {9,6}  {10,-33} {11}' -f $(if ($old) { $K.Yellow } else { $K.Green }), (Get-ExlIcon $state), $K.Reset, $r[0], $r[1], (Format-ExlNumber $r[2]), (Format-ExlBytes ([double]$r[3])), (Format-ExlNumber $r[4]), (Format-ExlNumber $r[5]), $noise, $range, $last)
+        Write-Host ('      {0}{1}{2}{3,-10} {4,-12} {5,7} {6,10} {7,13} {8,11} {9,6}  {10,-33} {11}' -f $(if ($old) { $K.Yellow } else { $K.Green }), (Get-ExlIcon $state), $K.Reset, (ConvertTo-ExlSafeText ([string]$r[0])), (ConvertTo-ExlSafeText ([string]$r[1])), (Format-ExlNumber $r[2]), (Format-ExlBytes ([double]$r[3])), (Format-ExlNumber $r[4]), (Format-ExlNumber $r[5]), $noise, $range, $last)
         Write-ExlLog 'INFO' ("Status {0} {1}: {2} files, {3} lines, {4} kept, noise {5}, {6}" -f $r[0], $r[1], $r[2], $r[4], $r[5], $noise, $range)
     }
     if ($stale.Count) { Write-ExlItem Warn ("No log line newer than {0} h for {1}: the scheduled collection stopped, the logging stopped or the logs were moved (run -Mode Discover)." -f $Settings.Collection.StaleSourceHours, ($stale -join ', ')) }
@@ -1416,7 +1798,7 @@ function Show-ExlStatus {
         if ($noise.Count) {
             Write-Host ''
             Write-ExlItem Info ('Noise set aside by the last collection ({0}):' -f (Format-ExlLocalTime $last[0][1] $zone 'yyyy-MM-dd HH:mm')) -Icon Filter
-            foreach ($n in $noise) { Write-Host ('          {0}{1,12}{2}  {3}' -f $K.Dim, (Format-ExlNumber $n[1]), $K.Reset, $n[0]) }
+            foreach ($n in $noise) { Write-Host ('          {0}{1,12}{2}  {3}' -f $K.Dim, (Format-ExlNumber $n[1]), $K.Reset, (ConvertTo-ExlSafeText ([string]$n[0]))) }
         }
     }
     Show-ExlIdentityStatus -Store $Store -Settings $Settings
@@ -1448,7 +1830,7 @@ function Show-ExlMailFlowStatus {
     }
     if ($learnt.Count) {
         $shown = @($learnt | Select-Object -First 40)
-        Write-Host ('          {0}{1}{2}{3}' -f $script:C.Dim, ($shown -join ', '), $(if ($learnt.Count -gt $shown.Count) { " and $(Format-ExlNumber ($learnt.Count - $shown.Count)) more (the log file lists every domain)" } else { '' }), $script:C.Reset)
+        Write-Host ('          {0}{1}{2}{3}' -f $script:C.Dim, (ConvertTo-ExlSafeText ($shown -join ', ')), $(if ($learnt.Count -gt $shown.Count) { " and $(Format-ExlNumber ($learnt.Count - $shown.Count)) more (the log file lists every domain)" } else { '' }), $script:C.Reset)
     }
     Write-ExlLog 'INFO' ("Status Sent to external: {0}; learnt domains ({1}): {2}; configured domains: {3}; collected servers: {4}" -f
         $(if ($rules.Saturated) { 'off (the list of learnt domains is full)' } elseif ($rules.HasDomains) { 'on' } else { 'no domain known' }), $learnt.Count, ($learnt -join ', '), ($configured -join ', '), (@($rules.Servers) -join ', '))
@@ -1959,6 +2341,279 @@ function Update-ExlApplicationLogPaths {
     return $notes.ToArray()
 }
 
+function Get-ExlManifestFileState {
+    <#
+        Is this file, as it is on disk now, the file the signed manifest lists? Accepted: its SHA256 is the one of PackageIntegrity.psd1, which
+        the verifier authenticated when the module was imported. Mismatch: it is not. None: no verified manifest in this process (a source tree).
+    #>
+    param([Parameter(Mandatory)][string]$Path, [string]$Root = $script:ToolRoot)
+    $manifestPath = Join-Path $Root 'PackageIntegrity.psd1'
+    if (-not $script:PackageVerified -or -not (Test-Path -LiteralPath $manifestPath -PathType Leaf)) { return 'None' }
+    $files = $null
+    if ($script:VerifiedManifest -and [string]::Equals($script:VerifiedManifest.Root, [IO.Path]::TrimEndingDirectorySeparator([IO.Path]::GetFullPath($Root)), [StringComparison]::OrdinalIgnoreCase)) { $files = $script:VerifiedManifest.Files }
+    else {
+        $manifest = Import-PowerShellDataFile -LiteralPath $manifestPath
+        if ([string]$manifest.SignerThumbprint -cne $script:OwnerThumbprint) { return 'Mismatch' }
+        $files = $manifest.Files
+    }
+    $relative = [IO.Path]::GetRelativePath($Root, $Path)
+    $entry = @($files | Where-Object { [string]::Equals($_.Path, $relative, [StringComparison]::OrdinalIgnoreCase) })
+    if ($entry.Count -ne 1) { return 'Mismatch' }
+    if ((Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash -ceq $entry[0].Sha256) { return 'Accepted' }
+    return 'Mismatch'
+}
+
+function Get-ExlWindowsPowerShellPolicy {
+    <# The execution policy that Windows PowerShell 5.1, which runs the helper, applies to this account: the answer of that host itself (group policy, machine and user scopes and the default of the edition included). Unknown when it cannot be read. #>
+    $host51 = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
+    if (-not (Test-Path -LiteralPath $host51 -PathType Leaf)) { return 'Unknown' }
+    $answer = try { (& $host51 -NoLogo -NoProfile -NonInteractive -Command '[string](Get-ExecutionPolicy)' 2>$null | Select-Object -First 1) } catch { $null }
+    if ($answer -and ([string]$answer).Trim() -cin 'Restricted', 'AllSigned', 'RemoteSigned', 'Unrestricted', 'Bypass') { return ([string]$answer).Trim() }
+    return 'Unknown'
+}
+
+function Get-ExlExecutionPolicyGroupScope {
+    <# The Group Policy scopes (MachinePolicy, UserPolicy) that set an execution policy for Windows PowerShell 5.1 on this computer, from its own Get-ExecutionPolicy -List. A policy set there wins over every other scope, the process scope (-ExecutionPolicy) included. Empty when none is set or when it cannot be read. #>
+    $host51 = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
+    if (-not (Test-Path -LiteralPath $host51 -PathType Leaf)) { return @() }
+    $command = "Get-ExecutionPolicy -List | Where-Object { [string]`$_.ExecutionPolicy -ne 'Undefined' } | ForEach-Object { [string]`$_.Scope }"
+    $answer = try { @(& $host51 -NoLogo -NoProfile -NonInteractive -Command $command 2>$null) } catch { @() }
+    return @($answer | ForEach-Object { ([string]$_).Trim() } | Where-Object { $_ -cin 'MachinePolicy', 'UserPolicy' })
+}
+
+function Get-ExlUrlZone {
+    <# The zone that the Windows URL security manager maps a path to (0 this computer, 1 intranet, 2 trusted sites, 3 Internet, 4 restricted sites): the zone that Windows PowerShell applies to a script by where it is. -1 when it cannot be read. #>
+    param([Parameter(Mandatory)][string]$Path)
+    if (-not ('ExchangeLogReport.ZoneMapper' -as [type])) {
+        Add-Type -TypeDefinition @"
+using System;
+using System.Runtime.InteropServices;
+using System.Text;
+namespace ExchangeLogReport
+{
+    [ComImport, Guid("79eac9ee-baf9-11ce-8c82-00aa004ba90b"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+    interface IInternetSecurityManager
+    {
+        [PreserveSig] int SetSecuritySite(IntPtr site);
+        [PreserveSig] int GetSecuritySite(out IntPtr site);
+        [PreserveSig] int MapUrlToZone([MarshalAs(UnmanagedType.LPWStr)] string url, out uint zone, uint flags);
+    }
+
+    public static class ZoneMapper
+    {
+        [DllImport("urlmon.dll")] static extern int CoInternetCreateSecurityManager(IntPtr site, out IInternetSecurityManager manager, uint reserved);
+        [DllImport("mpr.dll", CharSet = CharSet.Unicode)] static extern int WNetGetConnection(string local, StringBuilder remote, ref int length);
+
+        public static int UrlZone(string path)
+        {
+            IInternetSecurityManager manager;
+            if (CoInternetCreateSecurityManager(IntPtr.Zero, out manager, 0) != 0 || manager == null) return -1;
+            try { uint zone; return manager.MapUrlToZone(path, out zone, 0) == 0 ? (int)zone : -1; }
+            finally { Marshal.ReleaseComObject(manager); }
+        }
+
+        public static string NetworkPath(string drive)
+        {
+            var remote = new StringBuilder(1024); int length = remote.Capacity;
+            return WNetGetConnection(drive, remote, ref length) == 0 ? remote.ToString() : null;
+        }
+    }
+}
+"@
+    }
+    return [ExchangeLogReport.ZoneMapper]::UrlZone($Path)
+}
+
+function Resolve-ExlDrivePath {
+    <# The UNC path behind a mapped network drive ('Z:'), or $null when the drive is not a mapped network drive. #>
+    param([Parameter(Mandatory)][string]$Drive)
+    if (-not ('ExchangeLogReport.ZoneMapper' -as [type])) { [void](Get-ExlUrlZone -Path $env:SystemRoot) }
+    return [ExchangeLogReport.ZoneMapper]::NetworkPath($Drive)
+}
+
+function Get-ExlMappedZone {
+    <# The zone of the place of a file, a mapped drive being resolved to its UNC path first; $null when it cannot be determined. #>
+    param([Parameter(Mandatory)][string]$Path)
+    try {
+        $full = [IO.Path]::GetFullPath($Path)
+        if ($full -match '^[A-Za-z]:\\') {
+            $remote = Resolve-ExlDrivePath -Drive $full.Substring(0, 2)
+            if ($remote) { $full = $remote.TrimEnd('\') + $full.Substring(2) }
+        }
+        $zone = Get-ExlUrlZone -Path $full
+        if ($zone -ge 0) { return [int]$zone }
+    }
+    catch { Write-ExlLog 'DEBUG' "Zone of $Path not read: $($_.Exception.Message)" }
+    return $null
+}
+
+function Get-ExlZoneMark {
+    <# The text of the Zone.Identifier stream that a download left on a file; empty when the file carries none. #>
+    param([Parameter(Mandatory)][string]$Path)
+    return (@(Get-Content -LiteralPath $Path -Stream Zone.Identifier -ErrorAction SilentlyContinue) -join "`n")
+}
+
+function Get-ExlZoneId {
+    <#
+        The security zone that Windows PowerShell applies to a file: the larger of the mark that a download left on it (Zone.Identifier: 3 Internet,
+        4 Untrusted) and the zone of its place (a UNC path with a host name or an address is the Internet zone, a short name is the intranet, a mapped
+        drive is its UNC path). $null when the place cannot be mapped and the file carries no mark of the Internet: the zone is then not known.
+    #>
+    param([Parameter(Mandatory)][string]$Path)
+    $found = [regex]::Match((Get-ExlZoneMark -Path $Path), '(?m)^ZoneId=(\d+)\s*$')
+    $stream = if ($found.Success) { [int]$found.Groups[1].Value } else { 0 }
+    $mapped = Get-ExlMappedZone -Path $Path
+    if ($null -eq $mapped) { if ($stream -ge 3) { return $stream }; return $null }
+    return [Math]::Max($stream, $mapped)
+}
+function Test-ExlTrustedPublisher {
+    <# Is the certificate with this thumbprint in a Trusted Publishers store of this computer or of this account. #>
+    param([Parameter(Mandatory)][AllowEmptyString()][string]$Thumbprint)
+    if ($Thumbprint -notmatch '^[0-9A-Fa-f]{40}$') { return $false }
+    foreach ($store in 'LocalMachine', 'CurrentUser') {
+        if (Test-Path -LiteralPath "Cert:\$store\TrustedPublisher\$Thumbprint") { return $true }
+    }
+    return $false
+}
+
+function Resolve-ExlHelperPolicyPrediction {
+    <#
+        Will Windows PowerShell run a script file in a non-interactive child under this execution policy: Allowed, Blocked, or Unknown. A script
+        that needs a prompt (a file from the Internet under RemoteSigned or Unrestricted, a publisher that is not trusted under AllSigned) is Blocked:
+        the child cannot answer. A signature counts only when its status is Valid and its publisher is in a Trusted Publishers store.
+    #>
+    param([Parameter(Mandatory)][string]$Policy, [Parameter(Mandatory)][int]$ZoneId, [Parameter(Mandatory)][bool]$SignatureValid, [Parameter(Mandatory)][bool]$PublisherTrusted)
+    $remote = $ZoneId -ge 3
+    $signedAndTrusted = $SignatureValid -and $PublisherTrusted
+    switch ($Policy) {
+        'Bypass' { return 'Allowed' }
+        'Restricted' { return 'Blocked' }
+        'Unrestricted' { return $(if ($remote) { 'Blocked' } else { 'Allowed' }) }
+        'RemoteSigned' { return $(if (-not $remote -or $signedAndTrusted) { 'Allowed' } else { 'Blocked' }) }
+        'AllSigned' { return $(if ($signedAndTrusted) { 'Allowed' } else { 'Blocked' }) }
+        default { return 'Unknown' }
+    }
+}
+
+function Resolve-ExlHelperExecutionPolicy {
+    <#
+        How to start the discovery helper (src\Get-ExlExchangeSettings.ps1) in Windows PowerShell. Without -ExecutionPolicy Bypass when the policy of
+        the machine will let it run. When it would not (or the policy cannot be read), Bypass only if the file is the one the signed manifest lists
+        and its signature is the owner's (Get-OwnerSignatureVerdict: Valid, or valid with a certificate chain that this computer cannot build),
+        with a warning that says how to avoid it. A file that is not the manifest file, whose signature does not match or whose signer is not the
+        owner's is refused; in any other case the helper starts under the policy and may fail, with the reason in a warning.
+        A policy that comes from Group Policy (GroupPolicyScope) cannot be overridden by -ExecutionPolicy: Bypass is never used for it, and the
+        helper starts under that policy.
+        Statuses and verdict reasons are names, never message text.
+    #>
+    param(
+        [Parameter(Mandatory)]$Verdict,
+        [Parameter(Mandatory)][ValidateSet('Accepted', 'Mismatch', 'None')][string]$ManifestState,
+        [Parameter(Mandatory)][ValidateSet('Allowed', 'Blocked', 'Unknown')][string]$Prediction,
+        [string[]]$GroupPolicyScope = @()
+    )
+    $result = { param([bool]$Bypass, [bool]$Refuse, [string]$Reason, [string]$Warning) [pscustomobject]@{ Bypass = $Bypass; Refuse = $Refuse; Reason = $Reason; Warning = $Warning } }
+    if ($ManifestState -eq 'Mismatch') {
+        return & $result $false $true 'ManifestMismatch' 'The discovery helper is not the file listed by the signed manifest: it was modified. It is not started. Extract the release again.'
+    }
+    if ($Verdict.Status -ceq 'HashMismatch') {
+        return & $result $false $true 'HashMismatch' 'The signature of the discovery helper does not match its content: it was modified. It is not started. Extract the release again.'
+    }
+    if ($ManifestState -eq 'Accepted' -and $Verdict.Reason -ceq 'UnknownSigner') {
+        return & $result $false $true 'UnknownSigner' 'The discovery helper is signed by a certificate other than the owner certificate. It is not started. Extract the release again.'
+    }
+    if ($ManifestState -eq 'Accepted' -and $Verdict.Status -ceq 'NotSigned') {
+        return & $result $false $true 'NotSigned' 'The discovery helper has no signature although the signed manifest lists it as signed. It is not started. Extract the release again.'
+    }
+    if ($Prediction -eq 'Allowed') { return & $result $false $false 'PolicyAllows' $null }
+    if (@($GroupPolicyScope).Count) {
+        return & $result $false $false 'GroupPolicy' ("The execution policy of this computer is set by Group Policy ($($GroupPolicyScope[0])): -ExecutionPolicy Bypass cannot override it and is not used. The discovery helper starts under that policy and fails if it refuses the package files. " +
+            'If the policy is RemoteSigned, unblock the files of the package (Unblock-File). Otherwise ask for a policy that accepts them, or write the log folders in the Servers block of the configuration instead of running -Mode Discover (guide, 5.4 and 6.1).')
+    }
+    $why =if ($Prediction -eq 'Blocked') { 'The execution policy of this computer would not let the discovery helper run (a file from the Internet that is not signed by a trusted publisher, or a policy that forbids scripts)' } else { 'The execution policy of this computer could not be read' }
+    $how = 'To avoid it, unblock the files of the package (Unblock-File) or make the owner certificate a trusted publisher on this computer.'
+    if ($ManifestState -eq 'Accepted' -and $Verdict.Accepted) {
+        return & $result $true $false $(if ($Prediction -eq 'Blocked') { 'PolicyBlocks' } else { 'PolicyUnknown' }) "$why. The helper is the file of the signed manifest and its signer is the owner certificate: it starts with -ExecutionPolicy Bypass. $how"
+    }
+    return & $result $false $false 'NotEligible' "$why, and the helper is not confirmed by the signed manifest and the owner signature ($($Verdict.Reason)): it starts under that policy and may fail. $how"
+}
+
+function Get-ExlFileSignature {
+    <# The Authenticode signature of a file (one call, so that the checks of the launch can be tested without a signed file). #>
+    param([Parameter(Mandatory)][string]$Path)
+    return Microsoft.PowerShell.Security\Get-AuthenticodeSignature -LiteralPath $Path
+}
+
+function Get-ExlHelperLaunch {
+    <#
+        What Resolve-ExlHelperExecutionPolicy decides for this file now, before the helper is started: its signature, the signed manifest, and the
+        policy, zone and trusted publishers that decide whether Windows PowerShell would run it. A zone that cannot be determined leaves the prediction
+        Unknown. Fallback is the decision for a policy that blocks the file: what a retry with -ExecutionPolicy Bypass would be after a policy refusal.
+    #>
+    param([Parameter(Mandatory)][string]$Path, [string]$Root = $script:ToolRoot)
+    $signature = Get-ExlFileSignature -Path $Path
+    $verdict = Get-OwnerSignatureVerdict -Signature $signature -Pinned $script:OwnerThumbprint
+    $thumbprint = if ($signature.SignerCertificate) { $signature.SignerCertificate.Thumbprint } else { '' }
+    $zone = Get-ExlZoneId -Path $Path
+    $policy = ''
+    $prediction = if ($null -eq $zone) { 'Unknown' } else {
+        $policy = Get-ExlWindowsPowerShellPolicy
+        Resolve-ExlHelperPolicyPrediction -Policy $policy -ZoneId $zone -SignatureValid ($verdict.Status -ceq 'Valid') -PublisherTrusted (Test-ExlTrustedPublisher -Thumbprint $thumbprint)
+    }
+    $groupScope = @(if ($prediction -ne 'Allowed') { Get-ExlExecutionPolicyGroupScope })
+    $manifest = Get-ExlManifestFileState -Path $Path -Root $Root
+    $decision = Resolve-ExlHelperExecutionPolicy -Verdict $verdict -ManifestState $manifest -Prediction $prediction -GroupPolicyScope $groupScope
+    $decision | Add-Member -NotePropertyName Policy -NotePropertyValue $policy
+    $decision | Add-Member -NotePropertyName GroupPolicyScope -NotePropertyValue $groupScope
+    $decision | Add-Member -NotePropertyName Fallback -NotePropertyValue (Resolve-ExlHelperExecutionPolicy -Verdict $verdict -ManifestState $manifest -Prediction 'Blocked' -GroupPolicyScope $groupScope) -PassThru
+}
+
+function Get-ExlHelperFailureKind {
+    <#
+        What the output of a discovery helper that failed says, by error id and never by message text. HelperRefused: Windows PowerShell refused
+        to start the helper file (its error record names UnauthorizedAccess or PSSecurityException). ExchangeRefused: the helper started and
+        reported, in its ErrorId line, a security error raised by the Exchange Management Shell or the remote session. Other: anything else.
+    #>
+    param([AllowEmptyCollection()][string[]]$Output = @())
+    $text = @($Output) -join "`n"
+    $security = 'UnauthorizedAccess\b|AuthorizationManager|PSSecurityException'
+    $marker = [regex]::Match($text, '(?m)^ErrorId:[ \t]*(?<id>[^\r\n]*)$')
+    if ($marker.Success) { return $(if ($marker.Groups['id'].Value -cmatch $security) { 'ExchangeRefused' } else { 'Other' }) }
+    if ($text -cmatch 'FullyQualifiedErrorId\s*:\s*UnauthorizedAccess|PSSecurityException') { return 'HelperRefused' }
+    return 'Other'
+}
+
+function Get-ExlHelperFailureMessage {
+    <# The message of a failed discovery helper: what failed, and only the advice that fits its cause. Detail is the output of the helper. #>
+    param(
+        [Parameter(Mandatory)][ValidateSet('HelperRefused', 'ExchangeRefused', 'Other')][string]$Kind,
+        [Parameter(Mandatory)][string]$Detail,
+        [string]$Policy = '',
+        [string[]]$GroupPolicyScope = @(),
+        [bool]$Bypass = $false
+    )
+    $allSigned = 'The execution policy of this computer is AllSigned, which is not supported for -Mode Discover: the Exchange Management Shell does not run under it. Use a policy such as RemoteSigned, the Windows Server default (guide, 5.4).'
+    switch ($Kind) {
+        'HelperRefused' {
+            if (@($GroupPolicyScope).Count) {
+                return "-Mode Discover cannot start its helper: the execution policy of this computer is set by Group Policy ($($GroupPolicyScope[0])) and refuses it, and -ExecutionPolicy Bypass cannot override a Group Policy. " +
+                    "Run -Mode Discover on a computer whose policy accepts the package files, ask for the policy to be changed, or write the log folders in the Servers block of the configuration (guide, 5.4 and 6.1). $Detail"
+            }
+            if ($Bypass) { return $Detail }
+            return "$Detail The helper was started under the execution policy of this computer, which refused it: unblock the files of the package (Unblock-File) or make the owner certificate a trusted publisher on this computer (guide, 5.4)."
+        }
+        'ExchangeRefused' {
+            return "The Exchange Management Shell was refused by the execution policy of this computer: the package files are not the cause. -Mode Discover needs an execution policy under which the Exchange Management Shell runs; RemoteSigned is the Windows Server default and AllSigned is not supported for it. The collection, the report and the portal are not affected (guide, 5.4). $Detail"
+        }
+        default { return $(if ($Policy -ceq 'AllSigned') { "$Detail $allSigned" } else { $Detail }) }
+    }
+}
+function Get-ExlHelperArguments {
+    <# The command line of the discovery helper; -ExecutionPolicy Bypass only when Resolve-ExlHelperExecutionPolicy decided it. #>
+    param([Parameter(Mandatory)]$Launch, [Parameter(Mandatory)][string]$Helper, [Parameter(Mandatory)][string]$OutFile)
+    return @('-NoLogo', '-NoProfile', '-NonInteractive') + $(if ($Launch.Bypass) { @('-ExecutionPolicy', 'Bypass') }) + @('-File', $Helper, '-OutFile', $OutFile)
+}
+
 function Get-ExlExchangeSettings {
     <#
     .SYNOPSIS
@@ -1966,13 +2621,17 @@ function Get-ExlExchangeSettings {
         PowerShell 5.1: the Exchange cmdlets are supported in Windows PowerShell only. Exchange
         Management Shell on an Exchange server, Exchange remote PowerShell (Kerberos) elsewhere.
     #>
-    param([string[]]$ConnectTo, [pscredential]$Credential)
+    param([string[]]$ConnectTo, [pscredential]$Credential, [scriptblock]$Warn = { param([string]$Text) Write-ExlItem Warn $Text })
     $windowsPowerShell = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
     if (-not (Test-Path -LiteralPath $windowsPowerShell -PathType Leaf)) { throw "Windows PowerShell 5.1 is needed for -Mode Discover (the Exchange cmdlets run in Windows PowerShell only): $windowsPowerShell not found." }
     $helper = Join-Path $script:ToolRoot 'src\Get-ExlExchangeSettings.ps1'
     $out = Join-Path ([IO.Path]::GetTempPath()) ("elr-discover-{0}.json" -f [guid]::NewGuid().ToString('N'))
     $credentialFile = $null
-    $arguments = @('-NoLogo', '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', $helper, '-OutFile', $out)
+    $launch = Get-ExlHelperLaunch -Path $helper
+    if ($launch.Refuse) { throw $launch.Warning }
+    if ($launch.Warning) { & $Warn $launch.Warning }
+    if ($launch.Bypass) { Write-ExlEvent 2003 Warning 'The discovery helper was started with -ExecutionPolicy Bypass: the execution policy of this computer would not let it run.' }
+    $arguments = Get-ExlHelperArguments -Launch $launch -Helper $helper -OutFile $out
     if ($ConnectTo) { $arguments += @('-ConnectTo', ($ConnectTo -join ',')) }
     try {
         if ($Credential) {
@@ -1984,7 +2643,34 @@ function Get-ExlExchangeSettings {
         $output = @(& $windowsPowerShell @arguments 2>&1 | ForEach-Object { "$_".Trim() } | Where-Object { $_ })
         $code = $LASTEXITCODE
         foreach ($line in $output) { Write-ExlLog 'INFO' "Windows PowerShell: $line" }
-        if ($code -ne 0 -or -not (Test-Path -LiteralPath $out)) { throw ($(if ($output.Count) { $output -join ' ' } else { "Windows PowerShell ended with code $code." })) }
+        $failed = $code -ne 0 -or -not (Test-Path -LiteralPath $out)
+        $kind = if ($failed) { Get-ExlHelperFailureKind -Output $output } else { 'Other' }
+        $groupScope = @(if ($launch.PSObject.Properties['GroupPolicyScope']) { $launch.GroupPolicyScope })
+        $policy = if ($launch.PSObject.Properties['Policy']) { [string]$launch.Policy } else { '' }
+        # Safety net: the policy refused the helper although the prediction said it would run. The refusal is recognised by its error id
+        # (UnauthorizedAccess, PSSecurityException), never by its message; the same guarded Bypass as for a blocked policy is then used once,
+        # unless the policy comes from Group Policy, which no Bypass overrides.
+        if ($failed -and $kind -eq 'HelperRefused' -and -not $launch.Bypass -and -not $groupScope.Count -and $launch.Fallback -and $launch.Fallback.Bypass) {
+            $groupScope = @(Get-ExlExecutionPolicyGroupScope)
+        }
+        if ($failed -and $kind -eq 'HelperRefused' -and -not $launch.Bypass -and -not $groupScope.Count -and $launch.Fallback -and $launch.Fallback.Bypass) {
+            & $Warn $launch.Fallback.Warning
+            Write-ExlEvent 2003 Warning 'The discovery helper was started again with -ExecutionPolicy Bypass: the execution policy of this computer refused it.'
+            $launch = $launch.Fallback
+            $arguments = @(Get-ExlHelperArguments -Launch $launch -Helper $helper -OutFile $out)
+            if ($ConnectTo) { $arguments += @('-ConnectTo', ($ConnectTo -join ',')) }
+            if ($credentialFile) { $arguments += @('-CredentialFile', $credentialFile) }
+            $output = @(& $windowsPowerShell @arguments 2>&1 | ForEach-Object { "$_".Trim() } | Where-Object { $_ })
+            $code = $LASTEXITCODE
+            foreach ($line in $output) { Write-ExlLog 'INFO' "Windows PowerShell: $line" }
+            $failed = $code -ne 0 -or -not (Test-Path -LiteralPath $out)
+            $kind = if ($failed) { Get-ExlHelperFailureKind -Output $output } else { 'Other' }
+        }
+        if ($failed) {
+            $lines = @($output | Where-Object { $_ -cnotmatch '^ErrorId:' })
+            $detail = $(if ($lines.Count) { $lines -join ' ' } else { "Windows PowerShell ended with code $code." })
+            throw (Get-ExlHelperFailureMessage -Kind $kind -Detail $detail -Policy $policy -GroupPolicyScope $groupScope -Bypass ([bool]$launch.Bypass))
+        }
         return (Get-Content -LiteralPath $out -Raw -Encoding utf8 | ConvertFrom-Json)
     }
     finally {
@@ -2023,7 +2709,7 @@ function Invoke-ExlDiscovery {
 
     # ---- 1. Exchange (Windows PowerShell 5.1) --------------------------------------------------------
     Write-ExlStep 1 4 'Reading the Exchange settings (Windows PowerShell 5.1)' -Icon Server
-    $exchange = Get-ExlExchangeSettings -ConnectTo $targets -Credential $Credential
+    $exchange = Get-ExlExchangeSettings -ConnectTo $targets -Credential $Credential -Warn $warn
     $discovered = @($exchange.Servers)
     $edgeEntries = @($discovered | Where-Object { (& $prop $_ 'Role') -eq 'Edge' })
     if ($edgeEntries.Count) {
@@ -2237,25 +2923,84 @@ function Save-ExlMailCredential {
         Tool = 'Exchange Log Report'; UserName = $Credential.UserName; Scope = [string]$m.CredentialScope; Password = [Convert]::ToBase64String($protected)
         WrittenBy = [Security.Principal.WindowsIdentity]::GetCurrent().Name; Computer = [Environment]::MachineName; Written = (Get-Date).ToString('yyyy-MM-ddTHH:mm:sszzz')
     } | ConvertTo-Json
-    [void][IO.Directory]::CreateDirectory((Split-Path $m.CredentialFile -Parent))
-    [IO.File]::WriteAllText($m.CredentialFile, $content, [Text.UTF8Encoding]::new($false))
-    # Only SYSTEM, the administrators and this account may read the file (the password is protected anyway).
+    $bytes = [Text.UTF8Encoding]::new($false).GetBytes($content)
+    $directory = Split-Path $m.CredentialFile -Parent
+    [void][IO.Directory]::CreateDirectory($directory)
+    # The file is created with its final access control in one operation: it never exists with the permissions of the folder. A file already
+    # there is replaced by the new one, which carries its own access control.
+    # The work file is named .<file>.<32 hexadecimal digits>.tmp in the folder of the credential file: the package verifier accepts exactly that
+    # name in config\, so a process that dies before the file is moved never stops the next start. A work file left that way is removed here.
+    $leaf = [IO.Path]::GetFileName($m.CredentialFile)
+    foreach ($old in @(Get-ChildItem -LiteralPath $directory -Force -File -ErrorAction SilentlyContinue | Where-Object { $_.Name -cmatch ('^\.' + [regex]::Escape($leaf) + '\.[0-9a-f]{32}\.tmp$') -and $_.LastWriteTimeUtc -lt [DateTime]::UtcNow.AddMinutes(-10) })) {
+        Remove-Item -LiteralPath $old.FullName -Force -ErrorAction SilentlyContinue
+    }
+    $replace = Test-Path -LiteralPath $m.CredentialFile
+    $target = if ($replace) { Join-Path $directory ('.{0}.{1}.tmp' -f $leaf, [guid]::NewGuid().ToString('N')) } else { $m.CredentialFile }
+    $written = $false
     try {
-        $acl = [Security.AccessControl.FileSecurity]::new()
-        $acl.SetAccessRuleProtection($true, $false)
-        foreach ($sid in 'S-1-5-18', 'S-1-5-32-544', [Security.Principal.WindowsIdentity]::GetCurrent().User.Value) {
-            $acl.AddAccessRule([Security.AccessControl.FileSystemAccessRule]::new([Security.Principal.SecurityIdentifier]::new($sid), 'FullControl', 'Allow'))
+        try {
+            $stream = [IO.FileSystemAclExtensions]::Create([IO.FileInfo]::new($target), [IO.FileMode]::CreateNew, [Security.AccessControl.FileSystemRights]::FullControl,
+                [IO.FileShare]::None, 4096, [IO.FileOptions]::None, (New-ExlCredentialSecurity))
         }
-        [IO.FileSystemAclExtensions]::SetAccessControl([IO.FileInfo]::new($m.CredentialFile), $acl)
-    } catch { Write-ExlLog 'WARN' "Could not restrict the access to $($m.CredentialFile): $($_.Exception.Message)" }
+        catch { throw "The password was not saved: the file $($m.CredentialFile) could not be created with its access restricted to SYSTEM, the administrators and this account ($($_.Exception.Message))." }
+        try { $stream.Write($bytes, 0, $bytes.Length); $stream.Flush() } finally { $stream.Dispose() }
+        if ($replace) { [IO.File]::Move($target, $m.CredentialFile, $true) }
+        $written = $true
+    }
+    finally {
+        if (-not $written -and (Test-Path -LiteralPath $target)) { Remove-Item -LiteralPath $target -Force -ErrorAction SilentlyContinue }
+    }
     Write-ExlLog 'INFO' ("Mail credential written to {0} for {1} (DPAPI scope {2})" -f $m.CredentialFile, $Credential.UserName, $m.CredentialScope)
+    Write-ExlEvent 3000 Information ("The mail credential file was written (DPAPI scope {0})." -f $m.CredentialScope)
 }
+
+function New-ExlCredentialSecurity {
+    <# Access control of Mail.CredentialFile: SYSTEM, the administrators and the account that writes it, no inheritance. Security identifiers only: the names of these accounts depend on the language of Windows. #>
+    $acl = [Security.AccessControl.FileSecurity]::new()
+    $acl.SetAccessRuleProtection($true, $false)
+    foreach ($sid in 'S-1-5-18', 'S-1-5-32-544', [Security.Principal.WindowsIdentity]::GetCurrent().User.Value) {
+        $acl.AddAccessRule([Security.AccessControl.FileSystemAccessRule]::new([Security.Principal.SecurityIdentifier]::new($sid), 'FullControl', 'Allow'))
+    }
+    return $acl
+}
+
+function Test-ExlCredentialFileAccess {
+    <#
+        An existing Mail.CredentialFile that other accounts can read or change: the problems as text (empty when the access is restricted).
+        Expected: SYSTEM, the administrators, TrustedInstaller, the account that wrote the file (WrittenBy), the account that runs the tool and the
+        owner of the file; a file written again by Save-ExlMailCredential has exactly these. Only an inherited access control or another security
+        identifier is a problem. Compared by security identifier; the file keeps working either way.
+    #>
+    param([Parameter(Mandatory)][string]$Path)
+    try { $security = [IO.FileSystemAclExtensions]::GetAccessControl([IO.FileInfo]::new($Path)) }
+    catch { Write-ExlLog 'DEBUG' "Access of $Path not readable: $($_.Exception.Message)"; return @() }
+    $self = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+    $owner = try { $security.GetOwner([Security.Principal.SecurityIdentifier]).Value } catch { $null }
+    # The account that wrote the file is named in it (WrittenBy): its own entry is expected, so that a file written by an administrator for a task that
+    # runs as SYSTEM (scope Computer) does not warn at every send.
+    $writer = try { [Security.Principal.NTAccount]::new([string](Get-Content -LiteralPath $Path -Raw -Encoding utf8 | ConvertFrom-Json).WrittenBy).Translate([Security.Principal.SecurityIdentifier]).Value } catch { $null }
+    $allowed = @('S-1-5-18', 'S-1-5-32-544', $script:TrustedInstallerSid, $self, $owner, $writer) | Where-Object { $_ }
+    $problems = [Collections.Generic.List[string]]::new()
+    if (-not $security.AreAccessRulesProtected) { $problems.Add('it inherits the permissions of its folder') }
+    foreach ($rule in $security.GetAccessRules($true, $true, [Security.Principal.SecurityIdentifier])) {
+        if ($rule.AccessControlType -ne 'Allow' -or $rule.IdentityReference.Value -in $allowed) { continue }
+        $problems.Add("it grants access to $(Get-ExlAccountText $rule.IdentityReference.Value) ($($rule.FileSystemRights))")
+    }
+    return $problems.ToArray()
+}
+
+$script:CredentialAccessWarned = [Collections.Generic.HashSet[string]]::new()
 
 function Read-ExlMailCredential {
     <# The account and password of Mail.CredentialFile ($null when the file does not exist). #>
     param([Parameter(Mandatory)]$Settings)
     $m = $Settings.Mail
     if (-not (Test-Path -LiteralPath $m.CredentialFile -PathType Leaf)) { return $null }
+    $problems = @(Test-ExlCredentialFileAccess -Path $m.CredentialFile)
+    $key = [IO.Path]::GetFullPath($m.CredentialFile).ToUpperInvariant()
+    if ($problems.Count -and $script:CredentialAccessWarned.Add($key)) {
+        Write-ExlItem Warn ("Mail credential file: {0}: {1}. It still works. Write it again once, with the account that runs the tool: .\Run-Collector.cmd -Mode MailTest -Credential (Get-Credential). The new file is restricted to SYSTEM, the administrators and the account that writes it." -f $m.CredentialFile, ($problems -join '; '))
+    }
     $data = Get-Content -LiteralPath $m.CredentialFile -Raw -Encoding utf8 | ConvertFrom-Json
     $scope = if ($data.Scope -eq 'Computer') { [Security.Cryptography.DataProtectionScope]::LocalMachine } else { [Security.Cryptography.DataProtectionScope]::CurrentUser }
     try { $plain = [Security.Cryptography.ProtectedData]::Unprotect([Convert]::FromBase64String($data.Password), $script:MailEntropy, $scope) }
@@ -2275,6 +3020,8 @@ function New-ExlMailSettings {
     $s.Server = $m.SmtpServer; $s.Port = $m.Port; $s.Encryption = $m.Encryption; $s.Authentication = $m.Authentication
     $s.From = $m.From; $s.FromName = $m.FromName; $s.To = [string[]]@($m.To); $s.Cc = [string[]]@($m.Cc); $s.Bcc = [string[]]@($m.Bcc)
     $s.TargetName = $m.TargetName; $s.CertificateThumbprint = $m.CertificateThumbprint; $s.TimeoutSeconds = $m.TimeoutSeconds; $s.HeloName = $m.HeloName
+    $s.CheckRevocation = $m['CheckRevocation'] -eq $true
+    if ($m['MinimumTls']) { $s.MinimumTls = [string]$m['MinimumTls'] }
     if ($m.Authentication -in 'Basic', 'Kerberos') {
         $credential = Read-ExlMailCredential -Settings $Settings
         if ($credential) { $s.UserName = $credential.UserName; $s.Password = $credential.Password }
@@ -2291,6 +3038,23 @@ function Format-ExlMailSubject {
     return $text
 }
 
+function Write-ExlMailOutcome {
+    <# What a send leaves besides its result: the warnings of the session (console and log), and the event of a message that was sent. #>
+    param([Parameter(Mandatory)]$Smtp, [Parameter(Mandatory)]$Result)
+    foreach ($w in @($Result.Warnings)) { Write-ExlItem Warn $w }
+    if ($Result.Sent) {
+        $count = @(@($Smtp.To) + @($Smtp.Cc) + @($Smtp.Bcc) | Where-Object { $_ } | ForEach-Object { $_.Trim().ToLowerInvariant() } | Select-Object -Unique).Count
+        Write-ExlEvent 3001 Information ("E-mail sent through {0}:{1} to {2} recipient(s); TLS: {3}." -f $Smtp.Server, $Smtp.Port, $count, $(if ($Result.Tls) { $Result.Tls } else { 'none' }))
+    }
+}
+
+function Write-ExlMailRecipients {
+    <# Every recipient of a message about to be sent, Bcc included, and the server it goes through: one line in the log per send. #>
+    param([Parameter(Mandatory)]$Smtp, [string]$Subject)
+    $list = { param($Addresses) $items = @($Addresses | Where-Object { $_ }); if ($items.Count) { $items -join ', ' } else { '-' } }
+    Write-ExlLog 'INFO' ("Mail: sending '{0}' from {1} through {2}:{3}; To: {4}; Cc: {5}; Bcc: {6}" -f $Subject, $Smtp.From, $Smtp.Server, $Smtp.Port, (& $list $Smtp.To), (& $list $Smtp.Cc), (& $list $Smtp.Bcc))
+}
+
 function Send-ExlReportMail {
     <#
     .SYNOPSIS
@@ -2303,8 +3067,10 @@ function Send-ExlReportMail {
     $smtp = New-ExlMailSettings -Settings $Settings
     $subject = Format-ExlMailSubject -Template $m.Subject -Values @{ Title = $Title; Type = $ReportType; Period = $Period; Range = $Range; Servers = (@($Settings.Servers | ForEach-Object Name) -join ', '); Computer = [Environment]::MachineName }
     $content = [ExchangeLogReport.ReportMail]::Build($Report, $subject, $Title, $Period, $ReportType, [Environment]::MachineName, $m.Attach, [long]$m.MaxAttachmentMB * 1MB)
+    Write-ExlMailRecipients -Smtp $smtp -Subject $subject
     $result = [ExchangeLogReport.SmtpSender]::Send($smtp, $content)
     foreach ($l in $result.Transcript) { Write-ExlLog 'DEBUG' "SMTP $l" }
+    Write-ExlMailOutcome -Smtp $smtp -Result $result
     $attached = @($content.Attachments | ForEach-Object { '{0} ({1})' -f $_.Name, (Format-ExlBytes $_.Content.LongLength) })
     $result | Add-Member -NotePropertyName Attached -NotePropertyValue $attached -Force
     $result | Add-Member -NotePropertyName OmittedBytes -NotePropertyValue $content.OmittedBytes -Force
@@ -2326,18 +3092,20 @@ function Send-ExlTestMail {
     )
     $content.Text = $lines -join "`r`n"
     $content.Html = '<html><body style="font-family:Segoe UI,Arial,sans-serif;font-size:14px">' + (($lines | ForEach-Object { '<p>' + [Net.WebUtility]::HtmlEncode($_) + '</p>' }) -join '') + '</body></html>'
+    Write-ExlMailRecipients -Smtp $smtp -Subject $content.Subject
     $result = [ExchangeLogReport.SmtpSender]::Send($smtp, $content)
     foreach ($l in $result.Transcript) { Write-ExlLog 'DEBUG' "SMTP $l" }
+    Write-ExlMailOutcome -Smtp $smtp -Result $result
     return $result
 }
 
 #endregion
 
 # SIG # Begin signature block
-# MIImKQYJKoZIhvcNAQcCoIImGjCCJhYCAQExDzANBglghkgBZQMEAgEFADB5Bgor
+# MIImKgYJKoZIhvcNAQcCoIImGzCCJhcCAQExDzANBglghkgBZQMEAgEFADB5Bgor
 # BgEEAYI3AgEEoGswaTA0BgorBgEEAYI3AgEeMCYCAwEAAAQQH8w7YFlLCE63JNLG
-# KX7zUQIBAAIBAAIBAAIBAAIBADAxMA0GCWCGSAFlAwQCAQUABCDx2GgRGKREzung
-# BdWmVD0lOae6UWqVPGiblbiMc01ePKCCDW8wggZyMIIEWqADAgECAghkM1HTxzif
+# KX7zUQIBAAIBAAIBAAIBAAIBADAxMA0GCWCGSAFlAwQCAQUABCBsCnHZNyiyWwNE
+# LfceRkB9R1fotz9rM/pwjFnc0G4khqCCDW8wggZyMIIEWqADAgECAghkM1HTxzif
 # CDANBgkqhkiG9w0BAQsFADB8MQswCQYDVQQGEwJVUzEOMAwGA1UECAwFVGV4YXMx
 # EDAOBgNVBAcMB0hvdXN0b24xGDAWBgNVBAoMD1NTTCBDb3Jwb3JhdGlvbjExMC8G
 # A1UEAwwoU1NMLmNvbSBSb290IENlcnRpZmljYXRpb24gQXV0aG9yaXR5IFJTQTAe
@@ -2409,28 +3177,28 @@ function Send-ExlTestMail {
 # ULeH38N0Vr83psiJVuBSxQyt5nRVrpYz7FACq5gtXELkyViq/rGOlJKaRrgQ6WWq
 # eoIXqKhVFAdP/jAEm2M8ezoVYsUgPyKY2OcuecV9coulAcxUIUydx6qYiOfsGj5u
 # Dy7l4aYjvB771wkUMzUQwxzcDYXJtMMTaWRe6n9EemR67jc73u5CJyFg3PfA5WR1
-# wZislcdCZuS6MYIYEDCCGAwCAQEwgYwweDELMAkGA1UEBhMCVVMxDjAMBgNVBAgM
+# wZislcdCZuS6MYIYETCCGA0CAQEwgYwweDELMAkGA1UEBhMCVVMxDjAMBgNVBAgM
 # BVRleGFzMRAwDgYDVQQHDAdIb3VzdG9uMREwDwYDVQQKDAhTU0wgQ29ycDE0MDIG
 # A1UEAwwrU1NMLmNvbSBDb2RlIFNpZ25pbmcgSW50ZXJtZWRpYXRlIENBIFJTQSBS
 # MQIQBof4ljXihJpmCqqt2mhAWzANBglghkgBZQMEAgEFAKCBhDAYBgorBgEEAYI3
 # AgEMMQowCKACgAChAoAAMBkGCSqGSIb3DQEJAzEMBgorBgEEAYI3AgEEMBwGCisG
-# AQQBgjcCAQsxDjAMBgorBgEEAYI3AgEVMC8GCSqGSIb3DQEJBDEiBCAOaZopAA96
-# TxG/YhOSnj1noHfENXZThFIxSrA4f1RzDTANBgkqhkiG9w0BAQEFAASCAgBbVBWN
-# 2k+Em0O4Vzs4RgICq+u1PSWY1+ZUa/KZxLRK2/V7P+QdzwL1eTLxpiV/sW5D0HQH
-# 5498C0BpvI2eIGk5ptqvwyzn9S7gqCbDWewcalEmgZXjmQ6E7yu2JyBSmRGpaaw/
-# 25jcJIDZPg21907nDuzRnezGHeseBrejSZxmuspMT7nbK6pOH6znwfhCKfd4+FU7
-# 7tLyljZ1/LufME+QmRXnEXNm/7oUh29ahCfAky/Il1osJrJ+Dus3/CP802WQcgZt
-# HNqUTyuvJ3Rw+HmVYvZlzcA3jQig/+rA8l2cZ4gO3ilPv3MBaMwWI12o5ucXAtOd
-# e3cAZIn2aOPP0YNo3JV/ra7s/d7AsdW3uSJRmHbi1zJjdMwi5TUV3HpOrz6/SjxA
-# dISrvR0Togjza2lJewiOJELSitSp2jUl8P+AVWp/7mhxPo8nttyOF0v9a8K3BdXh
-# SnjuXTQJq2wZ8oAZw9Rbwk24Oo6pC1Ycg7g6euE+mBQzgkgY1ixSgjF6Qux7J9GX
-# ITl077nhsYiUvf6LZRZl0xeLtY4zSrKzFfKVUph16MDBT7C9C+wlip0mrMTQVWwr
-# NMHV2SkOYEHQ55Bkar1fepqV6SQvsMS0AIVvai2znH0lvSDbTeCL4UVZ2L2YzLN/
-# UNzh46CmPUUdGSWi5Q/cYoK/leY4+a7v8CTIm6GCFM0wghTJBgorBgEEAYI3AwMB
-# MYIUuTCCFLUGCSqGSIb3DQEHAqCCFKYwghSiAgEDMQ0wCwYJYIZIAWUDBAIBMIGJ
+# AQQBgjcCAQsxDjAMBgorBgEEAYI3AgEVMC8GCSqGSIb3DQEJBDEiBCBSEqO020tq
+# TKjv3po3IJX2w/neZKW+UG4j7C3PziBD9DANBgkqhkiG9w0BAQEFAASCAgCC8Jy1
+# mBDVPuvnyUkH6OhIeIlk3QeI+7LmqkeMLc6+FwS0uDOdhtX+QL40u5aLjh0phsxy
+# ykTuCBVZcoecvQIOL8nh+qaoGaRjXGbV9ExDnfl4RYC60ekrPtBnyxG3X/WkFQbY
+# iNf8452zyekPwDF7lqSTlYzdmrYmArvAw2v7iFAEVxnvdJWDx+mIO7mTaOzu0Sub
+# eIo43ozbeYdLg7JWKjsl2X7msWHzI868O7/nKs56UaEAToUAFrAS7P7tFHTJONzU
+# zDhrma/eHaURqy/KhjPCHYckzB02Wf6nqWiWkXD0Mj4vVZihmQZGyoA88jDBDHdf
+# th5TV7EsiYIKzXlSsCgN9tuyxgVE6Rt48ghAm4x5A6yl8tRdsE4F0Z93SYflOJE/
+# ZODt6NwQLP6LaO5HQWFZD8mUIV4eQid6/3c4B+hkg8ardHPbpEedvi/TEAf1fkJi
+# 11nozvIjnRvj8g5hflQf8wQgoOQFXZv5zjcBcAih7tTWmlEbtGWx1JDaD/wcoWH7
+# 1TsGTJ8etOYu8yJGxKtYbDTscuZu1W+tDkj5WL2BR3nSRMb4wfpROfrlhj/kn2HF
+# AOZWaqCYjnj7y7xwttELD3wOE2e2bzG3i0P2t5E5GObvXuvvstVv+LiUKcuvSJ/a
+# Y07zJOV46lnS12EF8P9TWN+lyv6n636Pvup+r6GCFM4wghTKBgorBgEEAYI3AwMB
+# MYIUujCCFLYGCSqGSIb3DQEHAqCCFKcwghSjAgEDMQ0wCwYJYIZIAWUDBAIBMIGJ
 # BgsqhkiG9w0BCRABBKB6BHgwdgIBAQYMKwYBBAGCqTABAwYBMDEwDQYJYIZIAWUD
-# BAIBBQAEIA3fvkSuSR/wjbQRVYmKA4BjfsadA4pogwjcSR8HEKE0Agh+nGkOJy10
-# KBgPMjAyNjExMTcyMTA0NDZaMAMCAQECEHf4OU3N7PVms/Yui6rlaUugghGnMIIE
+# BAIBBQAEIANugNjXWk/zkIH/CgLSIDJVeB233HL/dR+uoJX7UrJ6AghVifco3D73
+# mBgPMjAyNjExMjIxMTA5MDlaMAMCAQECEB21IKPBpz9QBcGFR8KBcRagghGnMIIE
 # 8zCCAtugAwIBAgIQVEP4N71a7hgBhHK4XNqO4zANBgkqhkiG9w0BAQsFADByMQsw
 # CQYDVQQGEwJVUzEOMAwGA1UECAwFVGV4YXMxEDAOBgNVBAcMB0hvdXN0b24xETAP
 # BgNVBAoMCFNTTCBDb3JwMS4wLAYDVQQDDCVTU0wuY29tIFRpbWVzdGFtcGluZyBJ
@@ -2525,17 +3293,17 @@ function Send-ExlTestMail {
 # rDMtXndUg3qhJL4pA3ZUlo7w5lM5ml+A7ijr/3Gk2v4QRoDeE2ShmTXdHgtqo8L/
 # fT119mYcETycE2NYGRXsBl3N0rzDsHRr8P3TrprqhRrX04iS0P7eQ+lDxgS3yhGn
 # 3OzWGhDt9Gf2x1qe0/qdhFAVOkXxzMZz4Uat6xsAfzX0+/m8GEKW5Ojw/HY+kLvV
-# wzSPOzGCAlUwggJRAgEBMIGGMHIxCzAJBgNVBAYTAlVTMQ4wDAYDVQQIDAVUZXhh
+# wzSPOzGCAlYwggJSAgEBMIGGMHIxCzAJBgNVBAYTAlVTMQ4wDAYDVQQIDAVUZXhh
 # czEQMA4GA1UEBwwHSG91c3RvbjERMA8GA1UECgwIU1NMIENvcnAxLjAsBgNVBAMM
 # JVNTTC5jb20gVGltZXN0YW1waW5nIElzc3VpbmcgUlNBIENBIDICEFRD+De9Wu4Y
 # AYRyuFzajuMwCwYJYIZIAWUDBAIBoIIBYDAaBgkqhkiG9w0BCQMxDQYLKoZIhvcN
-# AQkQAQQwHAYJKoZIhvcNAQkFMQ8XDTI2MTExNzIxMDQ0NlowKAYJKoZIhvcNAQk0
-# MRswGTALBglghkgBZQMEAgGhCgYIKoZIzj0EAwIwLwYJKoZIhvcNAQkEMSIEIPmB
-# nxZ4jZy9mTVQyIsj1X0gerQKeRPO8/dpGjvN/6JlMIHIBgsqhkiG9w0BCRACLzGB
+# AQkQAQQwHAYJKoZIhvcNAQkFMQ8XDTI2MTEyMjExMDkwOVowKAYJKoZIhvcNAQk0
+# MRswGTALBglghkgBZQMEAgGhCgYIKoZIzj0EAwIwLwYJKoZIhvcNAQkEMSIEIJE/
+# qAA2UGzRTqXqigi7eZbF1X9YgPk5auFojQiW3GKzMIHIBgsqhkiG9w0BCRACLzGB
 # uDCBtTCBsjCBrwQgV0/qF6r6XnxqK5sIyZixc15FCzhzykTmokygkw5j87AwgYow
 # dqR0MHIxCzAJBgNVBAYTAlVTMQ4wDAYDVQQIDAVUZXhhczEQMA4GA1UEBwwHSG91
 # c3RvbjERMA8GA1UECgwIU1NMIENvcnAxLjAsBgNVBAMMJVNTTC5jb20gVGltZXN0
 # YW1waW5nIElzc3VpbmcgUlNBIENBIDICEFRD+De9Wu4YAYRyuFzajuMwCgYIKoZI
-# zj0EAwIERjBEAiBctcUE23krWX94jUDDx1J2kqBBUUjz2630SPYxuzNpLAIgCM7X
-# 4DPGA43S8kH7N4KYJVpE2Jw00mTWj19gZVvYc2E=
+# zj0EAwIERzBFAiAH5BpptG9mGfQY122vSdrcfqHSRKG32xIm7j55ZV/5RAIhAOIM
+# qjFVFa/+vaWzuFQI6iKu33T8lJg8broFnxl1tbTN
 # SIG # End signature block

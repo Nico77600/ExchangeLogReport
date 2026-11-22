@@ -1,7 +1,7 @@
 ---
 title: Exchange Log Report
 subtitle: User guide
-version: 3.0.1
+version: 3.1.0
 author: Nicolas Fabert
 updated: 2026-11-01
 ---
@@ -34,13 +34,13 @@ updated: 2026-11-01
 > Windows marks files downloaded from the Internet. After you extract the ZIP (chapter 2), check the publisher first (right-click a `.ps1`, for example `Invoke-ExchangeLogReport.ps1`, Properties, Digital Signatures: `Nicolas Fabert`), then unblock the extracted folder once:
 >
 > ```powershell
-> Get-ChildItem "E:\Tools\ExchangeLogReport" -Recurse -File -Force | Unblock-File
+> Get-ChildItem "C:\Program Files\ExchangeLogReport" -Recurse -File -Force | Unblock-File
 > ```
 >
 > Replace the example path with the folder where you extracted the ZIP of the [latest release](https://github.com/Nico77600/ExchangeLogReport/releases/latest).
 
 > [!WARNING]
-> Noise removal is not anonymisation. Reports can contain account names, e-mail and IP addresses, device identifiers, message subjects and SMTP transcripts. Restrict access to the database and report folders. Database retention does not delete exported reports or copies sent by e-mail: protect and delete those separately.
+> Noise removal is not anonymisation. Reports can contain account names, e-mail and IP addresses, device identifiers, message subjects and SMTP transcripts. Restrict access to the database and report folders. Database retention does not delete exported reports or copies sent by e-mail: protect and delete those separately ([developer guide, 10.1](ExchangeLogReport-Guide.md#101-personal-data-and-its-removal)).
 
 > [!NOTE]
 > Nothing is sent by e-mail unless you do step 7.
@@ -81,7 +81,7 @@ C | 7 | Open a session, a message or an SMTP client | its timeline, its route or
 |---|---|---|
 | The Exchange servers | `EXCH01`, `EXCH02`, `EXCH03`, `EXCH04` | your servers |
 | The server where the tool runs | `EXCH01` | one of your Exchange servers (or an administration server: chapter 2) |
-| The folder of the tool | `E:\Tools\ExchangeLogReport` | where you extracted the ZIP |
+| The folder of the tool | `C:\Program Files\ExchangeLogReport` | where you extracted the ZIP |
 | The domain, the users | `contoso.com`, `alice@contoso.com`, `bob@contoso.com` | your domain, your users |
 | The day of a problem | `2026-10-07` | the day of your problem |
 
@@ -89,8 +89,10 @@ C | 7 | Open a session, a message or an SMTP client | its timeline, its route or
 ## 2. Before you start
 
 ```steps
-Download the package | Download `ExchangeLogReport-3.0.1-win-x64.zip` from the [latest release](https://github.com/Nico77600/ExchangeLogReport/releases/latest) (not the *Source code* archive). It carries its own PowerShell 7: nothing to install.
-Extract it | Extract the ZIP into `E:\Tools\ExchangeLogReport` on EXCH01, then unblock that folder with the command of the box above. The folder holds `Run-Collector.cmd`, `Start-Portal.cmd` and `Database-Storage.cmd`.
+Download the package | Download `ExchangeLogReport-3.1.0-win-x64.zip` from the [latest release](https://github.com/Nico77600/ExchangeLogReport/releases/latest) (not the *Source code* archive). It carries its own PowerShell 7: nothing to install.
+Check it | Before you extract the ZIP, check the publisher, the attestation and the SBOM of the release ([developer guide, 5.3](ExchangeLogReport-Guide.md#53-verify-the-download)).
+Extract it | Extract the ZIP into `C:\Program Files\ExchangeLogReport` on EXCH01 (a folder under `%ProgramFiles%` is the one to prefer; another folder works the same, once protected), then unblock that folder with the command of the box above. The folder holds `Run-Collector.cmd`, `Start-Portal.cmd` and `Database-Storage.cmd`.
+Protect the folder | Only the administrators and SYSTEM may change the files of the tool; the account that collects writes `data`, `reports` and `logs` only, with an `icacls` example in the [developer guide, 5.2](ExchangeLogReport-Guide.md#52-lock-down-the-installation-folder). An elevated start warns when another account can change the package.
 Check your account | You can sign in to EXCH01 as an administrator, and your account is in the Exchange role group *View-Only Organization Management* (for step 2 only; ask the Exchange administrator, or run `Get-RoleGroupMember 'View-Only Organization Management'` in the Exchange Management Shell).
 ```
 
@@ -104,7 +106,7 @@ That is all for a tool that runs on an Exchange server: there, it runs as **SYST
 | PowerShell | **PowerShell 7 is inside the package** (`powershell\`). **Windows PowerShell 5.1** (built into Windows Server) for step 2 only. |
 | Account | **Local administrator of every Exchange server** (the logs are read through `\\<server>\C$`). On an Exchange server: **SYSTEM**, nothing to configure. On an administration server: a **domain account** (not a local account), with *Log on as a batch job* on that server. |
 | Exchange role | *View-Only Organization Management*, for step 2 only. The collection and the reports need no Exchange role. |
-| Network | SMB (445) from the collector to every Exchange server. From an administration server, also HTTP (80) to one Exchange server for step 2. |
+| Network | SMB (445) from the collector to every Exchange server, with SMB signing required. From an administration server, also HTTP (80) to one Exchange server for step 2 (remote PowerShell with Kerberos). What protects each link: [developer guide, 4.3](ExchangeLogReport-Guide.md#43-network-protection). |
 | Logging | SMTP: `ProtocolLoggingLevel Verbose` on the connectors to analyse (also what shows the authenticated user of SMTP clients). POP/IMAP: protocol log on (optional). HttpProxy, IIS, MAPI and message tracking are on by default. |
 | Edge Transport | Its own copy of the tool **on the Edge itself** (chapter 8). |
 | E-mail (option of step 7) | SMTP (25, 587 or 465) from the collector to a receive connector that accepts it. |
@@ -124,7 +126,7 @@ Always use the launchers (`.\Run-Collector.cmd`, `.\Start-Portal.cmd`, `.\Databa
 The launcher `Run-Collector.cmd` checks the package, then starts the PowerShell that is inside it:
 
 ```powershell
-cd E:\Tools\ExchangeLogReport
+cd "C:\Program Files\ExchangeLogReport"
 ```
 
 ### 1 · List the servers
@@ -183,10 +185,10 @@ It reads the last 14 days of logs. It is the only long run: about **6 minutes** 
 
 **If not:** read the yellow lines above the summary. *Collection finished with warnings* means a server or a source was not read completely: a folder that is not readable or a server that does not answer (chapter 10).
 
-**Do:** then create the hourly task. Copy the whole block:
+**Do:** then create the hourly task (the folder must be unblocked first, as in the box at the top: a task cannot answer the question of Windows about a downloaded file). Copy the whole block:
 
 ```powershell
-$run = 'E:\Tools\ExchangeLogReport\Run-Collector.cmd'
+$run = '\"C:\Program Files\ExchangeLogReport\Run-Collector.cmd\"'
 
 # Every hour: read the new log lines
 schtasks /Create /F /RU SYSTEM /RL HIGHEST /TN "Exchange Log Report - collect" `
@@ -239,7 +241,7 @@ If you want, they can also arrive by e-mail (step 7).
 **Do:** copy the whole block. It creates two scheduled tasks, then makes the daily report now, so that you do not wait until tomorrow:
 
 ```powershell
-$run = 'E:\Tools\ExchangeLogReport\Run-Collector.cmd'
+$run = '\"C:\Program Files\ExchangeLogReport\Run-Collector.cmd\"'
 
 # Every day at 07:00: what happened in the last 24 hours (Detailed report)
 schtasks /Create /F /RU SYSTEM /RL HIGHEST /TN "Exchange Log Report - daily report" `
@@ -286,12 +288,12 @@ Get-ChildItem .\reports -Recurse -Filter ExchangeLogs.html |
 1. Check its last result (`Get-ScheduledTaskInfo`, chapter 8: `0` is a success).
 2. Read the red line in the log file of the day in `logs\`.
 
-Each report is a new folder in `E:\Tools\ExchangeLogReport\reports`:
+Each report is a new folder in `C:\Program Files\ExchangeLogReport\reports`:
 
 - the HTML file, and the same data in CSV files for Excel;
 - for a very large report, also an `ExchangeLogs_data` folder next to the HTML file. Keep the two together, and extract a zipped report completely before opening it.
 
-Delete the old folders when you no longer need them. Very large reports: memory, workers and temporary space are in the [developer guide, 6.4](ExchangeLogReport-Guide.md#64-collection-storage-report-logging).
+The tool deletes a report folder only when you set `Report.RetentionDays` (default `0`: never), and only folders it created itself; reports of earlier versions, exports and the rest are yours to delete (a command that prunes by age is in the [developer guide, 10.1](ExchangeLogReport-Guide.md#101-personal-data-and-its-removal)). Very large reports: memory, workers and temporary space are in the [developer guide, 6.4](ExchangeLogReport-Guide.md#64-collection-storage-report-logging).
 
 **The Usage report** (the one you just made, and the monthly one) answers *is this server really used?* with one card per server. **The daily report** opens on the same cards for the last 24 hours, with the client sessions, the failed requests and the messages of the day: chapter 5 explains how to read them.
 
@@ -305,7 +307,12 @@ In this example:
   - Click the **SMTP clients** tab and choose EXCH03: a scanner still sends mail through it, without TLS.
   - The **Authenticated user** column shows the account that Exchange logged for a successful SMTP login. It is never guessed from the sender address: when no account is proven, it shows *Not available*.
 
-These are the people to contact before EXCH03 goes. To look at that server only, for the last 30 days:
+These are the people to contact before EXCH03 goes.
+
+> [!WARNING]
+> *No real usage* is evidence, not an authorisation. Warnings, or their absence, do not decide a decommissioning either. The tool checks that HttpProxy and IIS keep writing; **SMTP, message tracking, MAPI and POP/IMAP are not checked**, so a server whose mail logging stopped looks like a server without mail. Check `-Mode Status` (the dates of the data of every source), the protocol logging of the connectors and a period long enough for a quarterly job, before you act ([developer guide, chapter 9](ExchangeLogReport-Guide.md#9-reading-the-report)).
+
+To look at that server only, for the last 30 days:
 
 ```powershell
 .\Run-Collector.cmd -Range Last30Days -Server EXCH03
@@ -371,7 +378,7 @@ Mail = @{
 **Do — 3. Add the e-mail to the two reports.** The same commands as step 5, with `-SendMail` at the end (`/F` replaces the tasks):
 
 ```powershell
-$run = 'E:\Tools\ExchangeLogReport\Run-Collector.cmd'
+$run = '\"C:\Program Files\ExchangeLogReport\Run-Collector.cmd\"'
 
 schtasks /Create /F /RU SYSTEM /RL HIGHEST /TN "Exchange Log Report - daily report" `
     /SC DAILY /ST 07:00 /TR "$run -Range Last24Hours -ReportType Detailed -SendMail"
@@ -400,6 +407,14 @@ The daily e-mail gives the figures (with an **Authentication** line: the share o
 | `Kerberos` | No password sent. On Exchange: port 587 (*Client Frontend*), with an account **that has a mailbox**: SYSTEM is refused (*Unable to proxy authenticated session*). | `Port = 587`, and save the account as for Basic. |
 
 The saved account is protected by Windows: only this computer (with `CredentialScope = 'Computer'`), or only the account that saved it, can read it. A self-signed certificate: set `CertificateThumbprint`. Every value: [developer guide, 8.1](ExchangeLogReport-Guide.md#81-sending-the-report-by-e-mail).
+
+Three more settings, all optional:
+
+- `AllowedRecipientDomains = @('contoso.com')` refuses to send when an address of `To`, `Cc` or `Bcc` is outside these domains (exact domains, any case).
+- `CheckRevocation = $true` also checks that the certificate of the server is not revoked; it is not checked otherwise.
+- `Bcc = @()` hides recipients from the others; the log file of the day still names every recipient of every send.
+
+What the e-mail protects and what it does not: `StartTls` and `Tls` encrypt the message; `Encryption = 'None'` does not, **even with Kerberos**, which proves the account and encrypts nothing; a pinned `CertificateThumbprint` replaces the check of the certificate chain and name ([developer guide, 8.1](ExchangeLogReport-Guide.md#81-sending-the-report-by-e-mail)).
 
 <!-- icon: search -->
 ## 5. B · Troubleshooting
@@ -541,7 +556,7 @@ Stop | **Stop portal**, or Ctrl+C in its window.
 
 The launcher checks the files of the package before it starts. It does not collect logs, build a report or change the database.
 
-The address in the browser holds a private access code, new at each start: never share or paste that address.
+The address in the browser holds a private access code, new at each start: never share or paste that address. **Anyone who has the code reads everything the portal shows** (accounts, addresses, subjects, transcripts of every day in the database), and the code is on the command line of the browser at launch: start the portal in your own session, not on a shared terminal server ([developer guide, 15.7](ExchangeLogReport-Guide.md#157-who-can-read-the-portal)). The portal listens on port 8765 by default. `.\Start-Portal.cmd -IdleMinutes 30` stops it after 30 minutes without a request.
 
 **If not:**
 
@@ -777,7 +792,7 @@ Each report is written to a new folder under `reports\`, one per run, named afte
 | Exit code | Meaning |
 |---|---|
 | `0` | Success. |
-| `2` | Finished with warnings: a server, a folder or a file could not be read, a source is stale, the IIS or application log folders changed since `-Mode Discover`, or the report could not be sent by e-mail (or a recipient was refused). The run went to the end: a report run still writes its report. |
+| `2` | Finished with warnings: a server, a folder or a file could not be read, a source is stale, the IIS or application log folders changed since `-Mode Discover`, a log line over 8 MB was skipped, a configured regular expression exceeded its time limit, or the report could not be sent by e-mail (or a recipient was refused). The run went to the end: a report run still writes its report. The warnings at the start (package folder, server names, package check) do not change the exit code. |
 | `1` | Failure: read the error in red, and the log file of the day in `logs\`. |
 
 | Warning | What to do |
@@ -791,6 +806,12 @@ Each report is written to a new folder under `reports\`, one per run, named afte
 | *No collection in the database yet* | Run `-Mode Collect` once (it reads the last 14 days), then schedule it every hour (step 3). |
 | *… more than 90 min (Report.MaxDataAgeMinutes) …* at every report | The hourly collection is not running: check the scheduled task (chapter 8). |
 | *The report was not sent by e-mail* | The reason follows (server not reachable, certificate not trusted, account refused, STARTTLS not offered). Run `-Mode MailTest` with the account of the task: it shows the SMTP conversation. |
+| *Package folder: … can change …* | The tool runs elevated and an account that is not an administrator can change its folder. Remove that write access ([developer guide, 5.2](ExchangeLogReport-Guide.md#52-lock-down-the-installation-folder)). The run goes on, unless `Security.RequireProtectedFolder` is `$true`. |
+| *Package integrity: The publisher root certificate is not trusted on this server …* | The server lacks the root certificate of the publisher. The package was accepted on the owner certificate and the signed file hashes. Install the root certificate, or accept the warning ([developer guide, 5.1](ExchangeLogReport-Guide.md#51-package-integrity)). |
+| *Servers[n].Name '…' is an IP address* / *was not found by the last -Mode Discover* | Write the name of the server, not an address, a UNC name or a path, and check its spelling (step 1). |
+| *The execution policy of this computer would not let the discovery helper run …* | `-Mode Discover` went on, after checking the owner signature. Avoid the warning: unblock the ZIP before you extract it, or make the owner certificate a trusted publisher ([developer guide, 5.4](ExchangeLogReport-Guide.md#54-the-execution-policy-and-hardened-servers)). |
+| *Mail credential file: … inherits the permissions of its folder* | The saved account can be read by other accounts. Save it again: `.\Run-Collector.cmd -Mode MailTest -Credential (Get-Credential 'CONTOSO\svc-elr-mail')`. |
+| *… line(s) longer than 8 MB skipped* / *… match(es) of the regular expressions … exceeded the time limit twice …* | Exit code 2. A huge line was not read, or a pattern of the noise rules needed more than 2 seconds for a line, twice (after 10 such timeouts the pattern is dropped for the rest of the collection): [developer guide, 6.3](ExchangeLogReport-Guide.md#63-noise) and Annex A. |
 
 Anything else: [developer guide, Annex A — Troubleshooting](ExchangeLogReport-Guide.md#annex-a--troubleshooting).
 

@@ -1,0 +1,28 @@
+# Dependabot version updates. Reviewed by the owner; nothing is merged automatically.
+version: 2
+updates:
+  # The GitHub Actions used by the workflows are pinned to full commit IDs. A pull request moves a pin to the commit of a newer release:
+  # review the action source, then update the allowed-pin list in tests/Workflow.Tests.ps1 in the same pull request.
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 2
+    cooldown:
+      default-days: 7
+    groups:
+      github-actions:
+        patterns:
+          - "*"
+
+  # lib/sqlite/packages.config only declares the NuGet packages whose binaries are committed under package/lib/sqlite, so that the dependency
+  # graph can raise alerts for them. The binaries are pinned by SHA-256 in product.json and replaced by hand with a signed release:
+  # an automatic version pull request would be misleading. A limit of 0 disables the version-update pull requests of this ecosystem; Dependabot
+  # security updates are a repository setting and stay off for it. Alerts still come from the dependency graph and the scheduled watch.
+  - package-ecosystem: nuget
+    directory: /lib/sqlite
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 0

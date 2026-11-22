@@ -74,7 +74,7 @@ Describe 'Packaged HttpListener Serve' {
         $script.Content | Should -BeExactly ([IO.File]::ReadAllText((Join-Path $script:Package 'templates\Report.template.js')))
         $meta = (Serve-Request '/api/meta').Content | ConvertFrom-Json
         $meta.mode | Should -Be 'Serve'
-        $meta.version | Should -Be '3.0.1'
+        $meta.version | Should -Be '3.1.0'
         $meta.schemaVersion | Should -Be 13
         $meta.requiresMigration | Should -BeFalse
         @(Get-ChildItem -LiteralPath (Join-Path $script:Package 'lib') -Filter '*.dll' -Recurse -File |

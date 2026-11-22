@@ -2,7 +2,7 @@
 //  Exchange Log Report - engine, part 4b: HTML report (data files and page)
 // -----------------------------------------------------------------------------
 //  Author  : Nicolas Fabert
-//  Version : 3.0.1
+//  Version : 3.1.0
 //
 //  The page and its data. Every table is written first as data files (plain JavaScript: __exl.file / __exl.push
 //  statements with gzip + base64 payloads); the report then either copies those files into the page (one file) or
@@ -29,6 +29,9 @@ namespace ExchangeLogReport
 
         internal const string TemplateName = "Report.template.html";
         internal static readonly string[] TemplateMarkers = { "%%META%%", "%%CHUNKS%%", "%%SCRIPT%%" };
+        // Optional marker, any number of times: the nonce of a static report. The template then holds a Content-Security-Policy meta element that
+        // lets run only the scripts carrying the nonce (and the scripts they create); the portal sends its own policy header and drops both.
+        internal const string NonceMarker = "%%NONCE%%";
         internal static string TemplateScriptPath(string templatePath) { return Path.ChangeExtension(templatePath, ".js"); }
 
         /// <summary>The markers of the template, each exactly once, and a main script that can be copied into a script element.</summary>
@@ -50,6 +53,8 @@ namespace ExchangeLogReport
         internal static string ServedPage(string template, string script, string path)
         {
             CheckTemplate(template, script, path);
+            template = System.Text.RegularExpressions.Regex.Replace(template, @"<meta\s+http-equiv=""Content-Security-Policy""[^>]*>\r?\n?", "", System.Text.RegularExpressions.RegexOptions.CultureInvariant | System.Text.RegularExpressions.RegexOptions.IgnoreCase)
+                .Replace(" nonce=\"" + NonceMarker + "\"", "");
             var main = new System.Text.RegularExpressions.Regex(@"<script>\s*%%SCRIPT%%\s*</script>", System.Text.RegularExpressions.RegexOptions.CultureInvariant);
             if (!main.IsMatch(template)) throw new InvalidDataException("The template must hold its main script as <script>%%SCRIPT%%</script>: " + path);
             return main.Replace(template.Replace("%%CHUNKS%%", "").Replace("%%META%%", "{\"served\":true}"), "<script src=\"report.js\"></script>", 1);
@@ -490,6 +495,9 @@ namespace ExchangeLogReport
             CheckTemplate(template, null, q.TemplatePath);
             string script = File.ReadAllText(TemplateScriptPath(q.TemplatePath), Encoding.UTF8);
             CheckTemplate(template, script, q.TemplatePath);
+            bool nonced = template.IndexOf(NonceMarker, StringComparison.Ordinal) >= 0;
+            string nonce = Convert.ToBase64String(System.Security.Cryptography.RandomNumberGenerator.GetBytes(18));
+            if (nonced) template = template.Replace(NonceMarker, nonce);
             var htmlSets = HtmlDatasets(sets);
             int limit = q.MaxHtmlRows > 0 ? q.MaxHtmlRows : int.MaxValue;
             foreach (var d in htmlSets)
@@ -528,7 +536,7 @@ namespace ExchangeLogReport
                         else if (inline)
                             foreach (var f in data.Files)
                             {
-                                WriteText(page, "<script>");
+                                WriteText(page, nonced ? "<script nonce=\"" + nonce + "\">" : "<script>");
                                 using (var input = new FileStream(Path.Combine(folderPartial, f.Name), FileMode.Open, FileAccess.Read, FileShare.Read, 65536))
                                 {
                                     int n;
