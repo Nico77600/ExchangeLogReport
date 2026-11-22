@@ -3,7 +3,7 @@
 <#
     Exchange Log Report - automated tests (Pester 5 or later).
     Author  : Nicolas Fabert
-    Version : 3.0.1
+    Version : 3.1.0
 
     Run:  Invoke-Pester -Path .\tests\ExchangeLogReport.Tests.ps1 -Output Detailed
 
@@ -74,7 +74,7 @@ $Store.Exec("ALTER TABLE smtp_transaction DROP COLUMN client_id;")
         if ($meta.data.folder) {
             foreach ($f in @($meta.data.files)) { $files.Add([IO.File]::ReadAllText((Join-Path (Join-Path (Split-Path $Path -Parent) $meta.data.folder) $f.name))) }
         } else {
-            foreach ($match in [regex]::Matches($html, '<script>(__exl\.file\("[^"]+","[^"]+"\);\n[^<]*)</script>')) { $files.Add($match.Groups[1].Value) }
+            foreach ($match in [regex]::Matches($html, '<script(?: nonce="[^"]*")?>(__exl\.file\("[^"]+","[^"]+"\);\n[^<]*)</script>')) { $files.Add($match.Groups[1].Value) }
         }
         $pushes = foreach ($text in $files) { [regex]::Matches($text, '__exl\.push\("([cd])","([^"]+)",(\d+),(\d+),"([^"]+)"\);') }
         foreach ($match in @($pushes | Where-Object { $_.Groups[1].Value -eq 'c' })) {
@@ -1522,7 +1522,10 @@ FROM message_rollup r JOIN message_rollup_value s ON s.id=r.status LEFT JOIN mes
             (& $script:ExtLine 22 'SENDEXTERNAL' '<o-far@contoso.test>' 'buyer@far.example' '250 2.1.5 Ok' 'To Internet via Postfix' '203.0.113.5' 'Originating'))
         $dumps = foreach ($order in @(@('teach', 'send'), @('send', 'teach'))) {
             $dir = Join-Path $TestDrive "external-order-$($order -join '-')"
-            $s = Import-ExlConfiguration -Path (New-TestConfig $dir) -Root $script:Root
+            # The rowid of an SMTP transaction is the order in which its file is applied; with several parse threads that is the order in which the
+            # threads finish, so the same logs collected twice may number their transactions differently. One thread applies the files in plan order.
+            $s = Import-ExlConfiguration -Path (New-TestConfig $dir @{ 'Parallelism            = 0' = 'Parallelism            = 1' }) -Root $script:Root
+            $s.Collection.Parallelism | Should -Be 1
             $log = Join-Path $dir 'logs-src\EXCH01\Exchange\TransportRoles\Logs\MessageTracking'
             $k = 2
             foreach ($name in $order) {
@@ -2448,6 +2451,18 @@ Describe 'Reports' {
         $html = Get-Content -LiteralPath $r.HtmlPath -Raw
         $html | Should -Match '"name":"Clients and devices","kind":"steps"'
     }
+    It 'names the report folder with the canonical type whatever the case that was typed' -ForEach @(
+        @{ Typed = 'detailed'; Name = 'Detailed' }
+        @{ Typed = 'DETAILED'; Name = 'Detailed' }
+        @{ Typed = 'usage'; Name = 'Usage' }
+    ) {
+        $store = Open-ExlStore -Settings $script:Settings -ReadOnly
+        try { $r = New-ExlReport -Store $store -Settings $script:Settings -Period $script:Period -ReportType $Typed } finally { $store.Dispose() }
+        $leaf = Split-Path $r.Folder -Leaf
+        $leaf | Should -MatchExactly "_$Name`_"
+        $leaf | Should -Not -MatchExactly "_$($Name.ToLowerInvariant())_|_$($Name.ToUpperInvariant())_"
+    }
+
     It 'leaves the route out of the CSV when IncludeRoutingDetails is off' {
         $store = Open-ExlStore -Settings $script:Settings -ReadOnly
         try { $r = New-ExlReport -Store $store -Settings $script:Settings -Period $script:Period -ReportType Detailed -IncludeRoutingDetails $false } finally { $store.Dispose() }
@@ -2965,7 +2980,7 @@ SELECT id,start_ms,json_array(json_array(start_ms,0,'EXCH01','EXCH01','Execute',
         function DataFiles($Report, $Html) {
             if ($Html.Meta.data.folder) { return @($Html.Meta.data.files | ForEach-Object { [pscustomobject]@{ Entry = $_; Text = [IO.File]::ReadAllText((Join-Path $Report.HtmlDataFolder $_.name)) } }) }
             $page = [IO.File]::ReadAllText($Report.HtmlPath)
-            $inline = @([regex]::Matches($page, '<script>(__exl\.file\("[^"]+","[^"]+"\);\n[^<]*)</script>'))
+            $inline = @([regex]::Matches($page, '<script(?: nonce="[^"]*")?>(__exl\.file\("[^"]+","[^"]+"\);\n[^<]*)</script>'))
             $files = @($Html.Meta.data.files)
             return @(0..($files.Count - 1) | ForEach-Object { [pscustomobject]@{ Entry = $files[$_]; Text = $inline[$_].Groups[1].Value } })
         }
@@ -3005,9 +3020,11 @@ SELECT id,start_ms,json_array(json_array(start_ms,0,'EXCH01','EXCH01','Execute',
         $template = [IO.File]::ReadAllText((Join-Path $script:Root 'templates\Report.template.html'))
         $script = [IO.File]::ReadAllText((Join-Path $script:Root 'templates\Report.template.js'))
         # The template around its markers, the script where its marker was: the page ends with the script element that holds the file.
-        $page.EndsWith("<script>`r`n" + $script + "</script>`r`n</body></html>`r`n") | Should -BeTrue
-        $page.StartsWith($template.Substring(0, $template.IndexOf('%%CHUNKS%%'))) | Should -BeTrue
-        $page | Should -Not -Match '%%(META|CHUNKS|SCRIPT)%%'
+        $nonce = [regex]::Match($page, 'script-src ''nonce-([^'']+)''').Groups[1].Value
+        $nonce | Should -Not -BeNullOrEmpty
+        $page.EndsWith("<script nonce=`"$nonce`">`r`n" + $script + "</script>`r`n</body></html>`r`n") | Should -BeTrue
+        $page.StartsWith($template.Substring(0, $template.IndexOf('%%CHUNKS%%')).Replace('%%NONCE%%', $nonce)) | Should -BeTrue
+        $page | Should -Not -Match '%%(META|CHUNKS|SCRIPT|NONCE)%%'
         $page | Should -Not -Match ([regex]::Escape('<script id="report-meta" type="application/json">{"served":true}'))
         $page | Should -Not -Match '<script src="report\.js">'
         $meta = [regex]::Match($page, '<script id="report-meta" type="application/json">(.*?)</script>', 'Singleline').Groups[1].Value | ConvertFrom-Json -Depth 50
@@ -6119,6 +6136,331 @@ namespace ElrTest
             $server.Messages.Count | Should -Be 2
         } finally { $server.Dispose() }
     }
+
+    Context 'Recipients, revocation and hostile servers' {
+        BeforeAll {
+            if (-not ('ElrTest.RogueSmtp' -as [type])) {
+                Add-Type -IgnoreWarnings -WarningAction SilentlyContinue -TypeDefinition @'
+using System;
+using System.Collections.Generic;
+using System.IO;
+using System.Net;
+using System.Net.Security;
+using System.Net.Sockets;
+using System.Security.Cryptography.X509Certificates;
+using System.Text;
+using System.Threading;
+
+namespace ElrTest
+{
+    /// <summary>An SMTP server that misbehaves in one way (Mode), for the tests of the mail client.</summary>
+    public sealed class RogueSmtp : IDisposable
+    {
+        readonly TcpListener _listener = new TcpListener(IPAddress.Loopback, 0);
+        readonly Thread _thread;
+        public int Port;
+        public string Mode;     // multiline | longline | close | no354 | inject
+        public X509Certificate2 Certificate;
+        public System.Security.Authentication.SslProtocols Protocols = System.Security.Authentication.SslProtocols.None;
+        public bool BodyReceived;
+        public List<string> Commands = new List<string>();
+        Stream _s;
+
+        public RogueSmtp(string mode)
+        {
+            Mode = mode;
+            _listener.Start();
+            Port = ((IPEndPoint)_listener.LocalEndpoint).Port;
+            _thread = new Thread(Loop) { IsBackground = true };
+            _thread.Start();
+        }
+
+        void Loop()
+        {
+            while (true)
+            {
+                TcpClient client;
+                try { client = _listener.AcceptTcpClient(); } catch { return; }
+                try { using (client) Serve(client.GetStream()); } catch { }
+            }
+        }
+
+        string Line()
+        {
+            var b = new List<byte>();
+            while (true) { int x = _s.ReadByte(); if (x < 0) return null; if (x == '\n') break; if (x != '\r') b.Add((byte)x); }
+            return Encoding.ASCII.GetString(b.ToArray());
+        }
+        void Raw(string text) { var b = Encoding.ASCII.GetBytes(text); _s.Write(b, 0, b.Length); _s.Flush(); }
+
+        void Serve(Stream stream)
+        {
+            _s = stream;
+            Raw("220 rogue ready\r\n");
+            while (true)
+            {
+                string l = Line();
+                if (l == null) return;
+                lock (Commands) Commands.Add(l);
+                string u = l.ToUpperInvariant();
+                if (u.StartsWith("EHLO"))
+                {
+                    if (Mode == "multiline") { Raw("250-rogue\r\n250-SIZE 1000\r\n"); Thread.Sleep(20000); return; }
+                    if (Mode == "longline") { Raw("250 " + new string('A', 70000)); Thread.Sleep(3000); return; }
+                    if (Mode == "close") return;
+                    Raw("250-rogue\r\n" + ((Mode == "inject" || Mode == "tls") && !(_s is SslStream) ? "250-STARTTLS\r\n" : "") + "250 SIZE 1000\r\n");
+                }
+                else if (u == "STARTTLS" && (Mode == "inject" || Mode == "tls"))
+                {
+                    // The reply and bytes of the same packet that the TLS session did not send.
+                    Raw(Mode == "inject" ? "220 ready\r\n250-INJECTEDCAP\r\n250 INJECTEDCAP2\r\n" : "220 ready\r\n");
+                    var ssl = new SslStream(_s, false);
+                    ssl.AuthenticateAsServer(Certificate, false, Protocols, false);
+                    _s = ssl;
+                }
+                else if (u.StartsWith("MAIL FROM:") || u.StartsWith("RCPT TO:")) Raw("250 ok\r\n");
+                else if (u == "DATA")
+                {
+                    if (Mode == "no354") { Raw("250 this is not 354\r\n"); if (Line() != null) BodyReceived = true; return; }
+                    Raw("354 go\r\n");
+                    string d;
+                    while ((d = Line()) != null && d != ".") { }
+                    BodyReceived = true;
+                    Raw("250 queued\r\n");
+                }
+                else if (u == "QUIT") { Raw("221 bye\r\n"); return; }
+                else Raw("500 unknown\r\n");
+            }
+        }
+
+        public void Dispose() { try { _listener.Stop(); } catch { } }
+    }
+}
+'@
+            }
+            function Get-MailWithBlock([string]$Directory, [string]$Values) {
+                $cfg = New-TestConfig $Directory
+                [IO.File]::WriteAllText($cfg, (Set-MailBlock ([IO.File]::ReadAllText($cfg)) $Values))
+                return $cfg
+            }
+        }
+
+        It 'loads Mail.CheckRevocation and Mail.AllowedRecipientDomains as optional keys that change nothing for an existing configuration' {
+            $s = Import-ExlConfiguration -Path (Join-Path $script:Root 'config\ExchangeLogReport.config.psd1') -Root $script:Root
+            $s.Mail.CheckRevocation | Should -BeFalse
+            @($s.Mail.AllowedRecipientDomains).Count | Should -Be 0
+            $s.Security.RequireProtectedFolder | Should -BeFalse
+            $dir = Join-Path $TestDrive 'mail-old'
+            $cfg = Get-MailWithBlock $dir "Enabled = `$false; SmtpServer = 'smtp.contoso.test'; From = 'elr@contoso.test'; To = @('team@contoso.test', 'boss@elsewhere.test')"
+            $old = Import-ExlConfiguration -Path $cfg -Root $script:Root
+            $old.Mail.CheckRevocation | Should -BeFalse
+            @($old.Mail.AllowedRecipientDomains).Count | Should -Be 0
+            @($old.Warnings).Count | Should -Be 0
+            $cfg = Get-MailWithBlock $dir "CheckRevocation = `$true"
+            (Import-ExlConfiguration -Path $cfg -Root $script:Root).Mail.CheckRevocation | Should -BeTrue
+            $cfg = Get-MailWithBlock $dir "CheckRevocation = 'yes'"
+            { Import-ExlConfiguration -Path $cfg -Root $script:Root } | Should -Throw '*Mail.CheckRevocation must be $true or $false*'
+            $smtp = & (Get-Module ExchangeLogReport) { param($x) New-ExlMailSettings -Settings $x } $old
+            $smtp.CheckRevocation | Should -BeFalse
+        }
+
+        It 'refuses a recipient outside Mail.AllowedRecipientDomains, whatever the case, and accepts the others' {
+            $dir = Join-Path $TestDrive 'mail-allow'
+            $cfg = Get-MailWithBlock $dir "SmtpServer = 'smtp.contoso.test'; From = 'elr@contoso.test'; AllowedRecipientDomains = @('Contoso.Test', '@Fabrikam.Test'); To = @('Team@CONTOSO.test'); Cc = @('boss@fabrikam.TEST'); Bcc = @('hidden@evil.test')"
+            $err = $null; try { Import-ExlConfiguration -Path $cfg -Root $script:Root } catch { $err = $_.Exception.Message }
+            $err | Should -Match "Mail: 'hidden@evil.test' is not in a domain of Mail.AllowedRecipientDomains \(contoso.test, fabrikam.test\)"
+            $err | Should -Not -Match 'Team@CONTOSO'
+            $err | Should -Not -Match "boss@fabrikam"
+            $cfg = Get-MailWithBlock $dir "SmtpServer = 'smtp.contoso.test'; From = 'elr@contoso.test'; AllowedRecipientDomains = @('Contoso.Test'); To = @('Team@CONTOSO.test')"
+            (Import-ExlConfiguration -Path $cfg -Root $script:Root).Mail.AllowedRecipientDomains | Should -Be @('contoso.test')
+        }
+
+        It 'logs every recipient, Bcc included, and the server at each send' {
+            $server = [ElrTest.FakeSmtp]::new()
+            $dir = Join-Path $TestDrive 'mail-log'
+            try {
+                $cfg = Get-MailWithBlock $dir "SmtpServer = '127.0.0.1'; Port = $($server.Port); Encryption = 'None'; Attach = 'None'; From = 'elr@contoso.test'; To = @('Team@Contoso.test'); Cc = @('Boss@Contoso.test'); Bcc = @('Hidden@Contoso.test', 'audit@contoso.test')"
+                $s = Import-ExlConfiguration -Path $cfg -Root $script:Root
+                $log = Start-ExlLog -Directory (Join-Path $dir 'mail-logs')
+                try {
+                    $test = & (Get-Module ExchangeLogReport) { param($x) Send-ExlTestMail -Settings $x } $s
+                    $test.Sent | Should -BeTrue
+                    $report = [ExchangeLogReport.ReportResult]::new(); $report.Folder = $TestDrive; $report.Title = 'T'
+                    $sent = & (Get-Module ExchangeLogReport) { param($x, $r) Send-ExlReportMail -Settings $x -Report $r -Period 'p' -ReportType 'Usage' -Range 'Last7Days' -Title 'T' } $s $report
+                    $sent.Sent | Should -BeTrue
+                } finally { Stop-ExlLog }
+                $lines = @(Get-Content -LiteralPath $log | Where-Object { $_ -match '\bMail: sending ' })
+                $lines.Count | Should -Be 2
+                foreach ($line in $lines) {
+                    $line | Should -Match 'To: Team@Contoso.test; Cc: Boss@Contoso.test; Bcc: Hidden@Contoso.test, audit@contoso.test'
+                    $line | Should -Match 'through 127.0.0.1:'
+                }
+                @($server.Recipients | Sort-Object -Unique) | Should -Be @('Boss@Contoso.test', 'Hidden@Contoso.test', 'Team@Contoso.test', 'audit@contoso.test' | Sort-Object -Unique)
+                $server.Messages[0] | Should -Not -Match 'Hidden@Contoso.test'
+            } finally { $server.Dispose() }
+        }
+
+        It 'sends to a pinned certificate whatever Mail.CheckRevocation says, and refuses another certificate on a later send' {
+            $other = [ElrTest.FakeSmtp]::NewCertificate('localhost')
+            $server = [ElrTest.FakeSmtp]::new(); $server.Certificate = $script:Cert; $server.OfferStartTls = $true
+            try {
+                $settings = New-MailSettings $server.Port 'StartTls' -Thumbprint $script:Cert.Thumbprint
+                $settings.CheckRevocation = $true
+                ([ExchangeLogReport.SmtpSender]::Send($settings, (New-Content))).Sent | Should -BeTrue
+                $server.Certificate = $other
+                $r = [ExchangeLogReport.SmtpSender]::Send($settings, (New-Content))
+                $r.Sent | Should -BeFalse
+                $r.Error | Should -Match 'not the one of Mail.CertificateThumbprint'
+                $server.Messages.Count | Should -Be 1
+            } finally { $server.Dispose() }
+        }
+
+        It 'checks the chain of an unpinned certificate when revocation is checked and refuses an untrusted one' {
+            $server = [ElrTest.FakeSmtp]::new(); $server.Certificate = $script:Cert; $server.OfferStartTls = $true
+            try {
+                $settings = New-MailSettings $server.Port 'StartTls'
+                $settings.CheckRevocation = $true
+                $r = [ExchangeLogReport.SmtpSender]::Send($settings, (New-Content))
+                $r.Sent | Should -BeFalse
+                $r.Error | Should -Match 'certificate of the server is not trusted'
+                $r.Error | Should -Match 'UntrustedRoot'
+                $server.Messages.Count | Should -Be 0
+            } finally { $server.Dispose() }
+        }
+
+        It 'drops what arrives in clear with the reply to STARTTLS' {
+            $server = [ElrTest.RogueSmtp]::new('inject'); $server.Certificate = $script:Cert
+            try {
+                $r = [ExchangeLogReport.SmtpSender]::Send((New-MailSettings $server.Port 'StartTls' -Thumbprint $script:Cert.Thumbprint), (New-Content))
+                @($r.ServerCapabilities) -join ',' | Should -Not -Match 'INJECTEDCAP'
+                $r.Transcript -join "`n" | Should -Not -Match 'INJECTEDCAP'
+                if ($r.Sent) { $server.BodyReceived | Should -BeTrue } else { $r.Error | Should -Match 'TLS failed' }
+            } finally { $server.Dispose() }
+        }
+
+        It 'ends on a malformed SMTP answer without hanging or sending a partial message' -ForEach @(
+            @{ Mode = 'multiline'; Pattern = '.' }
+            @{ Mode = 'longline'; Pattern = 'SMTP response line too long' }
+            @{ Mode = 'close'; Pattern = 'closed the connection' }
+            @{ Mode = 'no354'; Pattern = 'DATA refused by the server' }
+        ) {
+            $server = [ElrTest.RogueSmtp]::new($Mode)
+            try {
+                $settings = New-MailSettings $server.Port 'None'
+                $settings.Server = '127.0.0.1'
+                $settings.TimeoutSeconds = 5
+                $watch = [Diagnostics.Stopwatch]::StartNew()
+                $r = [ExchangeLogReport.SmtpSender]::Send($settings, (New-Content))
+                $watch.Elapsed.TotalSeconds | Should -BeLessThan 10
+                $r.Sent | Should -BeFalse
+                $r.Error | Should -Not -BeNullOrEmpty
+                if ($Mode -ne 'multiline') { $r.Error | Should -Match $Pattern }
+                $server.BodyReceived | Should -BeFalse
+            } finally { $server.Dispose() }
+        }
+
+        It 'reads Mail.MinimumTls as an optional key: None by default, any case, and only with TLS' {
+            (Import-ExlConfiguration -Path (Join-Path $script:Root 'config\ExchangeLogReport.config.psd1') -Root $script:Root).Mail.MinimumTls | Should -BeExactly 'None'
+            $dir = Join-Path $TestDrive 'mail-tls'
+            $cfg = Get-MailWithBlock $dir "Encryption = 'StartTls'; MinimumTls = 'tLS12'"
+            (Import-ExlConfiguration -Path $cfg -Root $script:Root).Mail.MinimumTls | Should -BeExactly 'Tls12'
+            $cfg = Get-MailWithBlock $dir "Encryption = 'Tls'; MinimumTls = 'TLS13'"
+            (Import-ExlConfiguration -Path $cfg -Root $script:Root).Mail.MinimumTls | Should -BeExactly 'Tls13'
+            $cfg = Get-MailWithBlock $dir "Encryption = 'StartTls'; MinimumTls = 'Tls11'"
+            { Import-ExlConfiguration -Path $cfg -Root $script:Root } | Should -Throw '*Mail.MinimumTls must be None, Tls12, Tls13*'
+            $cfg = Get-MailWithBlock $dir "Encryption = 'None'; MinimumTls = 'Tls12'"
+            { Import-ExlConfiguration -Path $cfg -Root $script:Root } | Should -Throw "*Mail.MinimumTls = 'Tls12' needs Mail.Encryption*"
+            $old = Import-ExlConfiguration -Path (Get-MailWithBlock $dir "Encryption = 'None'") -Root $script:Root
+            $old.Mail.MinimumTls | Should -BeExactly 'None'
+            (& (Get-Module ExchangeLogReport) { param($x) New-ExlMailSettings -Settings $x } $old).MinimumTls | Should -BeExactly 'None'
+        }
+
+        It 'tells a TLS version below 1.2 from the others, and a minimum from no minimum' {
+            $type = [ExchangeLogReport.SmtpSender]
+            $below = $type.GetMethod('IsBelowTls12', [Reflection.BindingFlags]'NonPublic,Static')
+            $min = $type.GetMethod('BelowMinimum', [Reflection.BindingFlags]'NonPublic,Static')
+            $p = [Security.Authentication.SslProtocols]
+            foreach ($case in @(@('Tls13', $false), @('Tls12', $false), @('None', $false), @('Tls11', $true), @('Tls', $true))) {
+                $below.Invoke($null, @([Enum]::Parse($p, $case[0]))) | Should -Be $case[1] -Because $case[0]
+            }
+            foreach ($case in @(@('Tls13', 'None', $false), @('Tls11', 'None', $false), @('Tls11', '', $false), @('Tls12', 'Tls12', $false), @('Tls11', 'tls12', $true), @('Tls', 'Tls12', $true),
+                    @('Tls12', 'Tls13', $true), @('Tls13', 'TLS13', $false), @('Tls11', 'Tls13', $true))) {
+                $min.Invoke($null, @([Enum]::Parse($p, $case[0]), $case[1])) | Should -Be $case[2] -Because ($case[0] + ' ' + $case[1])
+            }
+        }
+
+        It 'refuses a session below Mail.MinimumTls before anything is sent, and sends when the minimum is met' {
+            $server = [ElrTest.RogueSmtp]::new('tls'); $server.Certificate = $script:Cert; $server.Protocols = [Security.Authentication.SslProtocols]::Tls12
+            try {
+                $settings = New-MailSettings $server.Port 'StartTls' -Thumbprint $script:Cert.Thumbprint
+                $settings.MinimumTls = 'Tls13'
+                $r = [ExchangeLogReport.SmtpSender]::Send($settings, (New-Content))
+                $r.Sent | Should -BeFalse
+                $r.Error | Should -Match 'negotiated TLS 1\.2, below Mail\.MinimumTls \(Tls13\)'
+                @($server.Commands | Where-Object { $_ -like 'MAIL FROM*' -or $_ -like 'AUTH*' }).Count | Should -Be 0
+                $server.BodyReceived | Should -BeFalse
+                $settings.MinimumTls = 'tls12'
+                $ok = [ExchangeLogReport.SmtpSender]::Send($settings, (New-Content))
+                $ok.Sent | Should -BeTrue
+                @($ok.Warnings).Count | Should -Be 0
+            } finally { $server.Dispose() }
+        }
+
+        It 'warns, and still sends, when the session negotiates TLS older than 1.2' {
+            $server = [ElrTest.RogueSmtp]::new('tls'); $server.Certificate = $script:Cert; $server.Protocols = [Security.Authentication.SslProtocols]'Tls11'
+            try {
+                $r = [ExchangeLogReport.SmtpSender]::Send((New-MailSettings $server.Port 'StartTls' -Thumbprint $script:Cert.Thumbprint), (New-Content))
+                if (-not $r.Sent -and ($r.Error -match 'TLS failed' -or (@($r.Transcript) -contains 'C: STARTTLS' -and -not (@($r.Transcript) -match '^\* TLS ')))) { Set-ItResult -Skipped -Because "this computer does not negotiate TLS 1.1 ($($r.Error))"; return }
+                $r.Sent | Should -BeTrue
+                @($r.Warnings).Count | Should -Be 1
+                $r.Warnings[0] | Should -Match 'negotiated TLS 1\.1, older than TLS 1\.2'
+                $r.Tls | Should -Match '^TLS 1\.1,'
+                $strict = New-MailSettings $server.Port 'StartTls' -Thumbprint $script:Cert.Thumbprint
+                $strict.MinimumTls = 'Tls12'
+                $refused = [ExchangeLogReport.SmtpSender]::Send($strict, (New-Content))
+                $refused.Sent | Should -BeFalse
+                $refused.Error | Should -Match 'below Mail\.MinimumTls'
+            } finally { $server.Dispose() }
+        }
+
+        It 'writes the warnings of a session to the console and the log, and the event of a message sent' {
+            $dir = Join-Path $TestDrive 'mail-outcome'
+            $log = Start-ExlLog -Directory $dir -EventLog
+            $global:ExlTestEvents = [Collections.Generic.List[object]]::new()
+            Mock -ModuleName ExchangeLogReport Write-ExlEventEntry { $global:ExlTestEvents.Add([pscustomobject]@{ Id = $Id; Level = $Level; Message = $Message }) }
+            try {
+                $smtp = [ExchangeLogReport.MailSettings]::new(); $smtp.Server = 'smtp.contoso.test'; $smtp.Port = 587
+                $smtp.To = [string[]]@('Team@contoso.test', 'team@CONTOSO.test'); $smtp.Cc = [string[]]@('boss@contoso.test'); $smtp.Bcc = [string[]]@('audit@contoso.test')
+                $result = [ExchangeLogReport.MailResult]::new(); $result.Sent = $true; $result.Tls = 'TLS 1.1, Aes128'
+                $result.Warnings.Add('The e-mail session negotiated TLS 1.1, older than TLS 1.2: test.')
+                $console = & { & (Get-Module ExchangeLogReport) { param($s, $r) Write-ExlMailOutcome -Smtp $s -Result $r } $smtp $result } 6>&1 | Out-String
+            } finally { Stop-ExlLog }
+            $console | Should -Match 'older than TLS 1\.2: test'
+            (Get-Content -LiteralPath $log -Raw) | Should -Match '\[WARN \] The e-mail session negotiated TLS 1\.1'
+            $global:ExlTestEvents.Count | Should -Be 1
+            $global:ExlTestEvents[0].Id | Should -Be 3001
+            $global:ExlTestEvents[0].Level | Should -Be 'Information'
+            $global:ExlTestEvents[0].Message | Should -Be 'E-mail sent through smtp.contoso.test:587 to 3 recipient(s); TLS: TLS 1.1, Aes128.'
+            $global:ExlTestEvents[0].Message | Should -Not -Match 'contoso.test$|@'
+            Remove-Variable ExlTestEvents -Scope Global
+        }
+
+        It 'keeps CR and LF of the sender name, the subject and the recipients out of the message headers' {
+            $m = New-MailSettings 25 'None'
+            $m.FromName = "Report`r`nBcc: evil@evil.test"
+            $m.To = [string[]]@('team@contoso.test')
+            $id = $null
+            $bytes = [ExchangeLogReport.Mime]::Build($m, (New-Content "Subject`r`nBcc: evil2@evil.test"), [ref]$id)
+            $text = [Text.Encoding]::ASCII.GetString($bytes)
+            $headers = $text.Substring(0, $text.IndexOf("`r`n`r`n"))
+            @($headers -split "`r`n" | Where-Object { $_ -match '^(?i)Bcc:' }).Count | Should -Be 0
+            # The configuration refuses a recipient that holds a line break, a list or an angle bracket form.
+            foreach ($bad in "team@contoso.test`r`nBcc: evil@evil.test", 'a@contoso.test;b@contoso.test', 'Team <team@contoso.test>', 'a@contoso.test, b@contoso.test') {
+                $cfg = Get-MailWithBlock (Join-Path $TestDrive 'mail-bad') "SmtpServer = 'smtp.contoso.test'; From = 'elr@contoso.test'; To = @('$($bad.Replace("'", "''"))')"
+                { Import-ExlConfiguration -Path $cfg -Root $script:Root } | Should -Throw '*is not an e-mail address*'
+            }
+        }
+    }
 }
 
 Describe 'Console characters' {
@@ -6200,5 +6542,1651 @@ Describe 'Exact message counts' {
     It 'rejects events that go back in time' {
         $folder = Join-Path $TestDrive 'counts-order'; [void](New-Item -ItemType Directory -Path $folder)
         { Get-NewCounts $folder @(@('S', 5, 'a'), @('S', 4, 'b')) } | Should -Throw '*time order*'
+    }
+}
+
+Describe 'Package folder permissions' {
+    BeforeAll {
+        $script:Self = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+        function Set-TestAcl([string]$Path, [object[]]$Entries = @()) {
+            $security = [Security.AccessControl.DirectorySecurity]::new()
+            $security.SetAccessRuleProtection($true, $false)
+            foreach ($sid in 'S-1-5-18', 'S-1-5-32-544', $script:Self) {
+                $security.AddAccessRule([Security.AccessControl.FileSystemAccessRule]::new([Security.Principal.SecurityIdentifier]::new($sid), 'FullControl', 'ContainerInherit, ObjectInherit', 'None', 'Allow'))
+            }
+            foreach ($e in $Entries) {
+                $security.AddAccessRule([Security.AccessControl.FileSystemAccessRule]::new([Security.Principal.SecurityIdentifier]::new($e.Sid), $e.Rights, $e.Inherit, $e.Propagation, 'Allow'))
+            }
+            [IO.FileSystemAclExtensions]::SetAccessControl([IO.DirectoryInfo]::new($Path), $security)
+        }
+        function New-TestPackage([string]$Name, [object[]]$RootEntries = @(), [object[]]$ParentEntries = @()) {
+            $top = Join-Path $TestDrive $Name; $parent = Join-Path $top 'parent'; $package = Join-Path $parent 'package'
+            foreach ($d in $package, (Join-Path $package 'src'), (Join-Path $package 'config'), (Join-Path $package 'data')) { [void][IO.Directory]::CreateDirectory($d) }
+            Set-TestAcl $top; Set-TestAcl $parent $ParentEntries; Set-TestAcl $package $RootEntries
+            return [pscustomobject]@{ Top = $top; Parent = $parent; Package = $package }
+        }
+        function Get-Findings($Tree, $Elevated = $true) { @(& (Get-Module ExchangeLogReport) { param($r, $e, $s) Get-ExlPackageFolderFindings -Root $r -Elevated $e -StopAt $s } $Tree.Package $Elevated $Tree.Top) }
+        $script:UsersModify = @{ Sid = 'S-1-5-32-545'; Rights = 'Modify'; Inherit = 'ContainerInherit, ObjectInherit'; Propagation = 'None' }
+    }
+
+    It 'finds nothing when only the administrators, SYSTEM and this account can change the package' {
+        $tree = New-TestPackage 'acl-clean'
+        @(Get-Findings $tree).Count | Should -Be 0
+        @(& (Get-Module ExchangeLogReport) { param($r, $s) Test-ExlPackageFolderSecurity -Root $r -Elevated $true -StopAt $s } $tree.Package $tree.Top).Count | Should -Be 0
+    }
+
+    It 'names the identity by its SID and the folder when Users can write to the package folder, whatever the language of Windows' {
+        $tree = New-TestPackage 'acl-users' @($script:UsersModify)
+        $found = Get-Findings $tree
+        $roots = @($found | Where-Object { $_.Path -eq $tree.Package })
+        $roots.Count | Should -Be 1
+        $roots[0].Sid | Should -BeExactly 'S-1-5-32-545'
+        $roots[0].Parent | Should -BeFalse
+        $roots[0].Rights | Should -Match 'Delete|WriteData|AppendData'
+        @($found | Where-Object { $_.Path -eq (Join-Path $tree.Package 'src') }).Count | Should -Be 1
+        # data holds what the tool writes: it is not a code folder.
+        @($found | Where-Object { $_.Path -eq (Join-Path $tree.Package 'data') }).Count | Should -Be 0
+        $text = @(& (Get-Module ExchangeLogReport) { param($r, $s) Test-ExlPackageFolderSecurity -Root $r -Elevated $true -StopAt $s } $tree.Package $tree.Top)
+        $text.Count | Should -Be 1
+        $text[0] | Should -Match 'S-1-5-32-545'
+        $text[0] | Should -Match ([regex]::Escape($tree.Package))
+        $text[0] | Should -Match 'and 2 more folder'
+    }
+
+    It 'finds an account that can delete or replace a parent folder, and ignores an entry that only the children inherit' {
+        $tree = New-TestPackage 'acl-parent' @() @(@{ Sid = 'S-1-5-11'; Rights = 'DeleteSubdirectoriesAndFiles'; Inherit = 'None'; Propagation = 'None' })
+        $found = Get-Findings $tree
+        $found.Count | Should -Be 1
+        $found[0].Sid | Should -BeExactly 'S-1-5-11'
+        $found[0].Parent | Should -BeTrue
+        $found[0].Path | Should -Be $tree.Parent
+        # A parent where an account can only create subfolders does not let it replace the package.
+        $create = New-TestPackage 'acl-parent-create' @() @(@{ Sid = 'S-1-5-11'; Rights = 'CreateDirectories'; Inherit = 'None'; Propagation = 'None' })
+        @(Get-Findings $create).Count | Should -Be 0
+        $leaf = Join-Path $TestDrive 'acl-inherit-only'
+        [void][IO.Directory]::CreateDirectory($leaf)
+        Set-TestAcl $leaf @(@{ Sid = 'S-1-5-32-545'; Rights = 'Modify'; Inherit = 'ContainerInherit, ObjectInherit'; Propagation = 'InheritOnly' })
+        @(& (Get-Module ExchangeLogReport) { param($p) Get-ExlFolderWriters -Path $p -TrustedSid 'S-1-5-18', 'S-1-5-32-544' } $leaf | Where-Object Sid -eq 'S-1-5-32-545').Count | Should -Be 0
+    }
+
+    It 'does not count TrustedInstaller, the domain administrators or CREATOR OWNER as writers' {
+        $tree = New-TestPackage 'acl-trusted' @(
+            @{ Sid = 'S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464'; Rights = 'FullControl'; Inherit = 'ContainerInherit, ObjectInherit'; Propagation = 'None' }
+            @{ Sid = 'S-1-5-21-1111-2222-3333-512'; Rights = 'FullControl'; Inherit = 'ContainerInherit, ObjectInherit'; Propagation = 'None' }
+            @{ Sid = 'S-1-5-21-1111-2222-3333-519'; Rights = 'Modify'; Inherit = 'ContainerInherit, ObjectInherit'; Propagation = 'None' }
+            @{ Sid = 'S-1-3-0'; Rights = 'FullControl'; Inherit = 'ContainerInherit, ObjectInherit'; Propagation = 'None' })
+        @(Get-Findings $tree).Count | Should -Be 0
+    }
+
+    It 'does not check a run that is not elevated' {
+        $tree = New-TestPackage 'acl-not-elevated' @($script:UsersModify)
+        @(Get-Findings $tree $false).Count | Should -Be 0
+        @(Get-Findings $tree $true).Count | Should -BeGreaterThan 0
+    }
+
+    It 'leaves no warning once the icacls commands of the guide (5.2) are applied to a folder that carries Authenticated Users and Users itself, and to its parent' {
+        $guide = [IO.File]::ReadAllText((Join-Path $script:Root 'docs\ExchangeLogReport-Guide.md'))
+        $section = [regex]::Match($guide, '(?s)### 5\.2 Lock down the installation folder.*?### 5\.3').Value
+        $blocks = @([regex]::Matches($section, '(?s)```powershell\r?\n(.*?)```') | ForEach-Object { $_.Groups[1].Value })
+        $blocks.Count | Should -Be 2
+        $top = Join-Path $TestDrive 'icacls-guide'; $parent = Join-Path $top 'Tools'; $tool = Join-Path $parent 'ExchangeLogReport'
+        foreach ($d in $tool, (Join-Path $tool 'src'), (Join-Path $tool 'config'), (Join-Path $tool 'data'), (Join-Path $tool 'reports'), (Join-Path $tool 'logs')) { [void][IO.Directory]::CreateDirectory($d) }
+        Set-TestAcl $top
+        # A folder created outside %ProgramFiles%, or copied with its permissions: the entries are its own, not inherited.
+        foreach ($d in $parent, $tool) { & icacls.exe $d /grant '*S-1-5-11:(OI)(CI)M' '*S-1-5-32-545:(OI)(CI)RX' | Out-Null }
+        $after = { @(& (Get-Module ExchangeLogReport) { param($r, $s) Get-ExlPackageFolderFindings -Root $r -Elevated $true -StopAt $s } $tool $parent) }
+        (& $after | ForEach-Object Sid | Sort-Object -Unique) | Should -Contain 'S-1-5-11'
+        try {
+            foreach ($block in $blocks) {
+                $code = $block.Replace('C:\Program Files\ExchangeLogReport', $tool).Replace('C:\Tools', $parent).Replace('CONTOSO\ELR-Collectors', "*$script:Self")
+                & ([scriptblock]::Create($code)) | Out-Null
+            }
+            @(& $after).Count | Should -Be 0
+            @(& (Get-Module ExchangeLogReport) { param($r, $s) Test-ExlPackageFolderSecurity -Root $r -Elevated $true -StopAt $s } $tool $parent).Count | Should -Be 0
+        } finally {
+            foreach ($d in $parent, $tool) { & icacls.exe $d /grant "*${script:Self}:(OI)(CI)F" /T | Out-Null }
+        }
+    }
+
+    It 'compares security identifiers and never account names' {
+        $code = & (Get-Module ExchangeLogReport) { (@('Get-ExlFolderWriters', 'Get-ExlPackageFolderFindings', 'Test-ExlElevated', 'Test-ExlCredentialFileAccess', 'New-ExlCredentialSecurity') | ForEach-Object { (Get-Command $_).ScriptBlock.ToString() }) -join "`n" }
+        $code | Should -Not -Match '(?i)BUILTIN\\|NT AUTHORITY|NT SERVICE|Authenticated Users|\bEveryone\b|\bAdministrateurs\b'
+        $code | Should -Match 'S-1-5-32-544'
+    }
+
+    It 'reads Security.RequireProtectedFolder as an optional setting, off by default' {
+        $dir = Join-Path $TestDrive 'security-config'
+        $cfg = New-TestConfig $dir
+        $text = [IO.File]::ReadAllText($cfg)
+        (Import-ExlConfiguration -Path $cfg -Root $script:Root).Security.RequireProtectedFolder | Should -BeFalse
+        $without = [regex]::Replace($text, '(?ms)^    Security = @\{.*?^    \}\r?\n', '')
+        $without | Should -Not -Match 'Security = '
+        [IO.File]::WriteAllText($cfg, $without)
+        (Import-ExlConfiguration -Path $cfg -Root $script:Root).Security.RequireProtectedFolder | Should -BeFalse
+        [IO.File]::WriteAllText($cfg, $without.TrimEnd().TrimEnd('}') + "    Security = @{ RequireProtectedFolder = `$true }`r`n}`r`n")
+        (Import-ExlConfiguration -Path $cfg -Root $script:Root).Security.RequireProtectedFolder | Should -BeTrue
+        [IO.File]::WriteAllText($cfg, $without.TrimEnd().TrimEnd('}') + "    Security = @{ RequireProtectedFolder = 'yes'; Other = 1 }`r`n}`r`n")
+        $err = $null; try { Import-ExlConfiguration -Path $cfg -Root $script:Root } catch { $err = $_.Exception.Message }
+        $err | Should -Match 'Security.RequireProtectedFolder must be \$true or \$false'
+        $err | Should -Match 'Security.Other is not a known setting'
+    }
+}
+
+Describe 'Mail credential file' {
+    BeforeAll {
+        $script:Self = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+        $script:Cred = [pscredential]::new('CONTOSO\svc-smtp', (ConvertTo-SecureString 'Sup3r-secret' -AsPlainText -Force))
+        function New-CredentialSettings([string]$Name) {
+            $dir = Join-Path $TestDrive $Name
+            $s = Import-ExlConfiguration -Path (New-TestConfig $dir) -Root $script:Root
+            $s.Mail.CredentialFile = Join-Path $dir 'config\mail.credential'
+            return $s
+        }
+        function Get-Sids([string]$Path) {
+            $security = [IO.FileSystemAclExtensions]::GetAccessControl([IO.FileInfo]::new($Path))
+            return $security
+        }
+    }
+
+    It 'creates the file with exactly SYSTEM, the administrators and its writer, inheritance cut' {
+        $s = New-CredentialSettings 'cred-new'
+        Save-ExlMailCredential -Settings $s -Credential $script:Cred
+        $security = Get-Sids $s.Mail.CredentialFile
+        $security.AreAccessRulesProtected | Should -BeTrue
+        $rules = @($security.GetAccessRules($true, $true, [Security.Principal.SecurityIdentifier]))
+        @($rules.IdentityReference.Value | Sort-Object -Unique) | Should -Be @('S-1-5-18', 'S-1-5-32-544', $script:Self | Sort-Object -Unique)
+        foreach ($rule in $rules) { [string]$rule.AccessControlType | Should -Be 'Allow'; [string]$rule.FileSystemRights | Should -Be 'FullControl'; $rule.IsInherited | Should -BeFalse }
+        @(& (Get-Module ExchangeLogReport) { param($p) Test-ExlCredentialFileAccess -Path $p } $s.Mail.CredentialFile).Count | Should -Be 0
+    }
+
+    It 'keeps the format of the file and the DPAPI protection of the password' {
+        $s = New-CredentialSettings 'cred-format'
+        Save-ExlMailCredential -Settings $s -Credential $script:Cred
+        $data = Get-Content -LiteralPath $s.Mail.CredentialFile -Raw -Encoding utf8 | ConvertFrom-Json
+        @($data.PSObject.Properties.Name) | Should -Be @('Tool', 'UserName', 'Scope', 'Password', 'WrittenBy', 'Computer', 'Written')
+        $data.Scope | Should -Be 'User'
+        $entropy = [Text.Encoding]::UTF8.GetBytes('Exchange Log Report - mail credential')
+        $plain = [Security.Cryptography.ProtectedData]::Unprotect([Convert]::FromBase64String($data.Password), $entropy, [Security.Cryptography.DataProtectionScope]::CurrentUser)
+        [Text.Encoding]::UTF8.GetString($plain) | Should -BeExactly 'Sup3r-secret'
+    }
+
+    It 'replaces an existing file by one with the restricted access, without leaving a work file' {
+        $s = New-CredentialSettings 'cred-replace'
+        $dir = Split-Path $s.Mail.CredentialFile -Parent
+        [void][IO.Directory]::CreateDirectory($dir)
+        [IO.File]::WriteAllText($s.Mail.CredentialFile, '{"old":true}')
+        $loose = [IO.FileSystemAclExtensions]::GetAccessControl([IO.FileInfo]::new($s.Mail.CredentialFile))
+        $loose.AddAccessRule([Security.AccessControl.FileSystemAccessRule]::new([Security.Principal.SecurityIdentifier]::new('S-1-5-32-545'), 'Read', 'Allow'))
+        [IO.FileSystemAclExtensions]::SetAccessControl([IO.FileInfo]::new($s.Mail.CredentialFile), $loose)
+        Save-ExlMailCredential -Settings $s -Credential $script:Cred
+        (Get-Content -LiteralPath $s.Mail.CredentialFile -Raw) | Should -Match 'svc-smtp'
+        @(Get-Sids $s.Mail.CredentialFile | ForEach-Object { $_.GetAccessRules($true, $true, [Security.Principal.SecurityIdentifier]) } | ForEach-Object { $_.IdentityReference.Value }) | Should -Not -Contain 'S-1-5-32-545'
+        @(Get-ChildItem -LiteralPath $dir -Force -Filter '.*.tmp').Count | Should -Be 0
+    }
+
+    It 'removes the work file that an interrupted save left, and keeps a recent one' {
+        $s = New-CredentialSettings 'cred-stale'
+        $dir = Split-Path $s.Mail.CredentialFile -Parent
+        [void][IO.Directory]::CreateDirectory($dir)
+        [IO.File]::WriteAllText($s.Mail.CredentialFile, '{"old":true}')
+        $stale = Join-Path $dir ('.mail.credential.' + ('a' * 32) + '.tmp'); $recent = Join-Path $dir ('.mail.credential.' + ('b' * 32) + '.tmp'); $other = Join-Path $dir ('.other.credential.' + ('c' * 32) + '.tmp')
+        foreach ($f in $stale, $recent, $other) { [IO.File]::WriteAllText($f, 'work') }
+        foreach ($f in $stale, $other) { (Get-Item -LiteralPath $f).LastWriteTimeUtc = [DateTime]::UtcNow.AddHours(-1) }
+        Save-ExlMailCredential -Settings $s -Credential $script:Cred
+        Test-Path -LiteralPath $stale | Should -BeFalse
+        Test-Path -LiteralPath $recent | Should -BeTrue
+        Test-Path -LiteralPath $other | Should -BeTrue
+        $name = [regex]::Matches((Get-ChildItem -LiteralPath $dir -Force | ForEach-Object Name | Out-String), '\.mail\.credential\.[0-9a-f]{32}\.tmp').Count
+        $name | Should -Be 1
+    }
+
+    It 'fails the save and leaves no file when the access cannot be applied' {
+        $s = New-CredentialSettings 'cred-fail'
+        $dir = Split-Path $s.Mail.CredentialFile -Parent
+        [void][IO.Directory]::CreateDirectory($dir)
+        $bad = [Security.AccessControl.FileSecurity]::new()
+        $bad.SetOwner([Security.Principal.SecurityIdentifier]::new('S-1-5-21-111-222-333-444'))
+        $bad.SetAccessRuleProtection($true, $false)
+        $bad.AddAccessRule([Security.AccessControl.FileSystemAccessRule]::new([Security.Principal.SecurityIdentifier]::new($script:Self), 'FullControl', 'Allow'))
+        $probe = Join-Path $dir 'probe.tmp'
+        $accepted = $false
+        try { [IO.FileSystemAclExtensions]::Create([IO.FileInfo]::new($probe), 'CreateNew', 'FullControl', 'None', 4096, 'None', $bad).Dispose(); $accepted = $true } catch { }
+        Remove-Item -LiteralPath $probe -Force -ErrorAction SilentlyContinue
+        if ($accepted) { Set-ItResult -Skipped -Because 'this account may give a file any owner, so the descriptor cannot be made to fail'; return }
+        Mock -ModuleName ExchangeLogReport New-ExlCredentialSecurity {
+            $a = [Security.AccessControl.FileSecurity]::new()
+            $a.SetOwner([Security.Principal.SecurityIdentifier]::new('S-1-5-21-111-222-333-444'))
+            $a.SetAccessRuleProtection($true, $false)
+            $a.AddAccessRule([Security.AccessControl.FileSystemAccessRule]::new([Security.Principal.WindowsIdentity]::GetCurrent().User, 'FullControl', 'Allow'))
+            return $a
+        }
+        { Save-ExlMailCredential -Settings $s -Credential $script:Cred } | Should -Throw '*password was not saved*'
+        Test-Path -LiteralPath $s.Mail.CredentialFile | Should -BeFalse
+        @(Get-ChildItem -LiteralPath $dir -Force).Count | Should -Be 0
+        # A file that is already there is neither replaced nor damaged.
+        [IO.File]::WriteAllText($s.Mail.CredentialFile, '{"old":true}')
+        { Save-ExlMailCredential -Settings $s -Credential $script:Cred } | Should -Throw '*password was not saved*'
+        (Get-Content -LiteralPath $s.Mail.CredentialFile -Raw) | Should -Be '{"old":true}'
+        @(Get-ChildItem -LiteralPath $dir -Force).Count | Should -Be 1
+    }
+
+    It 'keeps working with an existing file that others can read, and says so' {
+        $s = New-CredentialSettings 'cred-loose'
+        Save-ExlMailCredential -Settings $s -Credential $script:Cred
+        $loose = [IO.FileSystemAclExtensions]::GetAccessControl([IO.FileInfo]::new($s.Mail.CredentialFile))
+        $loose.SetAccessRuleProtection($false, $false)
+        $loose.AddAccessRule([Security.AccessControl.FileSystemAccessRule]::new([Security.Principal.SecurityIdentifier]::new('S-1-5-32-545'), 'Read', 'Allow'))
+        [IO.FileSystemAclExtensions]::SetAccessControl([IO.FileInfo]::new($s.Mail.CredentialFile), $loose)
+        $problems = @(& (Get-Module ExchangeLogReport) { param($p) Test-ExlCredentialFileAccess -Path $p } $s.Mail.CredentialFile)
+        ($problems -join ' ') | Should -Match 'S-1-5-32-545'
+        ($problems -join ' ') | Should -Match 'inherits'
+        $shown = & { $back = & (Get-Module ExchangeLogReport) { param($x) Read-ExlMailCredential -Settings $x } $s; $back.Password } 6>&1
+        $shown | Where-Object { $_ -is [string] -and $_ -eq 'Sup3r-secret' } | Should -Not -BeNullOrEmpty
+        ($shown | Where-Object { $_ -isnot [string] } | Out-String) | Should -Match 'Mail credential file'
+    }
+
+    It 'warns once per run for a file with several problems, names the file and the command that writes it again, and keeps reading it' {
+        $s = New-CredentialSettings 'cred-once'
+        Save-ExlMailCredential -Settings $s -Credential $script:Cred
+        $loose = [IO.FileSystemAclExtensions]::GetAccessControl([IO.FileInfo]::new($s.Mail.CredentialFile))
+        $loose.SetAccessRuleProtection($false, $false)
+        foreach ($sid in 'S-1-5-32-545', 'S-1-15-2-1', 'S-1-15-2-2') {
+            $loose.AddAccessRule([Security.AccessControl.FileSystemAccessRule]::new([Security.Principal.SecurityIdentifier]::new($sid), 'Read', 'Allow'))
+        }
+        [IO.FileSystemAclExtensions]::SetAccessControl([IO.FileInfo]::new($s.Mail.CredentialFile), $loose)
+        $read = { $out = & { $back = & (Get-Module ExchangeLogReport) { param($x) Read-ExlMailCredential -Settings $x } $s; $back.Password } 6>&1; $out }
+        $first = & $read
+        $first | Where-Object { $_ -is [string] -and $_ -eq 'Sup3r-secret' } | Should -Not -BeNullOrEmpty
+        $warnings = @($first | Where-Object { $_ -isnot [string] } | ForEach-Object { [string]$_ } | Where-Object { $_ -match 'Mail credential file' })
+        $warnings.Count | Should -Be 1
+        $warnings[0] | Should -Match ([regex]::Escape($s.Mail.CredentialFile))
+        $warnings[0] | Should -Match 'S-1-5-32-545'
+        $warnings[0] | Should -Match 'S-1-15-2-1'
+        $warnings[0] | Should -Match ([regex]::Escape('.\Run-Collector.cmd -Mode MailTest -Credential (Get-Credential)'))
+        @(& $read | Where-Object { $_ -isnot [string] }).Count | Should -Be 0
+    }
+
+    It 'records how the generated folders inherit their access today' {
+        $dir = Join-Path $TestDrive 'generated-acl'
+        $s = Import-ExlConfiguration -Path (New-TestConfig $dir) -Root $script:Root
+        [void](Start-ExlLog -Directory $s.Logging.Path); Stop-ExlLog
+        [void][IO.Directory]::CreateDirectory($s.Report.OutputPath)
+        [void][IO.Directory]::CreateDirectory((Split-Path $s.Storage.DatabasePath -Parent))
+        foreach ($folder in $s.Logging.Path, $s.Report.OutputPath, (Split-Path $s.Storage.DatabasePath -Parent)) {
+            $security = [IO.FileSystemAclExtensions]::GetAccessControl([IO.DirectoryInfo]::new($folder))
+            $security.AreAccessRulesProtected | Should -BeFalse
+        }
+    }
+}
+
+Describe 'Discovery helper execution policy' {
+    BeforeAll {
+        $script:Module = Get-Module ExchangeLogReport
+        $script:Pinned = & $script:Module { $script:OwnerThumbprint }
+        $script:Other = '1' * 40
+        function New-Verdict([string]$Status, [string]$Signer, [bool]$Stamped = $true, [string[]]$Chain = @()) {
+            $signature = [pscustomobject]@{ Status = $Status; SignerCertificate = $(if ($Signer) { [pscustomobject]@{ Thumbprint = $Signer } }); TimeStamperCertificate = $(if ($Stamped) { 'stamp' }) }
+            & $script:Module { param($s, $p, $c) Get-OwnerSignatureVerdict -Signature $s -Pinned $p -ChainFlags $c } $signature $script:Pinned $Chain
+        }
+        function Resolve-Policy($Verdict, [string]$Manifest, [string]$Prediction) {
+            & $script:Module { param($v, $m, $p) Resolve-ExlHelperExecutionPolicy -Verdict $v -ManifestState $m -Prediction $p } $Verdict $Manifest $Prediction
+        }
+        function Get-Signer([string]$Name) { switch ($Name) { 'Pinned' { $script:Pinned } 'Other' { $script:Other } default { '' } } }
+    }
+
+    It 'decides for <Name>' -ForEach @(
+        @{ Name = 'a valid signature and a policy that lets it run'; Status = 'Valid'; Signer = 'Pinned'; Chain = @(); Manifest = 'Accepted'; Prediction = 'Allowed'; Bypass = $false; Refuse = $false; Reason = 'PolicyAllows' }
+        @{ Name = 'a valid signature and a policy that blocks it'; Status = 'Valid'; Signer = 'Pinned'; Chain = @(); Manifest = 'Accepted'; Prediction = 'Blocked'; Bypass = $true; Refuse = $false; Reason = 'PolicyBlocks' }
+        @{ Name = 'a valid signature and a policy that cannot be read'; Status = 'Valid'; Signer = 'Pinned'; Chain = @(); Manifest = 'Accepted'; Prediction = 'Unknown'; Bypass = $true; Refuse = $false; Reason = 'PolicyUnknown' }
+        @{ Name = 'a blocked policy and a tree without verified manifest'; Status = 'Valid'; Signer = 'Pinned'; Chain = @(); Manifest = 'None'; Prediction = 'Blocked'; Bypass = $false; Refuse = $false; Reason = 'NotEligible' }
+        @{ Name = 'a file that is not the manifest file'; Status = 'Valid'; Signer = 'Pinned'; Chain = @(); Manifest = 'Mismatch'; Prediction = 'Allowed'; Bypass = $false; Refuse = $true; Reason = 'ManifestMismatch' }
+        @{ Name = 'another signer on a manifest file'; Status = 'Valid'; Signer = 'Other'; Chain = @(); Manifest = 'Accepted'; Prediction = 'Allowed'; Bypass = $false; Refuse = $true; Reason = 'UnknownSigner' }
+        @{ Name = 'another signer without manifest under a blocking policy'; Status = 'Valid'; Signer = 'Other'; Chain = @(); Manifest = 'None'; Prediction = 'Blocked'; Bypass = $false; Refuse = $false; Reason = 'NotEligible' }
+        @{ Name = 'a missing root under a blocking policy'; Status = 'UnknownError'; Signer = 'Pinned'; Chain = @('UntrustedRoot'); Manifest = 'Accepted'; Prediction = 'Blocked'; Bypass = $true; Refuse = $false; Reason = 'PolicyBlocks' }
+        @{ Name = 'a missing intermediate and no revocation source under a blocking policy'; Status = 'UnknownError'; Signer = 'Pinned'; Chain = @('PartialChain', 'RevocationStatusUnknown', 'OfflineRevocation'); Manifest = 'Accepted'; Prediction = 'Blocked'; Bypass = $true; Refuse = $false; Reason = 'PolicyBlocks' }
+        @{ Name = 'NotTrusted (distrusted by an administrator) under a blocking policy'; Status = 'NotTrusted'; Signer = 'Pinned'; Chain = @('UntrustedRoot'); Manifest = 'Accepted'; Prediction = 'Blocked'; Bypass = $false; Refuse = $false; Reason = 'NotEligible' }
+        @{ Name = 'a chain that fails only for a missing revocation source under a blocking policy'; Status = 'UnknownError'; Signer = 'Pinned'; Chain = @('RevocationStatusUnknown', 'OfflineRevocation'); Manifest = 'Accepted'; Prediction = 'Blocked'; Bypass = $false; Refuse = $false; Reason = 'NotEligible' }
+        @{ Name = 'a missing root under a policy that lets it run'; Status = 'UnknownError'; Signer = 'Pinned'; Chain = @('UntrustedRoot'); Manifest = 'Accepted'; Prediction = 'Allowed'; Bypass = $false; Refuse = $false; Reason = 'PolicyAllows' }
+        @{ Name = 'a revoked chain under a blocking policy'; Status = 'UnknownError'; Signer = 'Pinned'; Chain = @('UntrustedRoot', 'Revoked'); Manifest = 'Accepted'; Prediction = 'Blocked'; Bypass = $false; Refuse = $false; Reason = 'NotEligible' }
+        @{ Name = 'a chain failure without chain status under a blocking policy'; Status = 'UnknownError'; Signer = 'Pinned'; Chain = @(); Manifest = 'Accepted'; Prediction = 'Blocked'; Bypass = $false; Refuse = $false; Reason = 'NotEligible' }
+        @{ Name = 'a signature that does not match the file'; Status = 'HashMismatch'; Signer = 'Pinned'; Chain = @(); Manifest = 'Accepted'; Prediction = 'Blocked'; Bypass = $false; Refuse = $true; Reason = 'HashMismatch' }
+        @{ Name = 'a hash mismatch without manifest'; Status = 'HashMismatch'; Signer = 'Pinned'; Chain = @(); Manifest = 'None'; Prediction = 'Allowed'; Bypass = $false; Refuse = $true; Reason = 'HashMismatch' }
+        @{ Name = 'no signature on a file the manifest lists'; Status = 'NotSigned'; Signer = ''; Chain = @(); Manifest = 'Accepted'; Prediction = 'Blocked'; Bypass = $false; Refuse = $true; Reason = 'NotSigned' }
+        @{ Name = 'no signature in a tree without manifest, blocking policy'; Status = 'NotSigned'; Signer = ''; Chain = @(); Manifest = 'None'; Prediction = 'Blocked'; Bypass = $false; Refuse = $false; Reason = 'NotEligible' }
+        @{ Name = 'no signature in a tree without manifest, policy that lets it run'; Status = 'NotSigned'; Signer = ''; Chain = @(); Manifest = 'None'; Prediction = 'Allowed'; Bypass = $false; Refuse = $false; Reason = 'PolicyAllows' }
+        @{ Name = 'an incompatible signature'; Status = 'Incompatible'; Signer = ''; Chain = @(); Manifest = 'None'; Prediction = 'Blocked'; Bypass = $false; Refuse = $false; Reason = 'NotEligible' }
+        @{ Name = 'a status that does not exist yet'; Status = 'SomethingNew'; Signer = 'Pinned'; Chain = @('UntrustedRoot'); Manifest = 'Accepted'; Prediction = 'Blocked'; Bypass = $false; Refuse = $false; Reason = 'NotEligible' }
+    ) {
+        $r = Resolve-Policy (New-Verdict $Status (Get-Signer $Signer) $true $Chain) $Manifest $Prediction
+        $r.Bypass | Should -Be $Bypass
+        $r.Refuse | Should -Be $Refuse
+        $r.Reason | Should -BeExactly $Reason
+        if ($Reason -eq 'PolicyAllows') { $r.Warning | Should -BeNullOrEmpty } else { $r.Warning | Should -Not -BeNullOrEmpty }
+        if ($Bypass) { $r.Warning | Should -Match '-ExecutionPolicy Bypass'; $r.Warning | Should -Match 'Unblock-File'; $r.Warning | Should -Match 'trusted publisher' }
+    }
+
+    It 'allows Bypass for a file of the manifest with the owner signature only, whatever the other inputs' {
+        $bypass = foreach ($status in 'Valid', 'UnknownError', 'NotTrusted', 'HashMismatch', 'NotSigned', 'Incompatible') {
+            foreach ($signer in 'Pinned', 'Other') {
+                foreach ($stamped in $true, $false) {
+                    foreach ($chain in @(), @('UntrustedRoot'), @('UntrustedRoot', 'Revoked'), @('PartialChain')) {
+                        foreach ($manifest in 'Accepted', 'Mismatch', 'None') {
+                            foreach ($prediction in 'Allowed', 'Blocked', 'Unknown') {
+                                $r = Resolve-Policy (New-Verdict $status (Get-Signer $signer) $stamped $chain) $manifest $prediction
+                                if ($r.Bypass) { [pscustomobject]@{ Status = $status; Signer = $signer; Stamped = $stamped; Chain = $chain -join ','; Manifest = $manifest; Prediction = $prediction } }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        @($bypass).Count | Should -BeGreaterThan 0
+        @($bypass | Where-Object { $_.Status -notin 'Valid', 'UnknownError' -or $_.Signer -ne 'Pinned' -or -not $_.Stamped -or $_.Manifest -ne 'Accepted' -or $_.Prediction -eq 'Allowed' -or ($_.Status -ne 'Valid' -and ($_.Chain -match 'Revoked' -or -not $_.Chain)) }).Count | Should -Be 0
+    }
+
+    It 'predicts whether Windows PowerShell runs the helper: <Policy>, zone <Zone>, signature valid <Valid>, publisher trusted <Trusted>' -ForEach @(
+        @{ Policy = 'Bypass'; Zone = 3; Valid = $false; Trusted = $false; Expected = 'Allowed' }
+        @{ Policy = 'Restricted'; Zone = 0; Valid = $true; Trusted = $true; Expected = 'Blocked' }
+        @{ Policy = 'Unrestricted'; Zone = 0; Valid = $false; Trusted = $false; Expected = 'Allowed' }
+        @{ Policy = 'Unrestricted'; Zone = 3; Valid = $true; Trusted = $true; Expected = 'Blocked' }
+        @{ Policy = 'RemoteSigned'; Zone = 0; Valid = $false; Trusted = $false; Expected = 'Allowed' }
+        @{ Policy = 'RemoteSigned'; Zone = 1; Valid = $false; Trusted = $false; Expected = 'Allowed' }
+        @{ Policy = 'RemoteSigned'; Zone = 3; Valid = $false; Trusted = $false; Expected = 'Blocked' }
+        @{ Policy = 'RemoteSigned'; Zone = 3; Valid = $true; Trusted = $false; Expected = 'Blocked' }
+        @{ Policy = 'RemoteSigned'; Zone = 3; Valid = $true; Trusted = $true; Expected = 'Allowed' }
+        @{ Policy = 'RemoteSigned'; Zone = 4; Valid = $false; Trusted = $true; Expected = 'Blocked' }
+        @{ Policy = 'AllSigned'; Zone = 0; Valid = $true; Trusted = $true; Expected = 'Allowed' }
+        @{ Policy = 'AllSigned'; Zone = 0; Valid = $true; Trusted = $false; Expected = 'Blocked' }
+        @{ Policy = 'AllSigned'; Zone = 0; Valid = $false; Trusted = $true; Expected = 'Blocked' }
+        @{ Policy = 'Undefined'; Zone = 0; Valid = $true; Trusted = $true; Expected = 'Unknown' }
+        @{ Policy = 'Unknown'; Zone = 3; Valid = $true; Trusted = $true; Expected = 'Unknown' }
+    ) {
+        & $script:Module { param($p, $z, $v, $t) Resolve-ExlHelperPolicyPrediction -Policy $p -ZoneId $z -SignatureValid $v -PublisherTrusted $t } $Policy $Zone $Valid $Trusted | Should -BeExactly $Expected
+    }
+
+    It 'reads the zone mark of a file, the policy of Windows PowerShell and the trusted publishers by thumbprint' {
+        $file = Join-Path $TestDrive 'zone.ps1'
+        [IO.File]::WriteAllText($file, "'x'")
+        & $script:Module { param($f) Get-ExlZoneId -Path $f } $file | Should -Be 0
+        Set-Content -LiteralPath $file -Stream Zone.Identifier -Value "[ZoneTransfer]`r`nZoneId=3`r`nReferrerUrl=https://example.test/"
+        & $script:Module { param($f) Get-ExlZoneId -Path $f } $file | Should -Be 3
+        Set-Content -LiteralPath $file -Stream Zone.Identifier -Value "[ZoneTransfer]`r`nZoneId=1"
+        & $script:Module { param($f) Get-ExlZoneId -Path $f } $file | Should -Be 1
+        & $script:Module { Get-ExlWindowsPowerShellPolicy } | Should -BeIn 'Restricted', 'AllSigned', 'RemoteSigned', 'Unrestricted', 'Bypass', 'Unknown'
+        & $script:Module { Test-ExlTrustedPublisher -Thumbprint ('A' * 40) } | Should -BeFalse
+        & $script:Module { Test-ExlTrustedPublisher -Thumbprint 'x\..\y' } | Should -BeFalse
+        $key = [Security.Cryptography.RSA]::Create(2048)
+        $request = [Security.Cryptography.X509Certificates.CertificateRequest]::new('CN=Exchange Log Report publisher test', $key, [Security.Cryptography.HashAlgorithmName]::SHA256, [Security.Cryptography.RSASignaturePadding]::Pkcs1)
+        $cert = $request.CreateSelfSigned([DateTimeOffset]::UtcNow.AddDays(-1), [DateTimeOffset]::UtcNow.AddDays(1))
+        $store = [Security.Cryptography.X509Certificates.X509Store]::new('TrustedPublisher', 'CurrentUser')
+        try {
+            $store.Open('ReadWrite')
+            & $script:Module { param($t) Test-ExlTrustedPublisher -Thumbprint $t } $cert.Thumbprint | Should -BeFalse
+            $store.Add([Security.Cryptography.X509Certificates.X509Certificate2]::new($cert.RawData))
+            & $script:Module { param($t) Test-ExlTrustedPublisher -Thumbprint $t } $cert.Thumbprint | Should -BeTrue
+            & $script:Module { param($t) Test-ExlTrustedPublisher -Thumbprint $t } $cert.Thumbprint.ToLowerInvariant() | Should -BeTrue
+        } finally {
+            $store.Remove([Security.Cryptography.X509Certificates.X509Certificate2]::new($cert.RawData))
+            $store.Close(); $cert.Dispose(); $key.Dispose()
+        }
+    }
+
+    It 'decides before the helper starts from the policy, the zone mark, the trusted publishers and the manifest' {
+        Mock -ModuleName ExchangeLogReport Get-ExlFileSignature ([scriptblock]::Create("[pscustomobject]@{ Status = 'Valid'; SignerCertificate = [pscustomobject]@{ Thumbprint = '$($script:Pinned)' }; TimeStamperCertificate = 'stamp' }"))
+        Mock -ModuleName ExchangeLogReport Get-ExlManifestFileState { 'Accepted' }
+        Mock -ModuleName ExchangeLogReport Get-ExlZoneId { 3 }
+        Mock -ModuleName ExchangeLogReport Test-ExlTrustedPublisher { $false }
+        Mock -ModuleName ExchangeLogReport Get-ExlWindowsPowerShellPolicy { 'RemoteSigned' }
+        $blocked = & $script:Module { Get-ExlHelperLaunch -Path 'helper.ps1' }
+        $blocked.Reason | Should -Be 'PolicyBlocks'
+        $blocked.Bypass | Should -BeTrue
+        Mock -ModuleName ExchangeLogReport Test-ExlTrustedPublisher { $true }
+        $trusted = & $script:Module { Get-ExlHelperLaunch -Path 'helper.ps1' }
+        $trusted.Reason | Should -Be 'PolicyAllows'
+        $trusted.Bypass | Should -BeFalse
+        Mock -ModuleName ExchangeLogReport Get-ExlZoneId { 0 }
+        Mock -ModuleName ExchangeLogReport Test-ExlTrustedPublisher { $false }
+        (& $script:Module { Get-ExlHelperLaunch -Path 'helper.ps1' }).Bypass | Should -BeFalse
+        Mock -ModuleName ExchangeLogReport Get-ExlWindowsPowerShellPolicy { 'AllSigned' }
+        (& $script:Module { Get-ExlHelperLaunch -Path 'helper.ps1' }).Bypass | Should -BeTrue
+        Mock -ModuleName ExchangeLogReport Get-ExlManifestFileState { 'Mismatch' }
+        (& $script:Module { Get-ExlHelperLaunch -Path 'helper.ps1' }).Refuse | Should -BeTrue
+    }
+
+    It 'never announces or uses Bypass for a policy set by Group Policy (<Scope>), and still refuses a modified helper' -ForEach @(
+        @{ Scope = 'MachinePolicy' }
+        @{ Scope = 'UserPolicy' }
+    ) {
+        foreach ($prediction in 'Blocked', 'Unknown') {
+            $r = & $script:Module { param($v, $p, $s) Resolve-ExlHelperExecutionPolicy -Verdict $v -ManifestState 'Accepted' -Prediction $p -GroupPolicyScope $s } (New-Verdict 'Valid' $script:Pinned) $prediction @($Scope)
+            $r.Bypass | Should -BeFalse
+            $r.Refuse | Should -BeFalse
+            $r.Reason | Should -BeExactly 'GroupPolicy'
+            $r.Warning | Should -Match "set by Group Policy \($Scope\)"
+            $r.Warning | Should -Match 'Servers block'
+            $r.Warning | Should -Not -Match 'it starts with'
+        }
+        $allowed = & $script:Module { param($v, $s) Resolve-ExlHelperExecutionPolicy -Verdict $v -ManifestState 'Accepted' -Prediction 'Allowed' -GroupPolicyScope $s } (New-Verdict 'Valid' $script:Pinned) @($Scope)
+        $allowed.Reason | Should -BeExactly 'PolicyAllows'
+        $modified = & $script:Module { param($v, $s) Resolve-ExlHelperExecutionPolicy -Verdict $v -ManifestState 'Mismatch' -Prediction 'Blocked' -GroupPolicyScope $s } (New-Verdict 'Valid' $script:Pinned) @($Scope)
+        $modified.Refuse | Should -BeTrue
+    }
+
+    It 'asks for the Group Policy scopes only when the policy would block the helper, and has no Bypass fallback under one' {
+        Mock -ModuleName ExchangeLogReport Get-ExlFileSignature ([scriptblock]::Create("[pscustomobject]@{ Status = 'Valid'; SignerCertificate = [pscustomobject]@{ Thumbprint = '$($script:Pinned)' }; TimeStamperCertificate = 'stamp' }"))
+        Mock -ModuleName ExchangeLogReport Get-ExlManifestFileState { 'Accepted' }
+        Mock -ModuleName ExchangeLogReport Get-ExlZoneId { 3 }
+        Mock -ModuleName ExchangeLogReport Test-ExlTrustedPublisher { $false }
+        $global:ExlGroupCalls = 0
+        Mock -ModuleName ExchangeLogReport Get-ExlWindowsPowerShellPolicy { 'AllSigned' }
+        Mock -ModuleName ExchangeLogReport Get-ExlExecutionPolicyGroupScope { $global:ExlGroupCalls++; @('MachinePolicy') }
+        $launch = & $script:Module { Get-ExlHelperLaunch -Path 'helper.ps1' }
+        $launch.Reason | Should -Be 'GroupPolicy'
+        $launch.Bypass | Should -BeFalse
+        $launch.Policy | Should -Be 'AllSigned'
+        @($launch.GroupPolicyScope) | Should -Be @('MachinePolicy')
+        $launch.Fallback.Bypass | Should -BeFalse
+        Mock -ModuleName ExchangeLogReport Get-ExlExecutionPolicyGroupScope { $global:ExlGroupCalls++; @() }
+        (& $script:Module { Get-ExlHelperLaunch -Path 'helper.ps1' }).Reason | Should -Be 'PolicyBlocks'
+        Mock -ModuleName ExchangeLogReport Get-ExlZoneId { 0 }
+        Mock -ModuleName ExchangeLogReport Test-ExlTrustedPublisher { $true }
+        $allowed = & $script:Module { Get-ExlHelperLaunch -Path 'helper.ps1' }
+        $allowed.Reason | Should -Be 'PolicyAllows'
+        $global:ExlGroupCalls | Should -Be 2
+        Remove-Variable ExlGroupCalls -Scope Global
+    }
+
+    It 'reads only the names of the Group Policy scopes from this computer' {
+        $scopes = @(& $script:Module { Get-ExlExecutionPolicyGroupScope })
+        foreach ($scope in $scopes) { $scope | Should -BeIn 'MachinePolicy', 'UserPolicy' }
+    }
+
+    It 'tells a refusal of the helper file from a refusal inside the Exchange Management Shell by error id, in any language' -ForEach @(
+        @{ Lines = @('+ FullyQualifiedErrorId : UnauthorizedAccess'); Kind = 'HelperRefused' }
+        @{ Lines = @('+ CategoryInfo          : Erreur de securite : (:) [], PSSecurityException'); Kind = 'HelperRefused' }
+        @{ Lines = @('Echec de la verification d''AuthorizationManager.'); Kind = 'Other' }
+        @{ Lines = @('Le shell a echoue', 'ErrorId: UnauthorizedAccess System.Management.Automation.PSSecurityException'); Kind = 'ExchangeRefused' }
+        @{ Lines = @('Le shell a echoue', 'ErrorId: AuthorizationManager.Check System.Management.Automation.RuntimeException'); Kind = 'ExchangeRefused' }
+        @{ Lines = @('The shell failed', 'ErrorId: RuntimeException System.Management.Automation.RuntimeException'); Kind = 'Other' }
+        @{ Lines = @('Access denied', 'ErrorId: System.UnauthorizedAccessException,Microsoft.PowerShell.Commands.ImportClixmlCommand System.UnauthorizedAccessException'); Kind = 'Other' }
+        @{ Lines = @(); Kind = 'Other' }
+    ) {
+        & $script:Module { param($l) Get-ExlHelperFailureKind -Output $l } $Lines | Should -BeExactly $Kind
+    }
+
+    It 'words the failure of the helper after its cause, and blames the package only when the helper file was refused' {
+        $text = { param($kind, $detail, $policy, $scope, $bypass) & $script:Module { param($k, $d, $p, $s, $b) Get-ExlHelperFailureMessage -Kind $k -Detail $d -Policy $p -GroupPolicyScope $s -Bypass $b } $kind $detail $policy $scope $bypass }
+        $helper = & $text 'HelperRefused' 'refused' 'RemoteSigned' @() $false
+        $helper | Should -Match 'Unblock-File'
+        $helper | Should -Match 'trusted publisher'
+        $bypassed = & $text 'HelperRefused' 'refused' 'RemoteSigned' @() $true
+        $bypassed | Should -BeExactly 'refused'
+        $group = & $text 'HelperRefused' 'refused' 'AllSigned' @('UserPolicy') $false
+        $group | Should -Match 'set by Group Policy \(UserPolicy\)'
+        $group | Should -Match 'Servers block'
+        $group | Should -Not -Match 'Unblock-File'
+        $shell = & $text 'ExchangeRefused' 'refused' 'AllSigned' @() $false
+        $shell | Should -Match 'Exchange Management Shell was refused by the execution policy'
+        $shell | Should -Match 'RemoteSigned is the Windows Server default'
+        $shell | Should -Match 'collection, the report and the portal are not affected'
+        $shell | Should -Not -Match 'Unblock-File|trusted publisher'
+        $other = & $text 'Other' 'The shell failed.' 'AllSigned' @() $true
+        $other | Should -Match '^The shell failed\. The execution policy of this computer is AllSigned, which is not supported for -Mode Discover'
+        (& $text 'Other' 'The shell failed.' 'RemoteSigned' @() $false) | Should -BeExactly 'The shell failed.'
+    }
+
+    It 'reads no message text, only the names of statuses' {
+        $code = & $script:Module { (@('Resolve-ExlHelperExecutionPolicy', 'Resolve-ExlHelperPolicyPrediction', 'Get-ExlHelperLaunch', 'Get-OwnerSignatureVerdict', 'Get-ExlManifestFileState', 'Get-ExlWindowsPowerShellPolicy', 'Get-ExlExecutionPolicyGroupScope', 'Get-ExlHelperFailureKind') | ForEach-Object { (Get-Command $_).ScriptBlock.ToString() }) -join "`n" }
+        $code | Should -Not -Match 'StatusMessage|StatusInformation'
+        $code | Should -Not -Match 'Exception\.Message|\.Message\b'
+    }
+
+    It 'builds the helper command line with Bypass only when decided' {
+        $default = & $script:Module { Get-ExlHelperArguments -Launch ([pscustomobject]@{ Bypass = $false }) -Helper 'h.ps1' -OutFile 'o.json' }
+        $default | Should -Be @('-NoLogo', '-NoProfile', '-NonInteractive', '-File', 'h.ps1', '-OutFile', 'o.json')
+        $bypass = & $script:Module { Get-ExlHelperArguments -Launch ([pscustomobject]@{ Bypass = $true }) -Helper 'h.ps1' -OutFile 'o.json' }
+        $bypass | Should -Be @('-NoLogo', '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', 'h.ps1', '-OutFile', 'o.json')
+    }
+
+    It 'does not start a helper that was refused' {
+        Mock -ModuleName ExchangeLogReport Get-ExlHelperLaunch { [pscustomobject]@{ Bypass = $false; Refuse = $true; Reason = 'HashMismatch'; Warning = 'The discovery helper was modified.' } }
+        { & $script:Module { Get-ExlExchangeSettings -ConnectTo 'exch.invalid' } } | Should -Throw '*discovery helper was modified*'
+    }
+
+    It 'compares the helper with the manifest only after the verifier accepted the tree, and finds its path in any case' {
+        $root = Join-Path $TestDrive 'manifest-state'
+        [void][IO.Directory]::CreateDirectory((Join-Path $root 'src'))
+        $helper = Join-Path $root 'src\Get-ExlExchangeSettings.ps1'
+        [IO.File]::WriteAllText($helper, "'helper'")
+        $hash = (Get-FileHash -LiteralPath $helper -Algorithm SHA256).Hash
+        $write = { param($Thumbprint, $Path, $Sha) [IO.File]::WriteAllText((Join-Path $root 'PackageIntegrity.psd1'), "@{ SchemaVersion = 1; SignerThumbprint = '$Thumbprint'; Files = @(@{ Path = '$Path'; Sha256 = '$Sha' }) }") }
+        $state = { param($flag) & $script:Module { param($f, $p, $r) $was = $script:PackageVerified; $script:PackageVerified = $f; try { Get-ExlManifestFileState -Path $p -Root $r } finally { $script:PackageVerified = $was } } $flag $helper $root }
+        & $write $script:Pinned 'src\Get-ExlExchangeSettings.ps1' $hash
+        & $state $true | Should -Be 'Accepted'
+        & $state $false | Should -Be 'None'
+        & $write $script:Pinned 'SRC\get-exlexchangesettings.PS1' $hash
+        & $state $true | Should -Be 'Accepted'
+        & $write $script:Pinned 'src\Get-ExlExchangeSettings.ps1' ('0' * 64)
+        & $state $true | Should -Be 'Mismatch'
+        & $write $script:Pinned 'src\Other.ps1' $hash
+        & $state $true | Should -Be 'Mismatch'
+        & $write ('2' * 40) 'src\Get-ExlExchangeSettings.ps1' $hash
+        & $state $true | Should -Be 'Mismatch'
+        Remove-Item -LiteralPath (Join-Path $root 'PackageIntegrity.psd1')
+        & $state $true | Should -Be 'None'
+    }
+
+    It 'keeps the hashes that the manifest listed when the verifier accepted the tree, whatever the manifest says later' {
+        $root = Join-Path $TestDrive 'manifest-kept'
+        [void][IO.Directory]::CreateDirectory((Join-Path $root 'src'))
+        $helper = Join-Path $root 'src\Get-ExlExchangeSettings.ps1'
+        [IO.File]::WriteAllText($helper, "'helper'")
+        $hash = (Get-FileHash -LiteralPath $helper -Algorithm SHA256).Hash
+        [IO.File]::WriteAllText((Join-Path $root 'PackageIntegrity.psd1'), "@{ SchemaVersion = 1; SignerThumbprint = '$script:Pinned'; Files = @(@{ Path = 'src\Get-ExlExchangeSettings.ps1'; Sha256 = '$('0' * 64)' }) }")
+        $state = & $script:Module {
+            param($p, $r, $h)
+            $was = $script:PackageVerified, $script:VerifiedManifest
+            $script:PackageVerified = $true
+            $script:VerifiedManifest = [pscustomobject]@{ Root = [IO.Path]::TrimEndingDirectorySeparator([IO.Path]::GetFullPath($r)); Files = @(@{ Path = 'src\Get-ExlExchangeSettings.ps1'; Sha256 = $h }) }
+            try { Get-ExlManifestFileState -Path $p -Root $r } finally { $script:PackageVerified, $script:VerifiedManifest = $was }
+        } $helper $root $hash
+        $state | Should -Be 'Accepted'
+    }
+    It 'pins the same owner certificate in the module, the verifier, both entry scripts and the manifest' {
+        $verifier = Get-Content -LiteralPath (Join-Path $script:Root 'src\Test-PackageIntegrity.ps1') -Raw
+        [regex]::Match($verifier, '\$signer = ''([0-9A-F]{40})''').Groups[1].Value | Should -BeExactly $script:Pinned
+        foreach ($name in 'Invoke-ExchangeLogReport.ps1', 'Database-Storage.ps1') {
+            $entry = Get-Content -LiteralPath (Join-Path $script:Root $name) -Raw
+            [regex]::Match($entry, '-Pinned ''([0-9A-F]{40})''').Groups[1].Value | Should -BeExactly $script:Pinned
+        }
+        $manifest = Join-Path $script:Root 'PackageIntegrity.psd1'
+        if (Test-Path -LiteralPath $manifest) { (Import-PowerShellDataFile -LiteralPath $manifest).SignerThumbprint | Should -BeExactly $script:Pinned }
+    }
+
+    It 'reads a missing root from the chain of a real signature, and refuses the file once a byte of it changes' -ForEach @('.ps1', '.psm1', '.psd1') {
+        $key = [Security.Cryptography.RSA]::Create(2048)
+        $request = [Security.Cryptography.X509Certificates.CertificateRequest]::new('CN=Exchange Log Report test signer', $key, [Security.Cryptography.HashAlgorithmName]::SHA256, [Security.Cryptography.RSASignaturePadding]::Pkcs1)
+        $usage = [Security.Cryptography.OidCollection]::new(); [void]$usage.Add([Security.Cryptography.Oid]::new('1.3.6.1.5.5.7.3.3'))
+        $request.CertificateExtensions.Add([Security.Cryptography.X509Certificates.X509KeyUsageExtension]::new([Security.Cryptography.X509Certificates.X509KeyUsageFlags]::DigitalSignature, $true))
+        $request.CertificateExtensions.Add([Security.Cryptography.X509Certificates.X509EnhancedKeyUsageExtension]::new($usage, $false))
+        $self = $request.CreateSelfSigned([DateTimeOffset]::UtcNow.AddDays(-1), [DateTimeOffset]::UtcNow.AddDays(2))
+        $cert = [Security.Cryptography.X509Certificates.X509Certificate2]::new($self.Export('Pfx', 't'), 't', 'Exportable')
+        try {
+            $file = Join-Path $TestDrive "signed$_"
+            [IO.File]::WriteAllText($file, $(if ($_ -eq '.psd1') { "@{ Value = 'original content of the file' }`r`n" } else { "'original content of the file'`r`n" }))
+            [void](Set-AuthenticodeSignature -FilePath $file -Certificate $cert)
+            $signature = Get-AuthenticodeSignature -LiteralPath $file
+            if ($signature.Status -eq 'Valid') { Set-ItResult -Skipped -Because 'the test certificate is trusted on this computer'; return }
+            # No time stamp authority offline: the signature is given the certificate as its stamp, which the verdict only tests for presence.
+            $signed = [pscustomobject]@{ Status = $signature.Status; SignerCertificate = $signature.SignerCertificate; TimeStamperCertificate = $signature.SignerCertificate }
+            $verdict = & $script:Module { param($s, $p) Get-OwnerSignatureVerdict -Signature $s -Pinned $p } $signed $cert.Thumbprint
+            [string]$signature.Status | Should -Be 'UnknownError'
+            $verdict.Accepted | Should -BeTrue
+            $verdict.Relaxed | Should -BeTrue
+            $verdict.Reason | Should -Be 'RootNotTrusted'
+            (& $script:Module { param($s, $p) Get-OwnerSignatureVerdict -Signature $s -Pinned $p } $signed $script:Pinned).Reason | Should -Be 'UnknownSigner'
+            $bytes = [IO.File]::ReadAllBytes($file)
+            $at = [Text.Encoding]::ASCII.GetString($bytes).IndexOf('original')
+            $bytes[$at] = [byte][char]'0'
+            [IO.File]::WriteAllBytes($file, $bytes)
+            $changed = Get-AuthenticodeSignature -LiteralPath $file
+            [string]$changed.Status | Should -Be 'HashMismatch'
+            $tampered = & $script:Module { param($s, $p) Get-OwnerSignatureVerdict -Signature $s -Pinned $p } ([pscustomobject]@{ Status = $changed.Status; SignerCertificate = $changed.SignerCertificate; TimeStamperCertificate = $changed.SignerCertificate }) $cert.Thumbprint
+            $tampered.Accepted | Should -BeFalse
+            $tampered.Reason | Should -Be 'HashMismatch'
+            $modified = Resolve-Policy $tampered 'Accepted' 'Blocked'
+            $modified.Bypass | Should -BeFalse
+            $modified.Refuse | Should -BeTrue
+        } finally { $cert.Dispose(); $self.Dispose(); $key.Dispose() }
+    }
+}
+Describe 'Configured server names' {
+    BeforeAll {
+        function New-NamesConfig([string]$Name, [string[]]$Names, [string[]]$Discovered) {
+            $dir = Join-Path $TestDrive $Name
+            $cfg = New-TestConfig $dir
+            $block = "Servers = @(`r`n" + (($Names | ForEach-Object { "        @{ Name = '$($_.Replace("'", "''"))' }" }) -join "`r`n") + "`r`n    )"
+            $text = [regex]::Replace([IO.File]::ReadAllText($cfg), '(?ms)^ *Servers = @\(.*?^ *\)', $block.Replace('$', '$$'))
+            [IO.File]::WriteAllText($cfg, $text)
+            if ($Discovered) {
+                $servers = ($Discovered | ForEach-Object { "        '$_' = @{ ExchangePath = '\\$_\D`$\Exchange' }" }) -join "`r`n"
+                [IO.File]::WriteAllText((Join-Path $dir 'ExchangeLogReport.paths.psd1'), "@{`r`n    Discovered = '2026-10-01T21:30:00+02:00'`r`n    By = 'x'`r`n    Via = 'x'`r`n    Collector = 'x'`r`n    Servers = @{`r`n$servers`r`n    }`r`n}`r`n")
+            }
+            return $cfg
+        }
+    }
+
+    It 'warns, and does not refuse, a name that is not a host name' -ForEach @(
+        @{ Name = '10.1.2.3'; Expect = 'is an IP address' }
+        @{ Name = '[::1]'; Expect = 'is an IP address' }
+        @{ Name = 'fe80::1'; Expect = 'is an IP address' }
+        @{ Name = '\\evil\share'; Expect = 'contains a slash, a backslash or a colon' }
+        @{ Name = 'host:445'; Expect = 'contains a slash, a backslash or a colon' }
+        @{ Name = 'a/b'; Expect = 'contains a slash, a backslash or a colon' }
+        @{ Name = 'bad name'; Expect = 'is not a host name' }
+        @{ Name = ('x' * 300); Expect = 'is not a host name' }
+    ) {
+        $s = Import-ExlConfiguration -Path (New-NamesConfig "name-$([guid]::NewGuid().ToString('N').Substring(0, 6))" @('EXCH01', $Name)) -Root $script:Root
+        @($s.Warnings).Count | Should -Be 1
+        $s.Warnings[0] | Should -Match ([regex]::Escape("Servers[2].Name '$Name'"))
+        $s.Warnings[0] | Should -Match $Expect
+        $s.Servers.Count | Should -Be 2
+        $s.Servers[1].Name | Should -Be $Name.ToUpperInvariant()
+    }
+
+    It 'accepts host names in any case, short or with their domain, without a warning' {
+        $s = Import-ExlConfiguration -Path (New-NamesConfig 'names-good' @('ExCh01', 'exch02.Contoso.Test', 'EXCH-03', 'exch_04')) -Root $script:Root
+        @($s.Warnings).Count | Should -Be 0
+    }
+
+    It 'warns about a server that the last -Mode Discover did not find, whatever the case or the domain' {
+        $s = Import-ExlConfiguration -Path (New-NamesConfig 'names-discovered' @('exch01', 'EXCH02.contoso.test', 'Other01') @('EXCH01', 'EXCH02')) -Root $script:Root
+        @($s.Warnings).Count | Should -Be 1
+        $s.Warnings[0] | Should -Match "Servers\[3\].Name 'Other01' was not found by the last -Mode Discover"
+        $none = Import-ExlConfiguration -Path (New-NamesConfig 'names-no-discover' @('Other01')) -Root $script:Root
+        @($none.Warnings).Count | Should -Be 0
+    }
+
+    It 'shows the warnings after the banner and still runs' {
+        $dir = Join-Path $TestDrive 'names-run'
+        $cfg = New-NamesConfig 'names-run' @('10.1.2.3')
+        $output = & pwsh -NoProfile -File (Join-Path $script:Root 'Invoke-ExchangeLogReport.ps1') -DevelopmentMode -Mode Status -ConfigPath $cfg 2>&1 | Out-String
+        $LASTEXITCODE | Should -Be 0
+        $output | Should -Match "Servers\[1\]\.Name '10\.1\.2\.3' is an IP address"
+        $output | Should -Match 'Ready for the first collection'
+        (Get-Content -LiteralPath (Get-ChildItem (Join-Path $dir 'toollogs') -Filter '*.log' | Select-Object -First 1).FullName -Raw) | Should -Match 'is an IP address'
+    }
+}
+
+Describe 'Control characters of log-derived text' {
+    It 'replaces C0 and C1 controls, ESC, DEL and the Unicode line separators, and keeps a tab' {
+        $esc = [char]27
+        $text = "a${esc}[31mb`0c`u{85}d`u{7F}e`u{2028}f`u{2029}g`th"
+        $safe = & (Get-Module ExchangeLogReport) { param($t) ConvertTo-ExlSafeText $t } $text
+        $safe | Should -BeExactly "a?[31mb?c?d?e?f?g`th"
+        & (Get-Module ExchangeLogReport) { ConvertTo-ExlSafeText "x`r`ny" } | Should -BeExactly 'x??y'
+        & (Get-Module ExchangeLogReport) { ConvertTo-ExlSafeText "x`r`ny" -KeepLineBreaks } | Should -BeExactly "x`r`ny"
+        & (Get-Module ExchangeLogReport) { ConvertTo-ExlSafeText $null } | Should -BeNullOrEmpty
+        & (Get-Module ExchangeLogReport) { ConvertTo-ExlSafeText '' } | Should -BeExactly ''
+        & (Get-Module ExchangeLogReport) { ConvertTo-ExlSafeText 'Boîte à lettres déjà là' } | Should -BeExactly 'Boîte à lettres déjà là'
+    }
+
+    It 'prints a hostile text on the console without a control character, in an item, a detail, the banner and the summary' {
+        $esc = [char]27
+        $hostile = "bad${esc}[2J${esc}]0;title`aname`r`nERROR: forged"
+        $dir = Join-Path $TestDrive 'safe-console'
+        $log = Start-ExlLog -Directory $dir
+        try {
+            $console = & {
+                Write-ExlItem Warn $hostile
+                Write-ExlDetail $hostile
+                Write-ExlBanner -Title 'Title' -Subtitle $hostile -Details ([ordered]@{ Users = @('Info', $hostile) })
+                Write-ExlSummary -Title 'Summary' -Values ([ordered]@{ Users = @('Info', $hostile) })
+            } 6>&1 | Out-String
+        } finally { Stop-ExlLog }
+        $console = [regex]::Replace($console, "$esc\[[0-9;]*m", '')
+        $console | Should -Not -Match '[\x00-\x08\x0B\x0C\x0E-\x1F\x7F-\x9F]'
+        $console | Should -Match ([regex]::Escape('bad?[2J?]0;title?name??ERROR: forged'))
+        $entries = @(Get-Content -LiteralPath $log)
+        ($entries -join "`n") | Should -Not -Match '[\x00-\x08\x0B\x0C\x0E-\x1F\x7F-\x9F]'
+    }
+
+    It 'does not let a value forge a line of the log: each line carries its own time stamp and level' {
+        $dir = Join-Path $TestDrive 'safe-log'
+        $log = Start-ExlLog -Directory $dir
+        try { Write-ExlLog 'WARN' "first`n2026-01-01T00:00:00.000+00:00 [OK   ] forged`r2026-01-01T00:00:00.000+00:00 [ERROR] forged too" } finally { Stop-ExlLog }
+        $lines = @(Get-Content -LiteralPath $log)
+        $lines.Count | Should -Be 3
+        foreach ($line in $lines) { $line | Should -Match '^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d{3}[+-]\d\d:\d\d \[WARN \] ' }
+        $lines[1] | Should -Match '\[WARN \] 2026-01-01T00:00:00.000\+00:00 \[OK   \] forged$'
+    }
+
+    It 'does not echo a hostile -User or -Server value raw, on the console or in the log' {
+        $dir = Join-Path $TestDrive 'safe-entry'
+        $cfg = New-TestConfig $dir
+        $entry = Join-Path $script:Root 'Invoke-ExchangeLogReport.ps1'
+        $esc = [char]27
+        $plain = { param($text) [regex]::Replace($text, "$esc\[[0-9;]*m", '') }
+        $out = & $plain (& pwsh -NoProfile -File $entry -DevelopmentMode -Mode Status -User "al${esc}[31mice" -ConfigPath $cfg 2>&1 | Out-String)
+        $out | Should -Not -Match '[\x00-\x08\x0B\x0C\x0E-\x1F\x7F-\x9F]'
+        $out | Should -Match ([regex]::Escape('al?[31mice'))
+        $logs = Get-ChildItem -LiteralPath (Join-Path $dir 'toollogs') -Filter '*.log' | ForEach-Object { Get-Content -LiteralPath $_.FullName -Raw }
+        ($logs -join "`n") | Should -Not -Match '[\x00-\x08\x0B\x0E-\x1F\x7F-\x9F]'
+        ($logs -join "`n") | Should -Match ([regex]::Escape('al?[31mice'))
+        $out = & $plain (& pwsh -NoProfile -File $entry -DevelopmentMode -Mode Collect -Server "EXCH${esc}[31m01" -ConfigPath $cfg 2>&1 | Out-String)
+        $LASTEXITCODE | Should -Be 1
+        $out | Should -Not -Match '[\x00-\x08\x0B\x0C\x0E-\x1F\x7F-\x9F]'
+        $out | Should -Match 'Unknown server\(s\): EXCH\?\[31m01'
+    }
+}
+Describe 'Corrupt and hostile log files' {
+    BeforeAll {
+        function Add-TestJunk([string]$Root, [int]$LongLine = 70000) {
+            $ascii = [Text.Encoding]::ASCII
+            $junk = [Collections.Generic.List[byte[]]]::new()
+            $junk.Add([byte[]](0, 0, 0, 0, 0, 0, 0, 0))
+            $junk.Add([byte[]](0xFF, 0xFE, 0xFD, 0xC0, 0xAF, 0x80))
+            $junk.Add($ascii.GetBytes(',,,,,,,,,,,,'))
+            $junk.Add($ascii.GetBytes('"unterminated,quote,1,2'))
+            $junk.Add($ascii.GetBytes('garbage without any separator'))
+            $junk.Add($ascii.GetBytes('2026-10-0'))
+            $junk.Add($ascii.GetBytes('2026-10-01T08:0'))
+            $junk.Add($ascii.GetBytes(('x' * $LongLine)))
+            $total = 0
+            foreach ($file in Get-ChildItem -LiteralPath $Root -Recurse -File) {
+                $bytes = [IO.File]::ReadAllBytes($file.FullName)
+                $out = [IO.MemoryStream]::new()
+                $start = 0
+                for ($i = 0; $i -lt $bytes.Length; $i++) {
+                    if ($bytes[$i] -ne 10) { continue }
+                    $out.Write($bytes, $start, $i - $start + 1); $start = $i + 1
+                    foreach ($j in $junk) { $out.Write($j, 0, $j.Length); $out.WriteByte(13); $out.WriteByte(10); $total++ }
+                }
+                if ($start -lt $bytes.Length) { $out.Write($bytes, $start, $bytes.Length - $start) }
+                [IO.File]::WriteAllBytes($file.FullName, $out.ToArray())
+            }
+            return $total
+        }
+        function Get-KindTotals($Settings) {
+            $rows = Query $Settings 'SELECT kind, SUM(lines), SUM(kept), SUM(noise), SUM(offset), SUM(size) FROM source_file GROUP BY kind ORDER BY kind'
+            $totals = @{}
+            foreach ($r in $rows) { $totals[[string]$r[0]] = [pscustomobject]@{ Lines = [long]$r[1]; Kept = [long]$r[2]; Noise = [long]$r[3]; Offset = [long]$r[4]; Size = [long]$r[5] } }
+            return $totals
+        }
+        function Get-Counts($Settings) {
+            $row = (Query $Settings 'SELECT (SELECT COUNT(*) FROM access_usage), (SELECT COALESCE(SUM(requests), 0) FROM access_usage), (SELECT COUNT(*) FROM access_event), (SELECT COUNT(*) FROM smtp_transaction), (SELECT COUNT(*) FROM message_event), (SELECT COUNT(*) FROM client_session)')[0]
+            return ($row | ForEach-Object { [string]$_ }) -join ','
+        }
+        $options = @{ 'PopImap         = $false' = 'PopImap         = $true' }
+        $script:CleanDir = Join-Path $TestDrive 'junk-clean'; $script:DirtyDir = Join-Path $TestDrive 'junk-dirty'
+        $script:CleanSettings = Import-ExlConfiguration -Path (New-TestConfig $script:CleanDir $options) -Root $script:Root
+        $dirtyConfig = New-TestConfig $script:DirtyDir $options
+        $script:JunkTotal = Add-TestJunk (Join-Path $script:DirtyDir 'logs-src')
+        $script:DirtySettings = Import-ExlConfiguration -Path $dirtyConfig -Root $script:Root
+        $script:CleanRun = Invoke-TestCollection $script:CleanSettings
+        $script:DirtyRun = Invoke-TestCollection $script:DirtySettings
+        $script:CleanKinds = Get-KindTotals $script:CleanSettings
+        $script:DirtyKinds = Get-KindTotals $script:DirtySettings
+    }
+
+    It 'reads past every corrupt line: nothing is stored from it, each one is counted as noise' {
+        $script:DirtyRun.Kept | Should -Be $script:CleanRun.Kept
+        $script:DirtyRun.Lines | Should -Be ($script:CleanRun.Lines + $script:JunkTotal)
+        $script:DirtyRun.Noise | Should -Be ($script:CleanRun.Noise + $script:JunkTotal)
+        $script:DirtyRun.Errors | Should -Be 0
+        (Get-Counts $script:DirtySettings) | Should -Be (Get-Counts $script:CleanSettings)
+    }
+
+    It 'does the same for the <Kind> log' -ForEach @(
+        @{ Kind = 'HttpProxy' }, @{ Kind = 'Iis' }, @{ Kind = 'EasBackEnd' }, @{ Kind = 'MapiBackEnd' }, @{ Kind = 'SmtpReceive' }, @{ Kind = 'SmtpSend' },
+        @{ Kind = 'Tracking' }, @{ Kind = 'Imap4' }
+    ) {
+        $script:CleanKinds.Keys | Should -Contain $Kind
+        $clean = $script:CleanKinds[$Kind]; $dirty = $script:DirtyKinds[$Kind]
+        $dirty.Kept | Should -Be $clean.Kept
+        $dirty.Noise | Should -BeGreaterThan $clean.Noise
+        $dirty.Lines - $clean.Lines | Should -Be ($dirty.Noise - $clean.Noise)
+        # Every file is read to its end: the resume point is the size.
+        $dirty.Offset | Should -Be $dirty.Size
+    }
+
+    It 'resumes at the end: a second collection reads no line again' {
+        $again = Invoke-TestCollection $script:DirtySettings
+        $again.Lines | Should -Be 0
+        $again.Kept | Should -Be 0
+        $again.Errors | Should -Be 0
+    }
+
+    It 'skips a line longer than the limit, counts it, warns, and reads the lines after it' {
+        $dir = Join-Path $TestDrive 'long-line'
+        $settings = Import-ExlConfiguration -Path (New-TestConfig $dir) -Root $script:Root
+        $file = Join-Path $dir 'logs-src\EXCH01\Exchange\Logging\HttpProxy\Mapi\HttpProxy_2026100108-1.LOG'
+        $lines = [IO.File]::ReadAllLines($file)
+        $at = [Array]::FindIndex($lines, [Predicate[string]] { param($l) $l.StartsWith('DateTime,') })
+        $text = (($lines[0..$at] + ('A' * (9MB)) + $lines[($at + 1)..($lines.Count - 1)]) -join "`r`n") + "`r`n"
+        [IO.File]::WriteAllText($file, $text, [Text.UTF8Encoding]::new($true))
+        $reference = Invoke-TestCollection (Import-ExlConfiguration -Path (New-TestConfig (Join-Path $TestDrive 'long-line-reference')) -Root $script:Root)
+        $run = Invoke-TestCollection $settings
+        $run.Kept | Should -Be $reference.Kept
+        $run.Lines | Should -Be ($reference.Lines + 1)
+        @($run.Warnings).Count | Should -Be 1
+        $run.Warnings[0] | Should -Match '^1 line\(s\) longer than .+ skipped on EXCH01'
+        $run.NoiseReasons['Line too long (skipped)'] | Should -Be 1
+    }
+
+    It 'keeps the memory of a line without end bounded, drops it and resumes after the complete lines' {
+        $path = Join-Path $TestDrive 'huge.log'
+        $stream = [IO.File]::Create($path)
+        try {
+            $head = [Text.Encoding]::ASCII.GetBytes("first`r`n")
+            $stream.Write($head, 0, $head.Length)
+            $block = [byte[]]::new(1MB); [Array]::Fill($block, [byte]65)
+            1..40 | ForEach-Object { $stream.Write($block, 0, $block.Length) }
+            $stream.WriteByte(13); $stream.WriteByte(10)
+            $tail = [Text.Encoding]::ASCII.GetBytes("after`r`nlast line without end")
+            $stream.Write($tail, 0, $tail.Length)
+        } finally { $stream.Dispose() }
+        [GC]::Collect()
+        $before = [GC]::GetTotalAllocatedBytes($true)
+        $seen = foreach ($l in [ExchangeLogReport.LogReader]::Lines($path, 0)) { [pscustomobject]@{ Oversized = $l.Oversized; Length = $l.Length; Next = $l.NextOffset } }
+        $allocated = [GC]::GetTotalAllocatedBytes($true) - $before
+        @($seen).Count | Should -Be 3
+        $seen[0].Length | Should -Be 5
+        $seen[1].Oversized | Should -BeTrue
+        $seen[1].Length | Should -Be 0
+        $seen[1].Next | Should -Be (7 + 40MB + 2)
+        $seen[2].Length | Should -Be 5
+        $seen[2].Next | Should -Be (7 + 40MB + 2 + 7)
+        $allocated | Should -BeLessThan 48MB
+        # A line without end that is longer than the limit is never returned: the file is read again from its start at the next collection.
+        $open = [IO.File]::Create((Join-Path $TestDrive 'open.log'))
+        try { $b = [byte[]]::new(10MB); [Array]::Fill($b, [byte]66); $open.Write($b, 0, $b.Length) } finally { $open.Dispose() }
+        @([ExchangeLogReport.LogReader]::Lines((Join-Path $TestDrive 'open.log'), 0)).Count | Should -Be 0
+    }
+
+    It 'counts a match of a catastrophic regular expression that exceeds the time limit, warns and goes on' {
+        $dir = Join-Path $TestDrive 'redos'
+        $cfg = New-TestConfig $dir @{ "ProbeUrlPatterns = @('healthcheck\.htm', '/owa/auth/x\.gif`$')" = "ProbeUrlPatterns = @('^(a+)+`$')" }
+        $settings = Import-ExlConfiguration -Path $cfg -Root $script:Root
+        $settings.Noise.ProbeUrlPatterns | Should -Be @('^(a+)+$')
+        $lines = foreach ($i in 1..30) {
+            ProxyLine @{ DateTime = (T (20 + $i / 100)); RequestId = [guid]::NewGuid().ToString(); Protocol = 'Mapi'; UrlHost = 'mail.contoso.test'; UrlStem = ('a' * 34) + '!' + $i
+                AuthenticationType = 'Negotiate'; IsAuthenticated = $true; AuthenticatedUser = 'CONTOSO\alice'; UserAgent = 'Outlook'; ClientIpAddress = '10.1.1.10'; ServerHostName = 'EXCH01'
+                HttpStatus = 200; BackEndStatus = 200; Method = 'POST'; ProxyAction = 'Proxy'; RoutingType = 'IntraForest'; TotalRequestTime = 42 }
+        }
+        Write-Log (Join-Path $dir 'logs-src\EXCH01\Exchange\Logging\HttpProxy\Mapi\HttpProxy_2026100109-1.LOG') (@('#Software: Microsoft Exchange Server', "#Fields: $script:ProxyFields", $script:ProxyFields) + $lines)
+        $watch = [Diagnostics.Stopwatch]::StartNew()
+        $run = Invoke-TestCollection $settings
+        $watch.Elapsed.TotalSeconds | Should -BeLessThan 120
+        $run.Errors | Should -Be 0
+        @($run.Warnings).Count | Should -Be 1
+        $run.Warnings[0] | Should -Match '^\d+ match\(es\) of the regular expressions of Noise\.ProbeUrlPatterns exceeded the time limit'
+        $run.Kept | Should -BeGreaterThan 30
+    }
+}
+
+Describe 'Spreadsheet formulas in CSV files and hostile log fields' {
+    BeforeAll {
+        $script:CsvMethod = [ExchangeLogReport.ReportBuilder].GetMethod('Csv', [Reflection.BindingFlags]'NonPublic,Static')
+        $script:FormulaMethod = [ExchangeLogReport.ReportBuilder].GetMethod('IsFormulaCell', [Reflection.BindingFlags]'NonPublic,Static')
+        $script:EscapeMethod = [ExchangeLogReport.Store].Assembly.GetType('ExchangeLogReport.ServeExportCsv').GetMethod('Escape', [Reflection.BindingFlags]'NonPublic,Static')
+    }
+
+    It 'neutralizes <Value> in the files of a report and in the export of the portal' -ForEach @(
+        @{ Value = '=1+1'; Expected = "'=1+1" }
+        @{ Value = '+1'; Expected = "'+1" }
+        @{ Value = '-1+2'; Expected = "'-1+2" }
+        @{ Value = '@SUM(1)'; Expected = "'@SUM(1)" }
+        @{ Value = ' =cmd'; Expected = "' =cmd" }
+        @{ Value = "   +1"; Expected = "'   +1" }
+        @{ Value = "  `t @x"; Expected = "'  `t @x" }
+        @{ Value = "`t=x"; Expected = "'`t=x" }
+        @{ Value = "`r=x"; Expected = "`"'`r=x`"" }
+        @{ Value = "`n=x"; Expected = "`"'`n=x`"" }
+        @{ Value = "`n  @x"; Expected = "`"'`n  @x`"" }
+        @{ Value = 'a=b'; Expected = 'a=b' }
+        @{ Value = ' plain'; Expected = ' plain' }
+        @{ Value = '   '; Expected = '   ' }
+        @{ Value = ''; Expected = '' }
+        @{ Value = 'x;y'; Expected = '"x;y"' }
+        @{ Value = '= ;y'; Expected = "`"'= ;y`"" }
+    ) {
+        $script:CsvMethod.Invoke($null, @($Value, ';')) | Should -BeExactly $Expected
+        $script:EscapeMethod.Invoke($null, @($Value)) | Should -BeExactly $Expected
+        $script:FormulaMethod.Invoke($null, @($Value)) | Should -Be ($Expected.TrimStart('"').StartsWith("'"))
+    }
+
+    It 'neutralizes the same cells in the export of the page as in the files' {
+        $template = [IO.File]::ReadAllText((Join-Path $script:Root 'templates\Report.template.js'))
+        $match = [regex]::Match($template, 'const esc = v => \{[^\n]*?if \(/(?<pattern>[^\n]+?)/\.test\(v\)\) v = "''" \+ v;')
+        $match.Success | Should -BeTrue
+        $pattern = [regex]::new($match.Groups['pattern'].Value)
+        foreach ($value in '=1', '+1', '-1', '@x', ' =x', "`t=x", "`r=x", "`n=x", "  `n @x", 'a=b', ' plain', '', '   ') {
+            $pattern.IsMatch($value) | Should -Be $script:FormulaMethod.Invoke($null, @($value))
+        }
+    }
+
+    It 'keeps hostile log fields inert in the CSV files, the HTML report and the body of the e-mail' {
+        $dir = Join-Path $TestDrive 'hostile'
+        $cfg = New-TestConfig $dir
+        $esc = [char]27
+        $exchange = Join-Path $dir 'logs-src\EXCH01\Exchange'
+        $hostileUser = 'CONTOSO\hostile<img src=x onerror=alert(1)>'
+        $agents = @('=HOSTILE-agent', ' +HOSTILE-space', "-HOSTILE`t-tab", "${esc}[2JHOSTILE-esc</script><img src=x onerror=alert(1)>`u{2028}", ('HOSTILE' + ('z' * 70000)))
+        $lines = for ($i = 0; $i -lt $agents.Count; $i++) {
+            ProxyLine @{ DateTime = (T (10 + $i)); RequestId = [guid]::NewGuid().ToString(); Protocol = 'Mapi'; UrlHost = 'mail.contoso.test'; UrlStem = "/mapi/emsmdb/@HOSTILE-url$i"
+                AuthenticationType = 'Negotiate'; IsAuthenticated = $true; AuthenticatedUser = $(if ($i -eq 1) { $hostileUser } else { 'CONTOSO\alice' }); AnchorMailbox = 'SMTP:alice@contoso.test'; UserAgent = $agents[$i]
+                ClientIpAddress = '10.1.1.10'; ServerHostName = 'EXCH01'; HttpStatus = 503; BackEndStatus = 503; ErrorCode = '@HOSTILE-error'; Method = 'POST'; ProxyAction = 'Proxy'
+                RoutingType = 'IntraForest'; TotalRequestTime = 42; GenericErrors = '+HOSTILE-generic' }
+        }
+        Write-Log (Join-Path $exchange 'Logging\HttpProxy\Mapi\HttpProxy_2026100109-1.LOG') (@('#Software: Microsoft Exchange Server', "#Fields: $script:ProxyFields", $script:ProxyFields) + $lines)
+        $header = (Get-Content -LiteralPath (Join-Path $exchange 'TransportRoles\Logs\MessageTracking\MSGTRK2026100108-1.LOG') | Where-Object { $_ -like '#Fields:*' } | Select-Object -First 1)
+        $tracking = @("$(T 12),10.1.1.50,+HOSTILE-client,10.0.0.2,,08DF000000000009;$(T 12);0,,SMTP,RECEIVE,1009,<hostile-1@contoso.test>,net-0009,bob@contoso.test,,2048,1,,,=HOSTILE-subject,alice@contoso.test,alice@contoso.test,,Originating,,,,,Email,$([guid]::NewGuid()),15.02.2562.045")
+        Write-Log (Join-Path $exchange 'TransportRoles\Logs\MessageTracking\MSGTRK2026100109-1.LOG') (@('#Software: Microsoft Exchange Server', $header) + $tracking)
+        $settings = Import-ExlConfiguration -Path $cfg -Root $script:Root
+        [void](Invoke-TestCollection $settings)
+        $store = Open-ExlStore -Settings $settings -ReadOnly
+        try { $report = New-ExlReport -Store $store -Settings $settings -Period ([pscustomobject]@{ StartMs = $script:Base.AddHours(-1).ToUnixTimeMilliseconds(); EndMs = $script:Base.AddHours(2).ToUnixTimeMilliseconds() }) -ReportType Detailed } finally { $store.Dispose() }
+        # CSV files: every cell that holds a hostile value is neutralized.
+        $cells = foreach ($file in Get-ChildItem -LiteralPath $report.Folder -Filter '*.csv') {
+            foreach ($row in Import-Csv -LiteralPath $file.FullName -Delimiter ';') { foreach ($p in $row.PSObject.Properties) { if ([string]$p.Value -match 'HOSTILE') { [pscustomobject]@{ File = $file.Name; Cell = [string]$p.Value } } } }
+        }
+        @($cells).Count | Should -BeGreaterThan 4
+        foreach ($cell in $cells) {
+            $cell.Cell | Should -Not -Match '^\s*[=+\-@]'
+            $cell.Cell | Should -Not -Match '^[\t\r\n]'
+        }
+        @($cells | Where-Object { $_.Cell.StartsWith("'") }).Count | Should -BeGreaterThan 1
+        # HTML: the data is packed, the page keeps its scripts and carries no raw payload.
+        $html = [IO.File]::ReadAllText($report.HtmlPath)
+        $html | Should -Not -Match '<img src=x'
+        $html | Should -Not -Match '[\x00-\x08\x0B\x0C\x0E-\x1F]'
+        $parsed = Read-TestHtml $report.HtmlPath
+        (($parsed.Sets.Values | ForEach-Object { $_ } | ConvertTo-Json -Depth 8 -Compress) -match 'HOSTILE') | Should -BeTrue
+        # E-mail body: the user is encoded in the HTML part.
+        $mail = [ExchangeLogReport.ReportMail]::Build($report, 's', 'Exchange Log Report', 'p', 'Detailed', 'PC1', 'None', 1MB)
+        $mail.Html | Should -Not -Match '<img src=x'
+        $mail.Html | Should -Match '&lt;img src=x'
+    }
+}
+
+Describe 'Content-Security-Policy of the static report' {
+    BeforeAll {
+        function Get-ScriptElements([string]$Html) { [regex]::Matches($Html, '<script\b(?<attributes>[^>]*)>') }
+        $script:CspPeriod = [pscustomobject]@{ StartMs = $script:Base.AddHours(-1).ToUnixTimeMilliseconds(); EndMs = $script:Base.AddHours(2).ToUnixTimeMilliseconds() }
+        $store = Open-ExlStore -Settings $script:Settings -ReadOnly
+        try { $script:CspReport = New-ExlReport -Store $store -Settings $script:Settings -Period $script:CspPeriod -ReportType Detailed } finally { $store.Dispose() }
+    }
+
+    It 'puts a nonce policy in the template and on every executing script of the page' {
+        $template = [IO.File]::ReadAllText((Join-Path $script:Root 'templates\Report.template.html'))
+        $template | Should -Match '<meta http-equiv="Content-Security-Policy" content="default-src ''none''; script-src ''nonce-%%NONCE%%'' ''strict-dynamic''; style-src ''unsafe-inline''; img-src data:; base-uri ''none''; form-action ''none''; object-src ''none''">'
+        foreach ($tag in Get-ScriptElements $template) {
+            if ($tag.Groups['attributes'].Value -notmatch 'type="application/json"') { $tag.Groups['attributes'].Value | Should -Match 'nonce="%%NONCE%%"' }
+        }
+        $script:CspReport.HtmlPath | Should -Not -BeNullOrEmpty
+        $html = [IO.File]::ReadAllText($script:CspReport.HtmlPath)
+        $nonce = [regex]::Match($html, 'script-src ''nonce-([^'']+)''').Groups[1].Value
+        $nonce.Length | Should -BeGreaterThan 20
+        $html | Should -Not -Match '%%NONCE%%'
+        $scripts = @(Get-ScriptElements $html)
+        $scripts.Count | Should -BeGreaterThan 3
+        foreach ($tag in $scripts) {
+            if ($tag.Groups['attributes'].Value -match 'type="application/json"') { continue }
+            $tag.Groups['attributes'].Value | Should -Match ('nonce="' + [regex]::Escape($nonce) + '"')
+        }
+    }
+
+    It 'generates a new nonce for each report' {
+        $store = Open-ExlStore -Settings $script:Settings -ReadOnly
+        try { $second = New-ExlReport -Store $store -Settings $script:Settings -Period $script:CspPeriod -ReportType Usage -IncludeRoutingDetails $false } finally { $store.Dispose() }
+        $a = [regex]::Match([IO.File]::ReadAllText($script:CspReport.HtmlPath), 'nonce-([^'']+)''').Groups[1].Value
+        $b = [regex]::Match([IO.File]::ReadAllText($second.HtmlPath), 'nonce-([^'']+)''').Groups[1].Value
+        $a | Should -Not -BeNullOrEmpty
+        $a | Should -Not -Be $b
+    }
+
+    It 'leaves a template without the marker as it was, and the portal page without the policy and the nonce' {
+        $served = [ExchangeLogReport.ReportBuilder].GetMethod('ServedPage', [Reflection.BindingFlags]'NonPublic,Static')
+        $template = [IO.File]::ReadAllText((Join-Path $script:Root 'templates\Report.template.html'))
+        $page = $served.Invoke($null, @($template, 'var x = 1;', 'Report.template.html'))
+        $page | Should -Not -Match '<meta http-equiv="Content-Security-Policy"'
+        $page | Should -Not -Match 'nonce="'
+        $page | Should -Match '<script src="report.js"></script>'
+        $plain = "<html><head></head><body><script>%%SCRIPT%%</script>%%CHUNKS%%<script id=`"report-meta`" type=`"application/json`">%%META%%</script></body></html>"
+        $served.Invoke($null, @($plain, 'var x = 1;', 'plain.html')) | Should -Match '<script src="report.js"></script>'
+    }
+}
+
+Describe 'Windows event log' {
+    BeforeAll {
+        $script:Module = Get-Module ExchangeLogReport
+        function Start-Capture { $global:ExlTestEvents = [Collections.Generic.List[object]]::new() }
+        function Stop-Capture { Remove-Variable ExlTestEvents -Scope Global -ErrorAction SilentlyContinue }
+        function Get-Captured { @($global:ExlTestEvents) }
+    }
+    BeforeEach {
+        Start-Capture
+        Mock -ModuleName ExchangeLogReport Write-ExlEventEntry { $global:ExlTestEvents.Add([pscustomobject]@{ Id = $Id; Level = $Level; Message = $Message }) }
+    }
+    AfterEach { & $script:Module { $script:EventLogEnabled = $false; $script:EventLogWarned = $false }; Stop-Capture }
+
+    It 'is off by default and in a configuration that does not mention it' {
+        (Import-ExlConfiguration -Path (Join-Path $script:Root 'config\ExchangeLogReport.config.psd1') -Root $script:Root).Logging.EventLog | Should -BeFalse
+        $cfg = New-TestConfig (Join-Path $TestDrive 'eventlog-config')
+        $without = [regex]::Replace([IO.File]::ReadAllText($cfg), '(?m)^\s*EventLog\s*=.*\r?\n', '')
+        $without | Should -Not -Match 'EventLog\s*='
+        [IO.File]::WriteAllText($cfg, $without)
+        (Import-ExlConfiguration -Path $cfg -Root $script:Root).Logging.EventLog | Should -BeFalse
+        [IO.File]::WriteAllText($cfg, [IO.File]::ReadAllText((Join-Path $script:Root 'config\ExchangeLogReport.config.psd1')).Replace('EventLog      = $false', 'EventLog      = $true'))
+        (Import-ExlConfiguration -Path $cfg -Root $script:Root).Logging.EventLog | Should -BeTrue
+        [IO.File]::WriteAllText($cfg, [IO.File]::ReadAllText((Join-Path $script:Root 'config\ExchangeLogReport.config.psd1')).Replace('EventLog      = $false', "EventLog      = 'yes'"))
+        { Import-ExlConfiguration -Path $cfg -Root $script:Root } | Should -Throw '*Logging.EventLog must be $true or $false*'
+    }
+
+    It 'writes nothing while it is off, and one event with its id, level and text when it is on' {
+        & $script:Module { Write-ExlEvent 1000 Information 'Run started.' }
+        @(Get-Captured).Count | Should -Be 0
+        Set-ExlEventLog -Enabled $true
+        & $script:Module { Write-ExlEvent 2001 Warning "Line one`r`nline two $([char]27)[31m" }
+        $events = Get-Captured
+        $events.Count | Should -Be 1
+        $events[0].Id | Should -Be 2001
+        $events[0].Level | Should -Be 'Warning'
+        $events[0].Message | Should -Be "Line one`r`nline two ?[31m"
+        Set-ExlEventLog -Enabled $false
+        & $script:Module { Write-ExlEvent 1000 Information 'Run started.' }
+        @(Get-Captured).Count | Should -Be 1
+    }
+
+    It 'never stops a run when the event log cannot be written, and says so once' {
+        Mock -ModuleName ExchangeLogReport Write-ExlEventEntry { throw 'The source cannot be created.' }
+        $dir = Join-Path $TestDrive 'eventlog-failure'
+        $log = Start-ExlLog -Directory $dir -EventLog
+        try {
+            $console = & { & $script:Module { Write-ExlEvent 1000 Information 'a'; Write-ExlEvent 1001 Information 'b'; Write-ExlEvent 2001 Warning 'c' } } 6>&1 | Out-String
+        } finally { Stop-ExlLog }
+        ([regex]::Matches($console, 'Windows event log: the events are not written')).Count | Should -Be 1
+        $console | Should -Match "Register the event source 'ExchangeLogReport'"
+        (Get-Content -LiteralPath $log -Raw) | Should -Match 'event 1001 not written'
+        (& $script:Module { $script:EventLogEnabled }) | Should -BeFalse
+    }
+
+    It 'warns with a fixed English text and the HRESULT, never the text of the exception, which depends on the language of Windows' {
+        Mock -ModuleName ExchangeLogReport Write-ExlEventEntry { throw [IO.IOException]::new('La source ExchangeLogReport est introuvable.', -2146233079) }
+        $dir = Join-Path $TestDrive 'eventlog-hresult'
+        $log = Start-ExlLog -Directory $dir -EventLog
+        try {
+            $console = & { & $script:Module { Write-ExlEvent 1000 Information 'a' } } 6>&1 | Out-String
+        } finally { Stop-ExlLog }
+        $console | Should -Match 'HRESULT 0x80131509'
+        $console | Should -Not -Match 'introuvable'
+        $console | Should -Match "Register the event source 'ExchangeLogReport' once as an administrator, or set Logging.EventLog to \`$false"
+    }
+
+    It 'is switched on by the log of a run and off again when the log closes' {
+        $log = Start-ExlLog -Directory (Join-Path $TestDrive 'eventlog-switch') -EventLog
+        (& $script:Module { $script:EventLogEnabled }) | Should -BeTrue
+        Stop-ExlLog
+        (& $script:Module { $script:EventLogEnabled }) | Should -BeFalse
+        $log = Start-ExlLog -Directory (Join-Path $TestDrive 'eventlog-switch')
+        (& $script:Module { $script:EventLogEnabled }) | Should -BeFalse
+        Stop-ExlLog
+    }
+
+    It 'writes 3000 when the credential file is written, without the account name' {
+        Set-ExlEventLog -Enabled $true
+        $dir = Join-Path $TestDrive 'eventlog-credential'
+        $s = Import-ExlConfiguration -Path (New-TestConfig $dir) -Root $script:Root
+        $s.Mail.CredentialFile = Join-Path $dir 'config\mail.credential'
+        Save-ExlMailCredential -Settings $s -Credential ([pscredential]::new('CONTOSO\svc-smtp', (ConvertTo-SecureString 'x' -AsPlainText -Force)))
+        $events = Get-Captured
+        $events.Count | Should -Be 1
+        $events[0].Id | Should -Be 3000
+        $events[0].Level | Should -Be 'Information'
+        $events[0].Message | Should -Be 'The mail credential file was written (DPAPI scope User).'
+    }
+
+    It 'writes 3001 for each message sent, with the server and the number of recipients and no address' {
+        Set-ExlEventLog -Enabled $true
+        $server = [ElrTest.FakeSmtp]::new()
+        try {
+            $cfg = New-TestConfig (Join-Path $TestDrive 'eventlog-mail')
+            [IO.File]::WriteAllText($cfg, [regex]::Replace([IO.File]::ReadAllText($cfg), '(?ms)^    Mail = @\{.*?^    \}', ("    Mail = @{ SmtpServer = '127.0.0.1'; Port = $($server.Port); Encryption = 'None'; From = 'elr@contoso.test'; To = @('a@contoso.test', 'b@contoso.test'); Cc = @('c@contoso.test'); Attach = 'None' }").Replace('$', '$$')))
+            $s = Import-ExlConfiguration -Path $cfg -Root $script:Root
+            (& $script:Module { param($x) Send-ExlTestMail -Settings $x } $s).Sent | Should -BeTrue
+        } finally { $server.Dispose() }
+        $events = @(Get-Captured | Where-Object Id -eq 3001)
+        $events.Count | Should -Be 1
+        $events[0].Message | Should -Be "E-mail sent through 127.0.0.1:$($server.Port) to 3 recipient(s); TLS: none."
+        $events[0].Message | Should -Not -Match '@'
+    }
+
+    It 'writes 2001 with the security identifier and the folder when the package folder can be changed' {
+        Set-ExlEventLog -Enabled $true
+        $top = Join-Path $TestDrive 'eventlog-acl'; $package = Join-Path $top 'package'
+        [void][IO.Directory]::CreateDirectory((Join-Path $package 'src'))
+        $security = [Security.AccessControl.DirectorySecurity]::new()
+        $security.SetAccessRuleProtection($true, $false)
+        foreach ($sid in 'S-1-5-18', 'S-1-5-32-544', [Security.Principal.WindowsIdentity]::GetCurrent().User.Value) { $security.AddAccessRule([Security.AccessControl.FileSystemAccessRule]::new([Security.Principal.SecurityIdentifier]::new($sid), 'FullControl', 'ContainerInherit, ObjectInherit', 'None', 'Allow')) }
+        [IO.FileSystemAclExtensions]::SetAccessControl([IO.DirectoryInfo]::new($top), $security)
+        $security.AddAccessRule([Security.AccessControl.FileSystemAccessRule]::new([Security.Principal.SecurityIdentifier]::new('S-1-5-32-545'), 'Modify', 'ContainerInherit, ObjectInherit', 'None', 'Allow'))
+        [IO.FileSystemAclExtensions]::SetAccessControl([IO.DirectoryInfo]::new($package), $security)
+        $text = @(& $script:Module { param($r, $s) Test-ExlPackageFolderSecurity -Root $r -Elevated $true -StopAt $s } $package $top)
+        $text.Count | Should -Be 1
+        $events = @(Get-Captured | Where-Object Id -eq 2001)
+        $events.Count | Should -Be 1
+        $events[0].Level | Should -Be 'Warning'
+        $events[0].Message | Should -Match '^Package folder: the security identifier S-1-5-32-545 can change the package folder '
+        $events[0].Message | Should -Match ([regex]::Escape($package))
+    }
+
+    It 'writes 2003 when the discovery helper starts with Bypass' {
+        Set-ExlEventLog -Enabled $true
+        Mock -ModuleName ExchangeLogReport Get-ExlHelperLaunch { [pscustomobject]@{ Bypass = $true; Refuse = $false; Reason = 'PolicyBlocks'; Warning = 'blocked' } }
+        Mock -ModuleName ExchangeLogReport Get-ExlHelperArguments { @('-NoLogo', '-NoProfile', '-NonInteractive', '-Command', 'exit 3') }
+        { & $script:Module { Get-ExlExchangeSettings -ConnectTo 'exch.invalid' -Warn { param($t) } } } | Should -Throw
+        $events = @(Get-Captured | Where-Object Id -eq 2003)
+        $events.Count | Should -Be 1
+        $events[0].Level | Should -Be 'Warning'
+        $events[0].Message | Should -Match 'ExecutionPolicy Bypass'
+    }
+
+    It 'writes 4000 and 4001 around the portal, which stops by itself when idle' {
+        Set-ExlEventLog -Enabled $true
+        $watch = [Diagnostics.Stopwatch]::StartNew()
+        $ready = Join-Path $TestDrive 'eventlog-portal.json'
+        Start-ExlServe -DatabasePath $script:Settings.Storage.DatabasePath -NoBrowser -Port 0 -ReadyFile $ready -IdleMinutes 0.03 -EventLog -DevelopmentMode 6>$null
+        $watch.Elapsed.TotalSeconds | Should -BeLessThan 60
+        $events = @(Get-Captured)
+        @($events | ForEach-Object Id) | Should -Be @(4000, 4001)
+        $events[0].Message | Should -Match 'idle limit 0\.03 minute'
+        Test-Path -LiteralPath $ready | Should -BeFalse
+    }
+
+    It 'documents every event id that the code writes, once, with its level' {
+        $table = [regex]::Matches((Get-Content -LiteralPath (Join-Path $script:Root 'ExchangeLogReport.psm1') -Raw), '(?m)^#\s+(\d{4}) (Information|Warning|Error)')
+        $documented = @($table | ForEach-Object { $_.Groups[1].Value })
+        $expected = @('1000', '1001', '2000', '2001', '2002', '2003', '3000', '3001', '4000', '4001')
+        @($documented | Sort-Object) | Should -Be $expected
+        $used = foreach ($relative in 'ExchangeLogReport.psm1', 'Invoke-ExchangeLogReport.ps1', 'src\Test-PackageIntegrity.ps1') {
+            $text = Get-Content -LiteralPath (Join-Path $script:Root $relative) -Raw
+            [regex]::Matches($text, 'Write-ExlEvent (\d{4}) ') | ForEach-Object { $_.Groups[1].Value }
+            [regex]::Matches($text, 'EventLogEntryType\]::Error, (\d{4})') | ForEach-Object { $_.Groups[1].Value }
+        }
+        @($used | Sort-Object -Unique) | Should -Be $expected
+    }
+}
+
+Describe 'Report retention' {
+    BeforeAll {
+        function New-ReportFolder($Root, [string]$Name, $Created, [switch]$NoMark) {
+            $folder = Join-Path $Root $Name
+            [void][IO.Directory]::CreateDirectory($folder)
+            [IO.File]::WriteAllText((Join-Path $folder 'ExchangeLogs.html'), 'report')
+            if (-not $NoMark) { [IO.File]::WriteAllText((Join-Path $folder '.exl-report'), "Exchange Log Report: report folder`r`nCreated=$($Created.ToString('yyyy-MM-ddTHH:mm:ssZ'))`r`n") }
+            $folder
+        }
+        function Invoke-Retention($Settings, $Now) {
+            $log = Start-ExlLog -Directory (Join-Path $TestDrive ('retention-log-' + [guid]::NewGuid().ToString('N').Substring(0, 6)))
+            try { $console = & { & (Get-Module ExchangeLogReport) { param($s, $n) Invoke-ExlReportRetention -Settings $s -Now $n } $Settings $Now } 6>&1 | Out-String } finally { Stop-ExlLog }
+            [pscustomobject]@{ Console = $console; Log = (Get-Content -LiteralPath $log -Raw) }
+        }
+        $script:Now = [datetime]::new(2026, 11, 18, 12, 0, 0, [DateTimeKind]::Utc)
+        $script:Old = 'ExchangeLogs_Detailed_20260101-0000_20260108-0000_101500_0123abcd'
+    }
+
+    It 'is off by default, and takes a number of days from 0 to 36500' {
+        (Import-ExlConfiguration -Path (Join-Path $script:Root 'config\ExchangeLogReport.config.psd1') -Root $script:Root).Report.RetentionDays | Should -Be 0
+        $cfg = New-TestConfig (Join-Path $TestDrive 'retention-config')
+        [IO.File]::WriteAllText($cfg, [IO.File]::ReadAllText($cfg).Replace('RetentionDays         = 0 ', 'RetentionDays         = 30 '))
+        (Import-ExlConfiguration -Path $cfg -Root $script:Root).Report.RetentionDays | Should -Be 30
+        [IO.File]::WriteAllText($cfg, [IO.File]::ReadAllText($cfg).Replace('RetentionDays         = 30 ', 'RetentionDays         = -1 '))
+        { Import-ExlConfiguration -Path $cfg -Root $script:Root } | Should -Throw '*Report.RetentionDays must be a whole number between 0 and 36500*'
+    }
+
+    It 'removes only the old folders that this tool created, and logs each removal' {
+        $dir = Join-Path $TestDrive 'retention-main'
+        $s = Import-ExlConfiguration -Path (New-TestConfig $dir) -Root $script:Root
+        $s.Report.RetentionDays = 30
+        $root = $s.Report.OutputPath
+        $old = New-ReportFolder $root $script:Old $script:Now.AddDays(-40)
+        $fresh = New-ReportFolder $root 'ExchangeLogs_Usage_20261101-0000_20261108-0000_101500_89abcdef' $script:Now.AddDays(-5)
+        $edge = New-ReportFolder $root 'ExchangeLogs_EdgeUsage_20260101-0000_20260108-0000_alice_101500_00112233' $script:Now.AddDays(-90)
+        $unmarked = New-ReportFolder $root 'ExchangeLogs_Usage_20250101-0000_20250108-0000_101500_aaaaaaaa' $script:Now.AddDays(-400) -NoMark
+        $other = New-ReportFolder $root 'Documents-of-the-team' $script:Now.AddDays(-400)
+        $prefix = New-ReportFolder $root 'Other_Usage_20250101-0000_20250108-0000_101500_bbbbbbbb' $script:Now.AddDays(-400)
+        $bad = New-ReportFolder $root 'ExchangeLogs_Usage_20250101-0000_20250108-0000_101500_ABCDEFGH' $script:Now.AddDays(-400)
+        $unreadable = New-ReportFolder $root 'ExchangeLogs_Usage_20250101-0000_20250108-0000_101500_cccccccc' $script:Now.AddDays(-400)
+        [IO.File]::WriteAllText((Join-Path $unreadable '.exl-report'), 'no date here')
+        $run = Invoke-Retention $s $script:Now
+        foreach ($gone in $old, $edge) { Test-Path -LiteralPath $gone | Should -BeFalse }
+        foreach ($kept in $fresh, $unmarked, $other, $prefix, $bad, $unreadable) { Test-Path -LiteralPath $kept | Should -BeTrue }
+        $run.Log | Should -Match ([regex]::Escape("Report folder removed: $script:Old (created 2026-10-09, Report.RetentionDays 30)."))
+        $run.Console | Should -Match 'Report folder removed: ExchangeLogs_EdgeUsage_'
+        $run.Log | Should -Match 'Report.RetentionDays: 1 report folder\(s\) without the mark of this tool are never removed.'
+        ([regex]::Matches($run.Log, 'Report folder removed')).Count | Should -Be 2
+    }
+
+    It 'removes nothing when the limit is 0, and the age is the date of the mark, not of the folder' {
+        $dir = Join-Path $TestDrive 'retention-zero'
+        $s = Import-ExlConfiguration -Path (New-TestConfig $dir) -Root $script:Root
+        $old = New-ReportFolder $s.Report.OutputPath $script:Old $script:Now.AddDays(-400)
+        (Invoke-Retention $s $script:Now).Log | Should -Not -Match 'removed'
+        Test-Path -LiteralPath $old | Should -BeTrue
+        $s.Report.RetentionDays = 30
+        (Get-Item -LiteralPath $old).LastWriteTimeUtc = $script:Now.AddDays(-1)
+        Invoke-Retention $s $script:Now | Out-Null
+        Test-Path -LiteralPath $old | Should -BeFalse
+    }
+
+    It 'never follows a reparse point: a junction in a report folder is a reason to keep it, a junction named like one is left alone' {
+        $dir = Join-Path $TestDrive 'retention-links'
+        $s = Import-ExlConfiguration -Path (New-TestConfig $dir) -Root $script:Root
+        $s.Report.RetentionDays = 30
+        $root = $s.Report.OutputPath
+        $target = Join-Path $TestDrive 'retention-target'
+        [void][IO.Directory]::CreateDirectory($target)
+        [IO.File]::WriteAllText((Join-Path $target 'precious.txt'), 'keep')
+        $inside = New-ReportFolder $root 'ExchangeLogs_Usage_20250101-0000_20250108-0000_101500_dddddddd' $script:Now.AddDays(-400)
+        New-Item -ItemType Junction -Path (Join-Path $inside 'link') -Target $target | Out-Null
+        $named = Join-Path $root 'ExchangeLogs_Usage_20250101-0000_20250108-0000_101500_eeeeeeee'
+        New-Item -ItemType Junction -Path $named -Target $target | Out-Null
+        [IO.File]::WriteAllText((Join-Path $target '.exl-report'), "Created=2020-01-01T00:00:00Z`r`n")
+        $run = Invoke-Retention $s $script:Now
+        Test-Path -LiteralPath $inside | Should -BeTrue
+        Test-Path -LiteralPath $named | Should -BeTrue
+        Test-Path -LiteralPath (Join-Path $target 'precious.txt') | Should -BeTrue
+        $run.Console | Should -Match 'holds a reparse point: it is not removed'
+        [IO.Directory]::Delete((Join-Path $inside 'link')); [IO.Directory]::Delete($named)
+    }
+
+    It 'marks every folder a report is written to' {
+        $store = Open-ExlStore -Settings $script:Settings -ReadOnly
+        try { $report = New-ExlReport -Store $store -Settings $script:Settings -Period ([pscustomobject]@{ StartMs = $script:Base.AddHours(-1).ToUnixTimeMilliseconds(); EndMs = $script:Base.AddHours(2).ToUnixTimeMilliseconds() }) -ReportType Usage -IncludeRoutingDetails $false } finally { $store.Dispose() }
+        $mark = Join-Path $report.Folder '.exl-report'
+        Test-Path -LiteralPath $mark | Should -BeTrue
+        (Get-Content -LiteralPath $mark -Raw) | Should -Match '(?m)^Created=\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ\r?$'
+        (Split-Path $report.Folder -Leaf) | Should -Match '^ExchangeLogs_Usage_\d{8}-\d{4}_\d{8}-\d{4}_\d{6}_[0-9a-f]{8}$'
+    }
+
+    It 'recognises its folders whatever the case of the report type and of the file prefix' {
+        $dir = Join-Path $TestDrive 'retention-case'
+        $s = Import-ExlConfiguration -Path (New-TestConfig $dir) -Root $script:Root
+        $s.Report.RetentionDays = 30
+        $root = $s.Report.OutputPath
+        $old = $script:Now.AddDays(-60)
+        $gone = @(
+            New-ReportFolder $root 'ExchangeLogs_detailed_20260101-0000_20260108-0000_101500_0123abcd' $old
+            New-ReportFolder $root 'ExchangeLogs_usage_20260101-0000_20260108-0000_101500_0123abce' $old
+            New-ReportFolder $root 'exchangelogs_Edgeusage_20260101-0000_20260108-0000_101500_0123ABCF' $old
+            New-ReportFolder $root 'EXCHANGELOGS_DETAILED_20260101-0000_20260108-0000_alice_101500_0123abd0' $old)
+        $kept = @(
+            New-ReportFolder $root 'ExchangeLogs_detailed_20261117-0000_20261118-0000_101500_0123abd1' $script:Now.AddDays(-1)
+            New-ReportFolder $root 'ExchangeLogs_detailed_20260101-0000_20260108-0000_101500_0123abdg' $old)
+        Invoke-Retention $s $script:Now | Out-Null
+        foreach ($f in $gone) { Test-Path -LiteralPath $f | Should -BeFalse -Because (Split-Path $f -Leaf) }
+        foreach ($f in $kept) { Test-Path -LiteralPath $f | Should -BeTrue -Because (Split-Path $f -Leaf) }
+    }
+
+    It 'removes the folder of a report written with -ReportType detailed and Report.DefaultType usage in lower case, named with the canonical type' {
+        $cfg = New-TestConfig (Join-Path $TestDrive 'retention-written') @{ "DefaultType           = 'Usage'" = "DefaultType           = 'usage'" }
+        $s = Import-ExlConfiguration -Path $cfg -Root $script:Root
+        $s.Report.DefaultType | Should -BeExactly 'usage'
+        $s.Report.RetentionDays = 30
+        $period = [pscustomobject]@{ StartMs = $script:Base.AddHours(-1).ToUnixTimeMilliseconds(); EndMs = $script:Base.AddHours(2).ToUnixTimeMilliseconds() }
+        $store = Open-ExlStore -Settings $script:Settings -ReadOnly
+        try {
+            $detailed = New-ExlReport -Store $store -Settings $s -Period $period -ReportType detailed -IncludeRoutingDetails $false
+            $usage = New-ExlReport -Store $store -Settings $s -Period $period -ReportType $s.Report.DefaultType -IncludeRoutingDetails $false
+        } finally { $store.Dispose() }
+        (Split-Path $detailed.Folder -Leaf) | Should -MatchExactly '^ExchangeLogs_Detailed_\d{8}-\d{4}_\d{8}-\d{4}_\d{6}_[0-9a-f]{8}$'
+        (Split-Path $usage.Folder -Leaf) | Should -MatchExactly '^ExchangeLogs_Usage_\d{8}-\d{4}_\d{8}-\d{4}_\d{6}_[0-9a-f]{8}$'
+        Invoke-Retention $s ([datetime]::UtcNow.AddDays(45)) | Out-Null
+        Test-Path -LiteralPath $detailed.Folder | Should -BeFalse
+        Test-Path -LiteralPath $usage.Folder | Should -BeFalse
+    }
+
+    It 'removes a folder that holds no link, and keeps one that holds a symbolic link' {
+        $dir = Join-Path $TestDrive 'retention-symlink'
+        $s = Import-ExlConfiguration -Path (New-TestConfig $dir) -Root $script:Root
+        $s.Report.RetentionDays = 30
+        $plain = New-ReportFolder $s.Report.OutputPath 'ExchangeLogs_Usage_20260101-0000_20260108-0000_101500_0123abc1' $script:Now.AddDays(-60)
+        $linked = New-ReportFolder $s.Report.OutputPath 'ExchangeLogs_Usage_20260101-0000_20260108-0000_101500_0123abc2' $script:Now.AddDays(-60)
+        $target = Join-Path $TestDrive 'retention-symlink-target.txt'
+        [IO.File]::WriteAllText($target, 'x')
+        try { [void](New-Item -ItemType SymbolicLink -Path (Join-Path $linked 'link.txt') -Target $target -ErrorAction Stop) }
+        catch { Set-ItResult -Skipped -Because 'this account cannot create a symbolic link'; return }
+        $run = Invoke-Retention $s $script:Now
+        Test-Path -LiteralPath $plain | Should -BeFalse
+        Test-Path -LiteralPath $linked | Should -BeTrue
+        $run.Console | Should -Match 'holds a reparse point: it is not removed'
+        [IO.File]::Delete((Join-Path $linked 'link.txt'))
+    }
+}
+
+Describe 'Zone of the discovery helper' {
+    BeforeAll {
+        $script:Module = Get-Module ExchangeLogReport
+        $script:Pinned = & $script:Module { $script:OwnerThumbprint }
+        function Get-Zone([string]$Path) { & $script:Module { param($p) Get-ExlZoneId -Path $p } $Path }
+        function Get-UrlZone([string]$Path) { & $script:Module { param($p) Get-ExlUrlZone -Path $p } $Path }
+    }
+
+    It 'maps a path to the zone that Windows applies to it, never nearer for a name with dots or an address than for a short name' {
+        Get-UrlZone "$env:SystemRoot\notepad.exe" | Should -Be 0
+        $short = Get-UrlZone '\\server\share\ELR\src\Get-ExlExchangeSettings.ps1'
+        $fqdn = Get-UrlZone '\\server.contoso.com\share\ELR\src\Get-ExlExchangeSettings.ps1'
+        $address = Get-UrlZone '\\10.1.2.3\share\ELR\src\Get-ExlExchangeSettings.ps1'
+        $short | Should -BeIn 0, 1, 2, 3
+        $fqdn | Should -BeGreaterOrEqual $short
+        $address | Should -BeGreaterOrEqual $short
+        $fqdn | Should -BeIn 1, 2, 3
+        $address | Should -BeIn 1, 2, 3
+    }
+
+    It 'gives a local file zone 0, and the larger of the mark and of the place for a file that carries a mark' {
+        $file = Join-Path $TestDrive 'zone-local.ps1'
+        [IO.File]::WriteAllText($file, "'x'")
+        Get-Zone $file | Should -Be 0
+        Set-Content -LiteralPath $file -Stream Zone.Identifier -Value "[ZoneTransfer]`r`nZoneId=3"
+        Get-Zone $file | Should -Be 3
+        Set-Content -LiteralPath $file -Stream Zone.Identifier -Value "[ZoneTransfer]`r`nZoneId=1"
+        Get-Zone $file | Should -Be 1
+    }
+
+    It 'takes <Name> as zone <Zone>' -ForEach @(
+        @{ Name = 'a UNC path with a fully qualified name'; Path = '\\files.contoso.com\elr\package\src\Get-ExlExchangeSettings.ps1'; Mapped = 3; Zone = 3 }
+        @{ Name = 'a UNC path with an IP address'; Path = '\\10.1.2.3\elr\package\src\Get-ExlExchangeSettings.ps1'; Mapped = 3; Zone = 3 }
+        @{ Name = 'a UNC path with a short name'; Path = '\\files\elr\package\src\Get-ExlExchangeSettings.ps1'; Mapped = 1; Zone = 1 }
+        @{ Name = 'a local path'; Path = 'C:\Tools\ELR\src\Get-ExlExchangeSettings.ps1'; Mapped = 0; Zone = 0 }
+    ) {
+        Mock -ModuleName ExchangeLogReport Get-ExlUrlZone ([scriptblock]::Create("$Mapped"))
+        Mock -ModuleName ExchangeLogReport Get-ExlZoneMark { '' }
+        Get-Zone $Path | Should -Be $Zone
+        $asked = $Path
+        Should -Invoke -ModuleName ExchangeLogReport Get-ExlUrlZone -ParameterFilter ({ $Path -ceq $asked }).GetNewClosure() -Times 1 -Exactly
+    }
+
+    It 'resolves a mapped drive to its UNC path before asking for the zone' {
+        Mock -ModuleName ExchangeLogReport Resolve-ExlDrivePath { '\\files.contoso.com\elr' }
+        Mock -ModuleName ExchangeLogReport Get-ExlUrlZone { 3 }
+        Mock -ModuleName ExchangeLogReport Get-ExlZoneMark { '' }
+        Get-Zone 'Z:\package\src\Get-ExlExchangeSettings.ps1' | Should -Be 3
+        Should -Invoke -ModuleName ExchangeLogReport Get-ExlUrlZone -ParameterFilter { $Path -ceq '\\files.contoso.com\elr\package\src\Get-ExlExchangeSettings.ps1' } -Times 1 -Exactly
+        Should -Invoke -ModuleName ExchangeLogReport Resolve-ExlDrivePath -ParameterFilter { $Drive -ceq 'Z:' } -Times 1 -Exactly
+    }
+
+    It 'leaves the drive of this computer as it is' {
+        & $script:Module { Resolve-ExlDrivePath -Drive 'C:' } | Should -BeNullOrEmpty
+    }
+
+    It 'does not know the zone when the place cannot be mapped, and a file from the Internet is then still from the Internet' {
+        $file = Join-Path $TestDrive 'zone-unknown.ps1'
+        [IO.File]::WriteAllText($file, "'x'")
+        foreach ($failure in { -1 }, { throw 'urlmon is not available' }) {
+            Mock -ModuleName ExchangeLogReport Get-ExlUrlZone $failure
+            Get-Zone $file | Should -BeNullOrEmpty
+        }
+        Set-Content -LiteralPath $file -Stream Zone.Identifier -Value "[ZoneTransfer]`r`nZoneId=3"
+        Get-Zone $file | Should -Be 3
+    }
+
+    It 'predicts Unknown, and so guards the launch with Bypass, when the zone is not known, and has the fallback ready' {
+        Mock -ModuleName ExchangeLogReport Get-ExlFileSignature ([scriptblock]::Create("[pscustomobject]@{ Status = 'Valid'; SignerCertificate = [pscustomobject]@{ Thumbprint = '$($script:Pinned)' }; TimeStamperCertificate = 'stamp' }"))
+        Mock -ModuleName ExchangeLogReport Get-ExlManifestFileState { 'Accepted' }
+        Mock -ModuleName ExchangeLogReport Get-ExlZoneId { $null }
+        Mock -ModuleName ExchangeLogReport Test-ExlTrustedPublisher { $false }
+        Mock -ModuleName ExchangeLogReport Get-ExlWindowsPowerShellPolicy { 'RemoteSigned' }
+        $launch = & $script:Module { Get-ExlHelperLaunch -Path 'helper.ps1' }
+        $launch.Reason | Should -Be 'PolicyUnknown'
+        $launch.Bypass | Should -BeTrue
+        $launch.Warning | Should -Match 'Unblock-File'
+        $launch.Fallback.Reason | Should -Be 'PolicyBlocks'
+        $launch.Fallback.Bypass | Should -BeTrue
+    }
+
+    It 'predicts from the zone of a UNC path with a host name as a policy that blocks, and of a short name as one that allows' {
+        Mock -ModuleName ExchangeLogReport Get-ExlFileSignature ([scriptblock]::Create("[pscustomobject]@{ Status = 'Valid'; SignerCertificate = [pscustomobject]@{ Thumbprint = '$($script:Pinned)' }; TimeStamperCertificate = 'stamp' }"))
+        Mock -ModuleName ExchangeLogReport Get-ExlManifestFileState { 'Accepted' }
+        Mock -ModuleName ExchangeLogReport Test-ExlTrustedPublisher { $false }
+        Mock -ModuleName ExchangeLogReport Get-ExlWindowsPowerShellPolicy { 'RemoteSigned' }
+        Mock -ModuleName ExchangeLogReport Get-ExlZoneMark { '' }
+        foreach ($case in @(@{ Zone = 3; Bypass = $true }, @{ Zone = 1; Bypass = $false })) {
+            Mock -ModuleName ExchangeLogReport Get-ExlUrlZone ([scriptblock]::Create("$($case.Zone)"))
+            (& $script:Module { Get-ExlHelperLaunch -Path '\\files\elr\package\src\Get-ExlExchangeSettings.ps1' }).Bypass | Should -Be $case.Bypass
+        }
+    }
+}
+
+Describe 'Discovery helper refused by the policy' {
+    BeforeAll { $script:Module = Get-Module ExchangeLogReport }
+    BeforeEach {
+        $global:ExlTestEvents = [Collections.Generic.List[object]]::new()
+        $global:ExlTestWarnings = [Collections.Generic.List[string]]::new()
+        Mock -ModuleName ExchangeLogReport Write-ExlEventEntry { $global:ExlTestEvents.Add([pscustomobject]@{ Id = $Id; Level = $Level }) }
+        Mock -ModuleName ExchangeLogReport Get-ExlExecutionPolicyGroupScope { @() }
+        Mock -ModuleName ExchangeLogReport Get-ExlHelperArguments {
+            if ($Launch.Bypass) { @('-NoLogo', '-NoProfile', '-Command', "Set-Content -LiteralPath '$OutFile' -Value '{ ""Servers"": [] }'; exit 0 #") }
+            else { @('-NoLogo', '-NoProfile', '-Command', ($global:ExlTestRefusal + '; exit 1 #')) }
+        }
+        & $script:Module { $script:EventLogEnabled = $true }
+    }
+    AfterEach {
+        & $script:Module { $script:EventLogEnabled = $false }
+        Remove-Variable ExlTestEvents, ExlTestWarnings, ExlTestRefusal -Scope Global -ErrorAction SilentlyContinue
+    }
+
+    It 'starts the helper again once with the guarded Bypass when the policy refuses it, recognised by its error id and not by the language of its message' -ForEach @(
+        @{ Refusal = "[Console]::Error.WriteLine('+ FullyQualifiedErrorId : UnauthorizedAccess')" }
+        @{ Refusal = "[Console]::Error.WriteLine('+ CategoryInfo          : Erreur de securite : (:) [], PSSecurityException')" }
+    ) {
+        $global:ExlTestRefusal = $Refusal
+        Mock -ModuleName ExchangeLogReport Get-ExlHelperLaunch ([scriptblock]::Create('[pscustomobject]@{ Bypass = $false; Refuse = $false; Reason = ''PolicyAllows''; Warning = $null; Fallback = [pscustomobject]@{ Bypass = $true; Refuse = $false; Reason = ''PolicyBlocks''; Warning = ''Guarded fallback warning.'' } }'))
+        $result = & $script:Module { Get-ExlExchangeSettings -ConnectTo 'exch.invalid' -Warn { param($t) $global:ExlTestWarnings.Add($t) } }
+        @($result.Servers).Count | Should -Be 0
+        $global:ExlTestWarnings.Count | Should -Be 1
+        $global:ExlTestWarnings[0] | Should -Be 'Guarded fallback warning.'
+        @($global:ExlTestEvents | Where-Object Id -eq 2003).Count | Should -Be 1
+    }
+
+    It 'does not start it again for another failure, nor when the fallback is not allowed' -ForEach @(
+        @{ Refusal = "[Console]::Error.WriteLine('The Exchange cmdlets are not available')"; Allowed = '$true' }
+        @{ Refusal = "[Console]::Error.WriteLine('+ FullyQualifiedErrorId : UnauthorizedAccess')"; Allowed = '$false' }
+    ) {
+        $global:ExlTestRefusal = $Refusal
+        Mock -ModuleName ExchangeLogReport Get-ExlHelperLaunch ([scriptblock]::Create("[pscustomobject]@{ Bypass = `$false; Refuse = `$false; Reason = 'PolicyAllows'; Warning = `$null; Fallback = [pscustomobject]@{ Bypass = $Allowed; Refuse = `$false; Reason = 'PolicyBlocks'; Warning = 'Guarded fallback warning.' } }"))
+        { & $script:Module { Get-ExlExchangeSettings -ConnectTo 'exch.invalid' -Warn { param($t) $global:ExlTestWarnings.Add($t) } } } | Should -Throw
+        $global:ExlTestWarnings.Count | Should -Be 0
+        @($global:ExlTestEvents | Where-Object Id -eq 2003).Count | Should -Be 0
+    }
+
+    It 'does not start it again under a policy set by Group Policy found after the refusal, and says what to do' {
+        $global:ExlTestRefusal = "[Console]::Error.WriteLine('+ FullyQualifiedErrorId : UnauthorizedAccess')"
+        Mock -ModuleName ExchangeLogReport Get-ExlExecutionPolicyGroupScope { @('MachinePolicy') }
+        Mock -ModuleName ExchangeLogReport Get-ExlHelperLaunch ([scriptblock]::Create('[pscustomobject]@{ Bypass = $false; Refuse = $false; Reason = ''PolicyAllows''; Warning = $null; Fallback = [pscustomobject]@{ Bypass = $true; Refuse = $false; Reason = ''PolicyBlocks''; Warning = ''Guarded fallback warning.'' } }'))
+        { & $script:Module { Get-ExlExchangeSettings -ConnectTo 'exch.invalid' -Warn { param($t) $global:ExlTestWarnings.Add($t) } } } | Should -Throw '*set by Group Policy (MachinePolicy)*'
+        $global:ExlTestWarnings.Count | Should -Be 0
+        @($global:ExlTestEvents | Where-Object Id -eq 2003).Count | Should -Be 0
+    }
+
+    It 'ends with the message of a Group Policy when the helper that was started under it is refused, with no Bypass and no event 2003' {
+        $global:ExlTestRefusal = "[Console]::Error.WriteLine('+ CategoryInfo          : Erreur de securite : (:) [], PSSecurityException')"
+        Mock -ModuleName ExchangeLogReport Get-ExlHelperLaunch ([scriptblock]::Create('[pscustomobject]@{ Bypass = $false; Refuse = $false; Reason = ''GroupPolicy''; Warning = ''The execution policy of this computer is set by Group Policy (UserPolicy): warned.''; Policy = ''AllSigned''; GroupPolicyScope = @(''UserPolicy''); Fallback = [pscustomobject]@{ Bypass = $false; Refuse = $false; Reason = ''GroupPolicy''; Warning = ''x'' } }'))
+        { & $script:Module { Get-ExlExchangeSettings -ConnectTo 'exch.invalid' -Warn { param($t) $global:ExlTestWarnings.Add($t) } } } | Should -Throw '*cannot start its helper*set by Group Policy (UserPolicy)*Servers block*'
+        $global:ExlTestWarnings.Count | Should -Be 1
+        $global:ExlTestWarnings[0] | Should -Match 'warned'
+        @($global:ExlTestEvents | Where-Object Id -eq 2003).Count | Should -Be 0
+    }
+
+    It 'does not blame the package, nor start the helper again, when the Exchange Management Shell was refused by the policy' {
+        $global:ExlTestRefusal = "[Console]::Error.WriteLine('Echec de la verification d''AuthorizationManager.'); [Console]::Error.WriteLine('ErrorId: UnauthorizedAccess System.Management.Automation.PSSecurityException')"
+        Mock -ModuleName ExchangeLogReport Get-ExlHelperLaunch ([scriptblock]::Create('[pscustomobject]@{ Bypass = $false; Refuse = $false; Reason = ''PolicyAllows''; Warning = $null; Policy = ''AllSigned''; Fallback = [pscustomobject]@{ Bypass = $true; Refuse = $false; Reason = ''PolicyBlocks''; Warning = ''Guarded fallback warning.'' } }'))
+        $failure = $null
+        try { & $script:Module { Get-ExlExchangeSettings -ConnectTo 'exch.invalid' -Warn { param($t) $global:ExlTestWarnings.Add($t) } } } catch { $failure = $_.Exception.Message }
+        $failure | Should -Match 'Exchange Management Shell was refused by the execution policy'
+        $failure | Should -Match 'Echec de la verification d''AuthorizationManager'
+        $failure | Should -Not -Match 'ErrorId:|Unblock-File|trusted publisher'
+        $global:ExlTestWarnings.Count | Should -Be 0
+        @($global:ExlTestEvents | Where-Object Id -eq 2003).Count | Should -Be 0
+    }
+
+    It 'says that AllSigned is not supported for the discovery when the helper fails under it for another reason' {
+        $global:ExlTestRefusal = "[Console]::Error.WriteLine('Errors occurred while loading the format data file'); [Console]::Error.WriteLine('ErrorId: RuntimeException System.Management.Automation.RuntimeException')"
+        Mock -ModuleName ExchangeLogReport Get-ExlHelperLaunch ([scriptblock]::Create('[pscustomobject]@{ Bypass = $false; Refuse = $false; Reason = ''PolicyAllows''; Warning = $null; Policy = ''AllSigned''; Fallback = [pscustomobject]@{ Bypass = $false; Refuse = $false; Reason = ''NotEligible''; Warning = ''x'' } }'))
+        { & $script:Module { Get-ExlExchangeSettings -ConnectTo 'exch.invalid' -Warn { param($t) $global:ExlTestWarnings.Add($t) } } } | Should -Throw '*loading the format data file*AllSigned, which is not supported for -Mode Discover*'
+    }
+}
+
+Describe 'Failure messages' {
+    BeforeAll {
+        $script:Module = Get-Module ExchangeLogReport
+        function Resolve-Failure([Exception]$Exception, [string]$Path) { & $script:Module { param($e, $p) Resolve-ExlFailureMessage -Exception $e -DatabasePath $p } $Exception $Path }
+    }
+
+    It 'says that the volume of the database is full for SQLite error 13, wrapped as PowerShell wraps a constructor failure, in any language' -ForEach @(
+        @{ Code = 13 }
+        @{ Code = 13 -bor (3 -shl 8) }
+    ) {
+        $inner = [Microsoft.Data.Sqlite.SqliteException]::new('SQLite Error 13: ''la base de donnees est pleine''.', $Code)
+        $wrapped = [Management.Automation.MethodInvocationException]::new('Exception calling ".ctor" with "3" argument(s)', $inner)
+        $text = Resolve-Failure $wrapped 'D:\ELR\data\ExchangeLogs.sqlite'
+        $text | Should -Match '^The volume that holds the database is full \(D:\\ELR\\data\\ExchangeLogs\.sqlite\)\. Free some space on it and run again'
+        $text | Should -Match 'the database is not damaged and the next run resumes where this one stopped'
+        $text | Should -Not -Match 'pleine|ctor'
+    }
+
+    It 'says that the disk is full for the Windows errors ERROR_DISK_FULL and ERROR_HANDLE_DISK_FULL, by HRESULT and not by message' -ForEach @(
+        @{ HResult = -2147024784 }
+        @{ HResult = -2147024857 }
+    ) {
+        $text = Resolve-Failure ([IO.IOException]::new('Espace insuffisant sur le disque.', $HResult)) ''
+        $text | Should -Match '^The disk is full: a file could not be written\. Free some space'
+        $text | Should -Not -Match 'insuffisant'
+    }
+
+    It 'keeps every other failure as it is, whatever its words' {
+        (Resolve-Failure ([IO.IOException]::new('There is not enough space on the disk.', -2147024891)) '') | Should -BeExactly 'There is not enough space on the disk.'
+        (Resolve-Failure ([Microsoft.Data.Sqlite.SqliteException]::new('SQLite Error 5: ''database is locked''.', 5)) 'x') | Should -BeExactly 'SQLite Error 5: ''database is locked''.'
+        (Resolve-Failure ([InvalidOperationException]::new('plain')) '') | Should -BeExactly 'plain'
+    }
+
+    It 'reports a full disk of the entry script as an error with exit code 1, from the same function' {
+        $entry = [IO.File]::ReadAllText((Join-Path $script:Root 'Invoke-ExchangeLogReport.ps1'))
+        $entry | Should -Match 'Resolve-ExlFailureMessage -Exception \$_\.Exception -DatabasePath'
+        (Import-PowerShellDataFile -LiteralPath (Join-Path $script:Root 'ExchangeLogReport.psd1')).FunctionsToExport | Should -Contain 'Resolve-ExlFailureMessage'
+    }
+}
+
+Describe 'Credential file written by another account' {
+    BeforeAll {
+        $script:Module = Get-Module ExchangeLogReport
+        $script:Writer = 'S-1-5-20'
+        $script:WriterName = [Security.Principal.SecurityIdentifier]::new($script:Writer).Translate([Security.Principal.NTAccount]).Value
+        function New-CredentialFile([string]$Name, [string[]]$Sids, [string]$WrittenBy, [switch]$Inherit) {
+            $dir = Join-Path $TestDrive $Name
+            [void][IO.Directory]::CreateDirectory($dir)
+            $path = Join-Path $dir 'mail.credential'
+            [IO.File]::WriteAllText($path, (@{ Tool = 'Exchange Log Report'; UserName = 'CONTOSO\svc'; Scope = 'Computer'; Password = 'AA=='; WrittenBy = $WrittenBy; Computer = 'X'; Written = '2026-11-01' } | ConvertTo-Json))
+            $security = [IO.FileSystemAclExtensions]::GetAccessControl([IO.FileInfo]::new($path))
+            $security.SetAccessRuleProtection(-not $Inherit, $false)
+            foreach ($rule in @($security.GetAccessRules($true, $false, [Security.Principal.SecurityIdentifier]))) { [void]$security.RemoveAccessRule($rule) }
+            foreach ($sid in $Sids) { $security.AddAccessRule([Security.AccessControl.FileSystemAccessRule]::new([Security.Principal.SecurityIdentifier]::new($sid), 'FullControl', 'Allow')) }
+            $security.AddAccessRule([Security.AccessControl.FileSystemAccessRule]::new([Security.Principal.WindowsIdentity]::GetCurrent().User, 'FullControl', 'Allow'))
+            [IO.FileSystemAclExtensions]::SetAccessControl([IO.FileInfo]::new($path), $security)
+            return $path
+        }
+        function Get-Problems([string]$Path) { @(& $script:Module { param($p) Test-ExlCredentialFileAccess -Path $p } $Path) }
+    }
+
+    It 'expects SYSTEM, the administrators and the account that wrote the file, whichever account reads it, and warns about nothing else' {
+        $path = New-CredentialFile 'cred-writer' @('S-1-5-18', 'S-1-5-32-544', $script:Writer) $script:WriterName
+        Get-Problems $path | Should -BeNullOrEmpty
+    }
+
+    It 'warns about another security identifier, and names it by SID' {
+        $path = New-CredentialFile 'cred-extra' @('S-1-5-18', 'S-1-5-32-544', $script:Writer, 'S-1-5-11') $script:WriterName
+        $problems = @(Get-Problems $path)
+        $problems.Count | Should -Be 1
+        $problems[0] | Should -Match 'S-1-5-11'
+        $problems[0] | Should -Not -Match 'S-1-5-20'
+    }
+
+    It 'warns about the writer when the file does not name a known account, and about an inherited access control' {
+        $unknown = New-CredentialFile 'cred-unknown' @('S-1-5-18', 'S-1-5-32-544', $script:Writer) 'NOBODY\nobody'
+        (Get-Problems $unknown) -join ' ' | Should -Match 'S-1-5-20'
+        $inherited = New-CredentialFile 'cred-inherit' @('S-1-5-18', 'S-1-5-32-544', $script:Writer) $script:WriterName -Inherit
+        (Get-Problems $inherited) -join ' ' | Should -Match 'inherits'
+    }
+
+    It 'is cleared by the advice: the file written again has only the expected access' {
+        $dir = Join-Path $TestDrive 'cred-rewrite'
+        $s = Import-ExlConfiguration -Path (New-TestConfig $dir) -Root $script:Root
+        $s.Mail.CredentialFile = Join-Path $dir 'config\mail.credential'
+        Save-ExlMailCredential -Settings $s -Credential ([pscredential]::new('CONTOSO\svc', (ConvertTo-SecureString 'x' -AsPlainText -Force)))
+        Get-Problems $s.Mail.CredentialFile | Should -BeNullOrEmpty
+        (Get-Content -LiteralPath $s.Mail.CredentialFile -Raw | ConvertFrom-Json).WrittenBy | Should -Not -BeNullOrEmpty
+    }
+}
+
+Describe 'Regular expression time limit under load' {
+    BeforeAll {
+        $script:Seam = [ExchangeLogReport.Collector].GetNestedType('SafeRegex', 'NonPublic')
+        function Get-SeamValue([string]$Name) { $script:Seam.GetField($Name, 'Static,NonPublic').GetValue($null) }
+        function Set-Seam([hashtable]$Values) { foreach ($k in $Values.Keys) { $script:Seam.GetField($k, 'Static,NonPublic').SetValue($null, $Values[$k]) } }
+        $script:SeamDefaults = @{ MatchLimit = (Get-SeamValue 'MatchLimit'); MaxTimeouts = (Get-SeamValue 'MaxTimeouts'); StallAttempts = 0; StallOnly = $null }
+        function Get-Counts($Settings) {
+            $row = (Query $Settings 'SELECT (SELECT COUNT(*) FROM access_usage), (SELECT COALESCE(SUM(requests), 0) FROM access_usage), (SELECT COUNT(*) FROM message_event), (SELECT COUNT(*) FROM smtp_transaction), (SELECT COUNT(*) FROM client_session)')[0]
+            return ($row | ForEach-Object { [string]$_ }) -join ','
+        }
+        function New-ProbeConfig([string]$Name, [int]$Lines) {
+            $dir = Join-Path $TestDrive $Name
+            $cfg = New-TestConfig $dir @{ 'ProbeUserAgentPatterns = @(' = "ProbeUserAgentPatterns = @('^ProbeAgent', " }
+            $rows = foreach ($i in 1..$Lines) {
+                ProxyLine @{ DateTime = (T (30 + $i / 100)); RequestId = [guid]::NewGuid().ToString(); Protocol = 'Mapi'; UrlHost = 'mail.contoso.test'; UrlStem = '/mapi/emsmdb/'
+                    AuthenticationType = 'Negotiate'; IsAuthenticated = $true; AuthenticatedUser = 'CONTOSO\alice'; UserAgent = 'ProbeAgentX'; ClientIpAddress = '10.1.1.10'; ServerHostName = 'EXCH01'
+                    HttpStatus = 200; BackEndStatus = 200; Method = 'POST'; ProxyAction = 'Proxy'; RoutingType = 'IntraForest'; TotalRequestTime = 42 }
+            }
+            Write-Log (Join-Path $dir 'logs-src\EXCH01\Exchange\Logging\HttpProxy\Mapi\HttpProxy_2026100110-1.LOG') (@('#Software: Microsoft Exchange Server', "#Fields: $script:ProxyFields") + $rows)
+            return Import-ExlConfiguration -Path $cfg -Root $script:Root
+        }
+    }
+    AfterEach { Set-Seam $script:SeamDefaults }
+
+    It 'allows a match two seconds, and drops a pattern only after ten timeouts' {
+        $script:SeamDefaults.MatchLimit | Should -Be ([TimeSpan]::FromSeconds(2))
+        $script:SeamDefaults.MaxTimeouts | Should -Be 10
+    }
+
+    It 'stores the same rows when the first attempt of every match times out under load' {
+        $reference = New-ProbeConfig 'stall-reference' 6
+        $stalled = New-ProbeConfig 'stall-stalled' 6
+        $a = Invoke-TestCollection $reference
+        Set-Seam @{ StallAttempts = 1 }
+        $b = Invoke-TestCollection $stalled
+        Set-Seam @{ StallAttempts = 0 }
+        $b.Kept | Should -Be $a.Kept
+        $b.Noise | Should -Be $a.Noise
+        $a.Noise | Should -BeGreaterThan 0
+        @($b.Warnings).Count | Should -Be 0
+        (Get-Counts $stalled) | Should -Be (Get-Counts $reference)
+    }
+
+    It 'does not remember a verdict that came from a timeout: each line is tried again and counted, and the same lines are noise once the stall is over' {
+        $stalled = New-ProbeConfig 'stall-remember' 5
+        Set-Seam @{ StallAttempts = 2; StallOnly = 'ProbeAgentX' }
+        $run = Invoke-TestCollection $stalled
+        Set-Seam @{ StallAttempts = 0; StallOnly = $null }
+        @($run.Warnings).Count | Should -Be 1
+        $run.Warnings[0] | Should -Match '^5 match\(es\) of the regular expressions of Noise\.ProbeUserAgentPatterns exceeded the time limit twice'
+        $run.Warnings[0] | Should -Not -Match 'dropped'
+        $clean = Invoke-TestCollection (New-ProbeConfig 'stall-remember-clean' 5)
+        $clean.Noise | Should -BeGreaterThan $run.Noise
+    }
+
+    It 'drops a pattern that keeps timing out, counts it over the whole run, and says which one' {
+        $s = New-ProbeConfig 'stall-drop' 8
+        Set-Seam @{ StallAttempts = 2; StallOnly = 'ProbeAgentX'; MaxTimeouts = 3 }
+        $run = Invoke-TestCollection $s
+        Set-Seam @{ StallAttempts = 0; StallOnly = $null; MaxTimeouts = 10 }
+        @($run.Warnings).Count | Should -Be 1
+        $run.Warnings[0] | Should -Match '^3 match\(es\) of the regular expressions of Noise\.ProbeUserAgentPatterns exceeded the time limit twice'
+        $run.Warnings[0] | Should -Match 'The expression of Noise\.ProbeUserAgentPatterns was dropped for the rest of this collection: simplify it\.'
+    }
+}
+
+Describe 'Update check of the bundled PowerShell' {
+    It 'is switched off, next to the telemetry opt-out, in every launcher' -ForEach @('Run-Collector.cmd', 'Start-Portal.cmd', 'Database-Storage.cmd') {
+        $text = [IO.File]::ReadAllText((Join-Path $script:Root $_))
+        $text | Should -Match '(?m)^set POWERSHELL_TELEMETRY_OPTOUT=1\r?\nset POWERSHELL_UPDATECHECK=Off\r?$'
+        $text.IndexOf('POWERSHELL_UPDATECHECK=Off') | Should -BeLessThan $text.IndexOf('pwsh.exe')
+    }
+
+    It 'has no other place where the package starts a process or registers a scheduled task: the launchers start pwsh.exe, the portal the browser, the storage audit sqlite3' {
+        $code = foreach ($file in Get-ChildItem -LiteralPath $script:Root -Recurse -File -Include '*.ps1', '*.psm1', '*.cs' | Where-Object { $_.FullName -notmatch '\\(docs|bin|data|logs|reports|powershell|lib)\\' }) {
+            [pscustomobject]@{ Name = $file.FullName.Substring($script:Root.Length + 1); Text = [IO.File]::ReadAllText($file.FullName) }
+        }
+        @($code | Where-Object { $_.Text -match 'Register-ScheduledTask|New-ScheduledTask|schtasks' }).Count | Should -Be 0
+        @($code | Where-Object { $_.Text -match 'Start-Process|ProcessStartInfo' } | ForEach-Object Name | Sort-Object) | Should -Be @('src\Engine.Serve.cs', 'src\Storage.Audit.cs')
     }
 }

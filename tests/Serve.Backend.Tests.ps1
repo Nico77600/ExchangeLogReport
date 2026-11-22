@@ -154,8 +154,9 @@ INSERT INTO smtp_transaction(id,time_ms,server,direction,role,connector,session_
     # (default: the package's templates folder).
     function Start-ServeTest([string]$Path, [int]$Timeout = 5, [int]$Concurrency = 4,
         [Threading.CancellationToken]$Cancellation = [Threading.CancellationToken]::None, [int]$Aggregate = 0, [string]$WebRoot = (Join-Path $script:Root 'templates'),
-        [TimeZoneInfo]$Zone = [TimeZoneInfo]::Utc) {
+        [TimeZoneInfo]$Zone = [TimeZoneInfo]::Utc, [double]$Idle = 0) {
         $o = [ExchangeLogReport.ServeOptions]::new()
+        $o.IdleMinutes = $Idle
         $o.DatabasePath = $Path; $o.WebRoot = $WebRoot; $o.Port = 0; $o.NoBrowser = $true
         $o.ReadyFile = Join-Path $script:Work ([guid]::NewGuid().ToString('N').Substring(0, 8) + '.json')
         $o.ReadyFileWithToken = $true; $o.RequestTimeoutSeconds = $Timeout
@@ -485,7 +486,7 @@ Describe 'Serve actual HttpListener endpoints' {
         $m = $r.Content | ConvertFrom-Json
         $m.schemaVersion | Should -Be 13
         $m.supportedSchemaVersion | Should -Be 13
-        $m.version | Should -BeExactly '3.0.1'
+        $m.version | Should -BeExactly '3.1.0'
         $m.readOnly | Should -BeTrue
         $m.mode | Should -BeExactly 'Serve'
         $r.Headers['Cache-Control'] | Should -Contain 'no-store'
@@ -501,6 +502,81 @@ Describe 'Serve actual HttpListener endpoints' {
         [ServeFixtures]::RawGet($script:Http.Port,'/api/meta',"localhost:$($script:Http.Port)",$script:Http.Token) | Should -Match 'HTTP/1.1 (400|403)'
         [ServeFixtures]::RawGet($script:Http.Port,'/%2e%2e/config/secret.psd1',"127.0.0.1:$($script:Http.Port)",$script:Http.Token) | Should -Match 'HTTP/1.1 (400|403)'
         [ServeFixtures]::RawGet($script:Http.Port,'/%252e%252e/secret',"127.0.0.1:$($script:Http.Port)",$script:Http.Token) | Should -Match 'HTTP/1.1 400'
+    }
+
+    It 'refuses every route of the API without the token or with a wrong one' {
+        $token = $script:Http.Token
+        $routes = @('GET /api/meta', 'GET /api/overview', 'GET /api/overview/counts', 'GET /api/overview/servers', 'GET /api/report-meta', 'GET /api/users', 'GET /api/users/AAAA',
+            'GET /api/authentication', 'GET /api/operations', 'GET /api/requests', 'GET /api/requests/abc', 'GET /api/messages', 'GET /api/messages/count', 'GET /api/messages/facets',
+            'GET /api/messages/1', 'GET /api/sessions', 'GET /api/sessions/1', 'GET /api/smtp/clients', 'GET /api/smtp/clients/1', 'GET /api/smtp/transactions', 'GET /api/smtp/transactions/1',
+            'GET /api/export.csv', 'GET /api/nothing', 'POST /api/export/ticket', 'POST /api/shutdown')
+        $variants = [ordered]@{ none = $null; empty = ''; zeros = ('0' * $token.Length); short = $token.Substring(0, 8); long = $token + 'a' }
+        foreach ($route in $routes) {
+            $method, $path = $route -split ' '
+            foreach ($name in $variants.Keys) {
+                $headers = @{}
+                if ($null -ne $variants[$name]) { $headers['X-Portal-Token'] = $variants[$name] }
+                $parameters = @{ Uri = $script:Http.Url + $path; Method = $method; Headers = $headers; SkipHttpErrorCheck = $true; TimeoutSec = 15 }
+                if ($method -eq 'POST') { $parameters.ContentType = 'application/json'; $parameters.Body = '{"view":"issues","query":""}' }
+                $answer = Invoke-WebRequest @parameters
+                $answer.StatusCode | Should -Be 401 -Because "$route with the token variant '$name'"
+            }
+        }
+        # The portal is still up after the refusals.
+        (Request $script:Http '/api/meta').StatusCode | Should -Be 200
+    }
+
+    It 'sends the cross-origin isolation headers with the page, its script, every answer of the API and every refusal' {
+        $paths = '/', '/report.js', '/api/meta', "/api/messages?$script:Period", '/api/nothing', '/api/messages?bad=1'
+        foreach ($path in $paths) {
+            $r = Request $script:Http $path
+            $r.Headers['Cross-Origin-Opener-Policy'] | Should -Be 'same-origin' -Because $path
+            $r.Headers['Cross-Origin-Resource-Policy'] | Should -Be 'same-origin' -Because $path
+            $r.Headers['X-Content-Type-Options'] | Should -Be 'nosniff'
+        }
+        $refused = Invoke-WebRequest -Uri ($script:Http.Url + '/api/meta') -SkipHttpErrorCheck -TimeoutSec 15
+        $refused.StatusCode | Should -Be 401
+        $refused.Headers['Cross-Origin-Opener-Policy'] | Should -Be 'same-origin'
+        $refused.Headers['Cross-Origin-Resource-Policy'] | Should -Be 'same-origin'
+    }
+
+    It 'stops by itself after the idle time without a request, shuts down cleanly and removes its ready file' {
+        $s = New-ServeStore 'idle'; Add-Mail $s
+        $path = $s.FilePath; $s.Dispose()
+        $watch = [Diagnostics.Stopwatch]::StartNew()
+        $h = Start-ServeTest $path -Idle 0.04
+        Test-Path -LiteralPath $h.Options.ReadyFile | Should -BeTrue
+        $h.Task.Wait(30000) | Should -BeTrue
+        $h.Task.GetAwaiter().GetResult()
+        $watch.Elapsed.TotalSeconds | Should -BeGreaterThan 2
+        Test-Path -LiteralPath $h.Options.ReadyFile | Should -BeFalse
+        { Invoke-WebRequest -Uri ($h.Url + '/api/meta') -TimeoutSec 3 } | Should -Throw
+    }
+
+    It 'counts the idle time from the last request: a portal in use stays up, then stops' {
+        $s = New-ServeStore 'idle-use'; Add-Mail $s
+        $path = $s.FilePath; $s.Dispose()
+        $h = Start-ServeTest $path -Idle 0.05
+        $until = [Diagnostics.Stopwatch]::StartNew()
+        while ($until.Elapsed.TotalSeconds -lt 7) { (Request $h '/api/meta').StatusCode | Should -Be 200; Start-Sleep -Milliseconds 700 }
+        $h.Task.IsCompleted | Should -BeFalse
+        $h.Task.Wait(30000) | Should -BeTrue
+        $h.Task.GetAwaiter().GetResult()
+        Test-Path -LiteralPath $h.Options.ReadyFile | Should -BeFalse
+    }
+
+    It 'has no idle limit by default' {
+        [ExchangeLogReport.ServeOptions]::new().IdleMinutes | Should -Be 0
+        $h = $script:Http
+        $h.Options.IdleMinutes | Should -Be 0
+    }
+
+    It 'accepts only the exact loopback authority of the portal in the Host header' {
+        $port = $script:Http.Port; $token = $script:Http.Token
+        [ServeFixtures]::RawGet($port, '/api/meta', "127.0.0.1:$port", $token) | Should -Match 'HTTP/1.1 200'
+        foreach ($authority in "127.0.0.1.:$port", '127.0.0.1', "[::1]:$port", "127.1:$port", "localhost:$port", "LOCALHOST:$port", "127.0.0.1:$($port + 1)", "0.0.0.0:$port", "127.0.0.1:$port,evil.test", "evil.test:$port") {
+            [ServeFixtures]::RawGet($port, '/api/meta', $authority, $token) | Should -Match 'HTTP/1.1 (400|403)' -Because $authority
+        }
     }
 
     It 'serves the report page built from the template at / and its script at /report.js, nothing else, with every inline script hashed' {
@@ -3043,6 +3119,15 @@ SELECT @a+i*69000+7,CASE i%2 WHEN 0 THEN 'EX1' ELSE 'EX2' END,'HttpProxy',CASE i
         (KDownload "/api/export/$('a' * 64).csv").StatusCode | Should -Be 404
     }
 
+    It 'gives an export ticket to one of several simultaneous downloads only' {
+        $t = (KTicket 'issues' "$script:KsPeriod&f.Protocol=owa").Content | ConvertFrom-Json
+        $address = $script:KsHost.Url + $t.url
+        $codes = @(1..8 | ForEach-Object -ThrottleLimit 8 -Parallel { (Invoke-WebRequest -Uri $using:address -SkipHttpErrorCheck -TimeoutSec 60).StatusCode })
+        @($codes | Where-Object { $_ -eq 200 }).Count | Should -Be 1
+        @($codes | Where-Object { $_ -eq 404 }).Count | Should -Be 7
+        (KDownload $t.url).StatusCode | Should -Be 404
+    }
+
     It 'keeps at most 16 export tickets waiting, says so for the next one, and never prints a ticket on the console' {
         $none = "$script:KsPeriod&f.Protocol=zzzz"
         $waiting = @(foreach ($i in 1..16) { $r = KTicket 'issues' $none; $r.StatusCode | Should -Be 200; ($r.Content | ConvertFrom-Json).url })
@@ -3125,5 +3210,62 @@ SELECT @a+i*69000+7,CASE i%2 WHEN 0 THEN 'EX1' ELSE 'EX2' END,'HttpProxy',CASE i
 
     It 'leaves the source database bytes unchanged' {
         KSha $script:Ks.FilePath | Should -BeExactly $script:KsHash
+    }
+}
+
+Describe 'Serve and a hostile database file' {
+    BeforeAll {
+        function Get-Tree { @(Get-ChildItem -LiteralPath $script:Work -Recurse -File -Force | ForEach-Object { $_.FullName }) | Sort-Object }
+        function Test-Hostile([string]$Path) {
+            # The file is served read only: its bytes never change, and Serve writes no file beside it but the index of the WAL that a reader needs.
+            $before = (Get-FileHash -LiteralPath $Path).Hash
+            $tree = Get-Tree
+            $codes = [Collections.Generic.List[int]]::new()
+            $started = $true
+            try {
+                $h = Start-ServeTest $Path
+                foreach ($route in '/api/meta', "/api/messages?$script:Period", "/api/sessions?$script:Period", "/api/report-meta?$script:Period") { $codes.Add([int](Request $h $route).StatusCode) }
+                (Request $h '/api/meta').StatusCode | Should -BeLessThan 500
+            } catch { $started = $false }
+            (Get-FileHash -LiteralPath $Path).Hash | Should -BeExactly $before
+            $new = @(Get-Tree | Where-Object { $_ -notin $tree -and $_ -notmatch '\.json$|\.sqlite-(shm|wal)$' })
+            ($new -join ';') | Should -BeNullOrEmpty
+            return [pscustomobject]@{ Started = $started; Codes = @($codes) }
+        }
+    }
+
+    It 'refuses a file of random bytes without writing to it' {
+        $path = Join-Path $script:Work 'random.sqlite'
+        $bytes = [byte[]]::new(8192); [Random]::new(7).NextBytes($bytes)
+        [IO.File]::WriteAllBytes($path, $bytes)
+        $r = Test-Hostile $path
+        if ($r.Started) { @($r.Codes | Where-Object { $_ -ge 500 }).Count | Should -Be 0 }
+    }
+
+    It 'does not run the triggers or views of a valid database that carries some, and does not write' {
+        $s = New-ServeStore 'trigger'; Add-Mail $s
+        Write-Sql $s 'CREATE VIEW exl_hostile_view AS SELECT 1 AS x;'
+        Write-Sql $s "CREATE TRIGGER exl_hostile_trigger AFTER INSERT ON message_event BEGIN INSERT INTO message_event(time_ms,server,event_id,message_id,log_id) VALUES(1,'EVIL','RECEIVE','<evil@invalid>','z'); END;"
+        $path = $s.FilePath; $s.Dispose()
+        $r = Test-Hostile $path
+        @($r.Codes | Where-Object { $_ -ge 500 }).Count | Should -Be 0
+    }
+
+    It 'refuses a database whose header announces a huge page count, without writing' {
+        $s = New-ServeStore 'pages'; Add-Mail $s
+        $path = $s.FilePath; $s.Dispose()
+        $bytes = [IO.File]::ReadAllBytes($path)
+        $bytes[28] = 0x7F; $bytes[29] = 0xFF; $bytes[30] = 0xFF; $bytes[31] = 0xFF
+        [IO.File]::WriteAllBytes($path, $bytes)
+        $r = Test-Hostile $path
+        if ($r.Started) { @($r.Codes | Where-Object { $_ -ge 500 }).Count | Should -Be 0 }
+    }
+
+    It 'does not load SQLite extensions' {
+        $s = New-ServeStore 'extension'
+        try {
+            $c = [ServeFixtures]::Connection($s).CreateCommand()
+            try { $c.CommandText = "SELECT load_extension('exl-no-such-extension')"; { [void]$c.ExecuteScalar() } | Should -Throw '*not authorized*' } finally { $c.Dispose() }
+        } finally { $s.Dispose() }
     }
 }

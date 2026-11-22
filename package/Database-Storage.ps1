@@ -18,7 +18,7 @@
 
 .NOTES
     Author  : Nicolas Fabert
-    Version : 3.0.1
+    Version : 3.1.0
     Exit codes : 0 = done, 2 = refused or failed (the message is on the error stream and in the JSON on stdout).
 
     This Script is a Personal project.
@@ -33,24 +33,110 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
+function Get-OwnerSignatureVerdict {
+    <#
+        Whether a PowerShell file of the package carries the owner's signature, from a Get-AuthenticodeSignature result. The same text is in
+        the verifier, the module and both entry scripts: each judges the verifier before it runs, so none can borrow the code of another.
+        Accepted when the signer is the pinned certificate, the signature is timestamped and either the status is Valid, or the status is
+        UnknownError (what Windows reports when the certificate chain cannot be built on this computer; the signature itself still verifies,
+        which Windows reports as HashMismatch otherwise) and the chain fails because the root or an intermediate certificate is missing
+        (Relaxed). Never accepted: HashMismatch, NotSigned, NotTrusted (a certificate that an administrator explicitly distrusts), another
+        signer, a missing timestamp, a chain that fails for any other reason (Revoked, NotSignatureValid, ExplicitDistrust...) or only because
+        no revocation source is reachable. Only names of enumerations are read, never message text. -ChainFlags (names of
+        X509ChainStatusFlags) replaces the chain built here.
+    #>
+    param([Parameter(Mandatory)]$Signature, [Parameter(Mandatory)][string]$Pinned, [string[]]$ChainFlags)
+    $status = [string]$Signature.Status
+    $certificate = $Signature.SignerCertificate
+    $verdict = { param([bool]$Accepted, [bool]$Relaxed, [string]$Reason) [pscustomobject]@{ Accepted = $Accepted; Relaxed = $Relaxed; Reason = $Reason; Status = $status } }
+    if ($status -cne 'Valid' -and $status -cne 'UnknownError') { return & $verdict $false $false $status }
+    if ($null -eq $certificate -or $certificate.Thumbprint -cne $Pinned) { return & $verdict $false $false 'UnknownSigner' }
+    if ($null -eq $Signature.TimeStamperCertificate) { return & $verdict $false $false 'NotTimestamped' }
+    if ($status -ceq 'Valid') { return & $verdict $true $false 'Valid' }
+    if ($null -eq $ChainFlags) {
+        # Revocation is read from what this computer already holds and no certificate is downloaded: no network wait on a server without Internet access.
+        $chain = [Security.Cryptography.X509Certificates.X509Chain]::new()
+        try {
+            $chain.ChainPolicy.RevocationMode = [Security.Cryptography.X509Certificates.X509RevocationMode]::Offline
+            $chain.ChainPolicy.DisableCertificateDownloads = $true
+            [void]$chain.Build($certificate)
+            $ChainFlags = @($chain.ChainStatus | ForEach-Object { ([string]$_.Status) -split ',\s*' } | Where-Object { $_ -and $_ -cne 'NoError' } | Select-Object -Unique)
+        }
+        finally { $chain.Dispose() }
+    }
+    $allowed = 'UntrustedRoot', 'PartialChain', 'RevocationStatusUnknown', 'OfflineRevocation', 'NotTimeValid'
+    if (-not @($ChainFlags | Where-Object { $_ -ceq 'UntrustedRoot' -or $_ -ceq 'PartialChain' }).Count -or @($ChainFlags | Where-Object { $_ -cnotin $allowed }).Count) { return & $verdict $false $false 'ChainStatus' }
+    return & $verdict $true $true 'RootNotTrusted'
+}
+function Get-PathReparseTag {
+    <#
+        The tag of the reparse point at Path, or $null when Path is not one. WIN32_FIND_DATAW.dwReserved0 holds the tag when FILE_ATTRIBUTE_REPARSE_POINT
+        is set; FindFirstFileW reads it from the directory entry without opening the item, so a cloud placeholder is not downloaded. The two calls are
+        declared with Reflection.Emit: no C# is compiled, because this runs before the engine exists. Layout of the 592-byte structure: dwFileAttributes
+        at offset 0, dwReserved0 at offset 36. The same text is in the verifier, the module and both entry scripts.
+    #>
+    param([Parameter(Mandatory)][string]$Path)
+    $api = Get-Variable -Name FindFileApi -Scope Script -ValueOnly -ErrorAction Ignore
+    if ($null -eq $api) {
+        $module = [Reflection.Emit.AssemblyBuilder]::DefineDynamicAssembly([Reflection.AssemblyName]::new('ReparseTag'), [Reflection.Emit.AssemblyBuilderAccess]::Run).DefineDynamicModule('ReparseTag')
+        $native = $module.DefineType('Native', 'Public, Abstract, Sealed')
+        foreach ($call in @(@('FindFirstFileW', [IntPtr], @([string], [IntPtr])), @('FindClose', [bool], @([IntPtr])))) {
+            $method = $native.DefinePInvokeMethod($call[0], 'kernel32.dll', $call[0], 'Public, Static, PinvokeImpl', 'Standard', $call[1], [type[]]$call[2], 'Winapi', 'Unicode')
+            $method.SetImplementationFlags('PreserveSig')
+        }
+        $api = $native.CreateType()
+        Set-Variable -Name FindFileApi -Scope Script -Value $api
+    }
+    $full = [IO.Path]::GetFullPath($Path)
+    $full = if ($full.StartsWith('\\?\', [StringComparison]::Ordinal)) { $full } elseif ($full.StartsWith('\\', [StringComparison]::Ordinal)) { '\\?\UNC\' + $full.Substring(2) } else { '\\?\' + $full }
+    $data = [Runtime.InteropServices.Marshal]::AllocHGlobal(592)
+    try {
+        $handle = $api::FindFirstFileW($full, $data)
+        if ($handle -eq [IntPtr]::new(-1)) { throw "Package integrity: the reparse tag of this path cannot be read (Windows error $([Runtime.InteropServices.Marshal]::GetLastSystemError())): $Path" }
+        [void]$api::FindClose($handle)
+        if (([Runtime.InteropServices.Marshal]::ReadInt32($data, 0) -band 0x400) -eq 0) { return $null }
+        return [uint32]([long][Runtime.InteropServices.Marshal]::ReadInt32($data, 36) -band 0xFFFFFFFFL)
+    }
+    finally { [Runtime.InteropServices.Marshal]::FreeHGlobal($data) }
+}
+function Test-ReparseTagAllowed {
+    <#
+        The rule for the tag of a reparse point, not for the bare attribute. Refused: every tag that redirects to another path, that is every tag with the
+        name-surrogate bit 0x20000000 (symbolic link 0xA000000C, junction and mount point 0xA0000003, and the others), and every tag that is not in the closed
+        list below (fail closed). Accepted, the Microsoft types that do not redirect: the cloud files of OneDrive (0x9000001A and its variants 0x9000101A to
+        0x9000F01A, that is the tag with the bits 0x0000F000 cleared), data deduplication 0x80000013 and WOF (Windows Overlay Filter, CompactOS) 0x80000017.
+        The SHA256 of the signed manifest still detects any change of content, including one made by a synchronisation.
+    #>
+    param([Parameter(Mandatory)][uint32]$Tag)
+    if ($Tag -band 0x20000000u) { return $false }
+    return (($Tag -band 0xFFFF0FFFu) -eq 0x9000001Au) -or $Tag -eq 0x80000013u -or $Tag -eq 0x80000017u
+}
+function Get-RefusedReparseTag {
+    <# $null when the item (from Get-Item -Force) is not a reparse point or its tag is accepted by Test-ReparseTagAllowed; otherwise the refused tag as eight hexadecimal digits. #>
+    param([Parameter(Mandatory)]$Item)
+    if (-not ($Item.Attributes -band [IO.FileAttributes]::ReparsePoint)) { return $null }
+    $tag = [uint32](Get-PathReparseTag $Item.FullName)
+    if (Test-ReparseTagAllowed $tag) { return $null }
+    return $tag.ToString('X8')
+}
 $integrityManifest = Join-Path $PSScriptRoot 'PackageIntegrity.psd1'
 if (Microsoft.PowerShell.Management\Test-Path -LiteralPath $integrityManifest) {
     $integrityVerifier = Join-Path $PSScriptRoot 'src\Test-PackageIntegrity.ps1'
     $integrityCursor = [IO.Path]::GetFullPath($integrityVerifier)
     while ($integrityCursor) {
         $integrityItem = Microsoft.PowerShell.Management\Get-Item -LiteralPath $integrityCursor -Force -ErrorAction Stop
-        if ($integrityItem.Attributes -band [IO.FileAttributes]::ReparsePoint) {
-            throw "Package integrity: reparse point: $integrityCursor"
+        $integrityRefused = Get-RefusedReparseTag $integrityItem
+        if ($integrityRefused) {
+            throw "Package integrity: reparse point that is not accepted (tag 0x$integrityRefused): $integrityCursor"
         }
         $integrityCursor = [IO.Path]::GetDirectoryName($integrityCursor)
     }
     $integritySignature = Microsoft.PowerShell.Security\Get-AuthenticodeSignature -LiteralPath $integrityVerifier -ErrorAction Stop
-    if ([string]$integritySignature.Status -cne 'Valid' -or $null -eq $integritySignature.SignerCertificate -or
-        $integritySignature.SignerCertificate.Thumbprint -cne '0F28E442889F17B5F4D251E8F96E7CC6E2C9C6D6' -or
-        $null -eq $integritySignature.TimeStamperCertificate) {
+    if (-not (Get-OwnerSignatureVerdict -Signature $integritySignature -Pinned '0F28E442889F17B5F4D251E8F96E7CC6E2C9C6D6').Accepted) {
         throw 'Package integrity: verifier must have the trusted, timestamped owner signature. Use the complete release ZIP (https://github.com/Nico77600/ExchangeLogReport/releases/latest): extract it again and unblock it. A development or CI build is started from its folder with powershell\pwsh.exe -NoLogo -NoProfile -File Database-Storage.ps1 -DevelopmentMode <arguments>.'
     }
-    if ($DevelopmentMode) { & $integrityVerifier -Root $PSScriptRoot -DevelopmentMode | Out-Null } else { & $integrityVerifier -Root $PSScriptRoot -Distribution | Out-Null }
+    $integrityResult = @(if ($DevelopmentMode) { & $integrityVerifier -Root $PSScriptRoot -DevelopmentMode -SuppressTrustWarning } else { & $integrityVerifier -Root $PSScriptRoot -Distribution -SuppressTrustWarning })
+    foreach ($w in @($integrityResult | ForEach-Object { $_.Warnings } | Where-Object { $_ })) { Write-Warning "Package integrity: $w" }
 } elseif (-not $DevelopmentMode) {
     throw 'Package integrity: PackageIntegrity.psd1 is missing. Use the complete release ZIP (https://github.com/Nico77600/ExchangeLogReport/releases/latest): extract it again and unblock it. A development or CI build is started from its folder with powershell\pwsh.exe -NoLogo -NoProfile -File Database-Storage.ps1 -DevelopmentMode <arguments>.'
 } else {
@@ -74,10 +160,10 @@ Import-Module (Join-Path $PSScriptRoot 'ExchangeLogReport.psd1') -Force
 Initialize-ExlEngine -Root $PSScriptRoot -WithStorage
 exit [ExchangeLogReport.Storage.StorageCli]::Run([string[]]$Arguments, (Get-Module ExchangeLogReport).Version.ToString(), (Join-Path $PSScriptRoot 'sqlite-tools\sqlite3.exe'))
 # SIG # Begin signature block
-# MIImKgYJKoZIhvcNAQcCoIImGzCCJhcCAQExDzANBglghkgBZQMEAgEFADB5Bgor
+# MIImKQYJKoZIhvcNAQcCoIImGjCCJhYCAQExDzANBglghkgBZQMEAgEFADB5Bgor
 # BgEEAYI3AgEEoGswaTA0BgorBgEEAYI3AgEeMCYCAwEAAAQQH8w7YFlLCE63JNLG
-# KX7zUQIBAAIBAAIBAAIBAAIBADAxMA0GCWCGSAFlAwQCAQUABCDb8UUYGwwLfzj/
-# 5RSsqzUkvxYyHmFnYOSqT2ZGw4UnyaCCDW8wggZyMIIEWqADAgECAghkM1HTxzif
+# KX7zUQIBAAIBAAIBAAIBAAIBADAxMA0GCWCGSAFlAwQCAQUABCAV2vbN1rOEI1uq
+# 7PXL5rY6waYM+HzDthY/V3Rv2Gnf7aCCDW8wggZyMIIEWqADAgECAghkM1HTxzif
 # CDANBgkqhkiG9w0BAQsFADB8MQswCQYDVQQGEwJVUzEOMAwGA1UECAwFVGV4YXMx
 # EDAOBgNVBAcMB0hvdXN0b24xGDAWBgNVBAoMD1NTTCBDb3Jwb3JhdGlvbjExMC8G
 # A1UEAwwoU1NMLmNvbSBSb290IENlcnRpZmljYXRpb24gQXV0aG9yaXR5IFJTQTAe
@@ -149,28 +235,28 @@ exit [ExchangeLogReport.Storage.StorageCli]::Run([string[]]$Arguments, (Get-Modu
 # ULeH38N0Vr83psiJVuBSxQyt5nRVrpYz7FACq5gtXELkyViq/rGOlJKaRrgQ6WWq
 # eoIXqKhVFAdP/jAEm2M8ezoVYsUgPyKY2OcuecV9coulAcxUIUydx6qYiOfsGj5u
 # Dy7l4aYjvB771wkUMzUQwxzcDYXJtMMTaWRe6n9EemR67jc73u5CJyFg3PfA5WR1
-# wZislcdCZuS6MYIYETCCGA0CAQEwgYwweDELMAkGA1UEBhMCVVMxDjAMBgNVBAgM
+# wZislcdCZuS6MYIYEDCCGAwCAQEwgYwweDELMAkGA1UEBhMCVVMxDjAMBgNVBAgM
 # BVRleGFzMRAwDgYDVQQHDAdIb3VzdG9uMREwDwYDVQQKDAhTU0wgQ29ycDE0MDIG
 # A1UEAwwrU1NMLmNvbSBDb2RlIFNpZ25pbmcgSW50ZXJtZWRpYXRlIENBIFJTQSBS
 # MQIQBof4ljXihJpmCqqt2mhAWzANBglghkgBZQMEAgEFAKCBhDAYBgorBgEEAYI3
 # AgEMMQowCKACgAChAoAAMBkGCSqGSIb3DQEJAzEMBgorBgEEAYI3AgEEMBwGCisG
-# AQQBgjcCAQsxDjAMBgorBgEEAYI3AgEVMC8GCSqGSIb3DQEJBDEiBCAfhlTvP9/s
-# BfFH06Nd9qwoj5XFOvskt44LY9fdQioiaTANBgkqhkiG9w0BAQEFAASCAgBqhlg2
-# J+FtV399fdqCowDhbQZPz1uPKxJpOY1lF2wRABg5+vzLvNx5fN3vH0X4FHtgn5zz
-# BfNVnjQQz4wyJbqchvQAfdiKzkh2JkemJEBJdbtpDfVLdjBV+5HGxrNC8znTI7an
-# rwUNqyHZS6M6FfpLyeBbYUEJGKg8BFjkkL9qPjig8n1xij4HwKNNegh3SDbfvuRd
-# ZNELqzVdRkdi7zNYYE6kvSgFkB1Abv0ba4TraWbjjxfA6xOLSNswye+8S2Gf9e4N
-# xyqjVrim0JM2ADqqg3oEJ3w98OxSKehLyyCUTgg0fP2MwzQ6xi/b6J0xM8pLrfXt
-# ceSJB0XBwOt5a5rnGTg5aTdf1llr8twkpMsn+FpqxziGmEJic2R2r5T4Tn2XgVq2
-# CyJSLqWIO0a9VuGWSXaX18nfHTcq6p/EhtJx2Zw06fW6oPe+TJWPpovZoHJ8Wt16
-# zRFaSW9ZTvnQvVtfY1IVZ+acsd/KLL/sgGhCT5ujRkZukLSEafUlnjnpZ26EY87v
-# zpp6TUB1xzEn4YEFeAyzNIsqWX1ksMCK4FNUqhYOLOC6tYzEJjny3ATXrLk6VPuu
-# Sxl1QnhMP9jFmrSc39QzRzJhiRb7ndOrjyt/F5+gueYyxr3RpEKWfcgu0xx4/Qry
-# 3vKft+V2obK+6RBN8oNDx1ssNYp50oKMwrnIJaGCFM4wghTKBgorBgEEAYI3AwMB
-# MYIUujCCFLYGCSqGSIb3DQEHAqCCFKcwghSjAgEDMQ0wCwYJYIZIAWUDBAIBMIGJ
+# AQQBgjcCAQsxDjAMBgorBgEEAYI3AgEVMC8GCSqGSIb3DQEJBDEiBCDEk6AetJjt
+# 2Hj+u/jvaMgEDnUZmArHbsygiUFTfPfvWzANBgkqhkiG9w0BAQEFAASCAgCh9cib
+# Ke5LCIMbd3bJqKU3iv/6Paxfj+cZMXBBQfPPmMUY1uzUp04fzg94v6teCdOf82rI
+# rPOrnjPrONNjQ4Rbr+T1GGMGbQwnE1mP/p0ItbQvJQ5/KVsFJvD7LJSD0kfm3KpO
+# nkUmbYQlDMRtecjDyPMhv0qBFFU11NyFYUzrMKI0BWAdwRgRFD9ro+upfeN+zg9F
+# GUtATDdqQqA8lhdLSm/OC96pwjypLJQAA4JLKXsRUoNcBU/GtvdHaSPYR5c00P6m
+# aMQJuoAXB+b+TCPWp2AiUYa/f/cFrIaKrk4ttVjwHisfyI9nfCSHxnNIxIfKszRr
+# yPVhWxNsFxCRqrXesChWJDRJmZ37dtt8D/IYxYd/Sfru0Z4oTjQ9gjJM+TuwbFnl
+# cVKoS0mpVAWBRaKLADP15hgeJ/KLH2z5EVy6BLNu8qmGRYhI4L22EizyrZ3AnbDW
+# KP9NmkJrAjSSM/gs1Js755aCzgmA+KV/ZXXeoP1t7pQqFiXAIFQEIt4AP/dhDhsI
+# SZRTdu7suDpffdVKOJxfr9UaElxapsjNtLjdlzMelKKS6skSQq5Vq4clCuaVJg4a
+# chscpCqNk+7z0jFWbKB1noBjQUoMhggXKw9IwQaXHPbpAeYrFVALC4lgqKDHAqfx
+# whciuyBnjk2nX768V8gv5LCcauttAQ63m2dBAqGCFM0wghTJBgorBgEEAYI3AwMB
+# MYIUuTCCFLUGCSqGSIb3DQEHAqCCFKYwghSiAgEDMQ0wCwYJYIZIAWUDBAIBMIGJ
 # BgsqhkiG9w0BCRABBKB6BHgwdgIBAQYMKwYBBAGCqTABAwYBMDEwDQYJYIZIAWUD
-# BAIBBQAEIHQLr2wtMl4eYFq3WCdOLc4RH/Goz7odokqsBi5EZnjPAghw3PVrHn0k
-# BxgPMjAyNjExMTcyMTA0NDFaMAMCAQECEB97ykKsoIRCfPbQOYsvJZigghGnMIIE
+# BAIBBQAEILR369A2oeVumt2BmwthfUar0mhT8vy1tBHN1i+wUrUuAgg9NGYKTABr
+# VRgPMjAyNjExMjIxMTA5MDZaMAMCAQECEG+TqgUMx7YXhlFAXY/o1sCgghGnMIIE
 # 8zCCAtugAwIBAgIQVEP4N71a7hgBhHK4XNqO4zANBgkqhkiG9w0BAQsFADByMQsw
 # CQYDVQQGEwJVUzEOMAwGA1UECAwFVGV4YXMxEDAOBgNVBAcMB0hvdXN0b24xETAP
 # BgNVBAoMCFNTTCBDb3JwMS4wLAYDVQQDDCVTU0wuY29tIFRpbWVzdGFtcGluZyBJ
@@ -265,17 +351,17 @@ exit [ExchangeLogReport.Storage.StorageCli]::Run([string[]]$Arguments, (Get-Modu
 # rDMtXndUg3qhJL4pA3ZUlo7w5lM5ml+A7ijr/3Gk2v4QRoDeE2ShmTXdHgtqo8L/
 # fT119mYcETycE2NYGRXsBl3N0rzDsHRr8P3TrprqhRrX04iS0P7eQ+lDxgS3yhGn
 # 3OzWGhDt9Gf2x1qe0/qdhFAVOkXxzMZz4Uat6xsAfzX0+/m8GEKW5Ojw/HY+kLvV
-# wzSPOzGCAlYwggJSAgEBMIGGMHIxCzAJBgNVBAYTAlVTMQ4wDAYDVQQIDAVUZXhh
+# wzSPOzGCAlUwggJRAgEBMIGGMHIxCzAJBgNVBAYTAlVTMQ4wDAYDVQQIDAVUZXhh
 # czEQMA4GA1UEBwwHSG91c3RvbjERMA8GA1UECgwIU1NMIENvcnAxLjAsBgNVBAMM
 # JVNTTC5jb20gVGltZXN0YW1waW5nIElzc3VpbmcgUlNBIENBIDICEFRD+De9Wu4Y
 # AYRyuFzajuMwCwYJYIZIAWUDBAIBoIIBYDAaBgkqhkiG9w0BCQMxDQYLKoZIhvcN
-# AQkQAQQwHAYJKoZIhvcNAQkFMQ8XDTI2MTExNzIxMDQ0MVowKAYJKoZIhvcNAQk0
-# MRswGTALBglghkgBZQMEAgGhCgYIKoZIzj0EAwIwLwYJKoZIhvcNAQkEMSIEIFuS
-# Dvp8oJ8IofA8Xq/bRhBcTltn7+6LaEq/u3JPfCfPMIHIBgsqhkiG9w0BCRACLzGB
+# AQkQAQQwHAYJKoZIhvcNAQkFMQ8XDTI2MTEyMjExMDkwNlowKAYJKoZIhvcNAQk0
+# MRswGTALBglghkgBZQMEAgGhCgYIKoZIzj0EAwIwLwYJKoZIhvcNAQkEMSIEIMmQ
+# 9B69E+Vb+xpH6qCAFYGIxd92gghgDGwcFOt49tbcMIHIBgsqhkiG9w0BCRACLzGB
 # uDCBtTCBsjCBrwQgV0/qF6r6XnxqK5sIyZixc15FCzhzykTmokygkw5j87AwgYow
 # dqR0MHIxCzAJBgNVBAYTAlVTMQ4wDAYDVQQIDAVUZXhhczEQMA4GA1UEBwwHSG91
 # c3RvbjERMA8GA1UECgwIU1NMIENvcnAxLjAsBgNVBAMMJVNTTC5jb20gVGltZXN0
 # YW1waW5nIElzc3VpbmcgUlNBIENBIDICEFRD+De9Wu4YAYRyuFzajuMwCgYIKoZI
-# zj0EAwIERzBFAiBxI8Sg9SNpVegLI1mY0PZ31tXPDoiymAZ6jdLPrKQd6AIhAMl2
-# t267LtVGQKS58Sn2D4F0NmvQl1d8CIBlDNnvVgED
+# zj0EAwIERjBEAiA4hMDlfVcob7C384xkxq3bnU1VIO14NJNlQr/qtTSduQIgLAsz
+# xFk7XvP4uWRLBwuynAhCrACv5+iqhsIFEE+dLDE=
 # SIG # End signature block

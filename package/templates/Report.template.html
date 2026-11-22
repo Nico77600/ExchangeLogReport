@@ -10,13 +10,15 @@
                       report nothing: the same files are read from the <FilePrefix>_data folder next to this page
       META marker   : the report description (period, filters, datasets and their columns, manifest of the data files) as JSON
       SCRIPT marker : the main script of the page, Report.template.js next to this file, copied as it is
+      NONCE marker : any number of times, the nonce of a static report (new for each report): in the Content-Security-Policy element and on
+                      every script element that runs, the data files included. The portal drops the policy element and the nonce attributes.
     The portal (src\Engine.Serve.cs) builds its page from the same two files: no data files, {"served":true} as the description, and
     the main script as report.js; the page then reads the description and the rows from the local API of the portal.
     Everything else is static: texts, colours or tabs can be changed here, no rebuild needed.
 -->
-<html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<html lang="en"><head><meta charset="UTF-8"><meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'nonce-%%NONCE%%' 'strict-dynamic'; style-src 'unsafe-inline'; img-src data:; base-uri 'none'; form-action 'none'; object-src 'none'"><meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Exchange Server | Usage and troubleshooting</title>
-<script>
+<script nonce="%%NONCE%%">
   (() => {
     const param = new URLSearchParams(window.location.search).get("scoutTheme");
     const theme = param === "light" || param === "dark" ? param : (window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light");
@@ -258,12 +260,12 @@ input.invalid { border-color:var(--cp-danger); background:var(--cp-danger-soft);
 <dialog id="detail"><div class="dialog-head"><h2 id="detail-title">Details</h2><button id="detail-close" type="button">Close</button></div><div class="dialog-body" id="detail-body"></div></dialog>
 <noscript>JavaScript is required to display this report. Open the CSV files of the same folder for the complete data.</noscript>
 <footer id="footer"></footer>
-<script>
+<script nonce="%%NONCE%%">
 /* Receives the statements of the data files (scripts of this page, or of the data folder) until the main script below takes over. */
 window.__exl = { q: [], file(id, name) { this.q.push(["f", id, name, document.currentScript]); }, push(k, set, first, count, data) { this.q.push([k, set, first, count, data, document.currentScript]); } };
 </script>
 %%CHUNKS%%
 <script id="report-meta" type="application/json">%%META%%</script>
-<script>
+<script nonce="%%NONCE%%">
 %%SCRIPT%%</script>
 </body></html>

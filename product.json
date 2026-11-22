@@ -1,19 +1,106 @@
 {
   "name": "ExchangeLogReport",
-  "version": "3.0.1",
+  "version": "3.1.0",
   "visibility": "public",
   "status": "release",
   "runtimeIdentifier": "win-x64",
   "sqliteTools": {
-    "version": "3.54.0",
-    "url": "https://www.sqlite.org/2026/sqlite-tools-win-x64-3540000.zip",
-    "archiveSha256": "63cb06e952a83fd140139b008ed5b47496608161c62f8cd17bc96e8beb1de029",
-    "archiveSha3_256": "8d1ccff873455c7f83c6e03ee253e81406d0e432ca9e7247ed6183929a824b33",
-    "executableSha256": "1d4dbbc37396c5de744e1a732540b8bc83cd89888f47e86365b726e5a813c5e7"
+    "version": "3.54.1",
+    "url": "https://www.sqlite.org/2026/sqlite-tools-win-x64-3540100.zip",
+    "archiveSha256": "fb20997ade5583a5fbf1e36db7bc3c82c9416b3f314f16961e1572aa4e49487d",
+    "archiveSha3_256": "e171f3993a992edf076746926dd52b5e2ebfabaee38818e74987e1d8112ab987",
+    "executableSha256": "3627c4ce2632949ee6d795c92e0a33f68fb30235f0a55a7719f0636414d8e1d3"
+  },
+  "sqliteLibraries": {
+    "directory": "lib/sqlite",
+    "packages": [
+      {
+        "id": "Microsoft.Data.Sqlite.Core",
+        "license": "MIT",
+        "supplier": "Microsoft",
+        "version": "10.0.12",
+        "url": "https://www.nuget.org/api/v2/package/Microsoft.Data.Sqlite.Core/10.0.12",
+        "packageSha256": "5e8ed353006dadf55d5c7f56d237321c20bb10c786262e6b25526756e1036332",
+        "files": [
+          {
+            "path": "Microsoft.Data.Sqlite.dll",
+            "packagePath": "lib/net8.0/Microsoft.Data.Sqlite.dll",
+            "sha256": "b98d957462be432895b00dccca012d3c127e118d3d4262418014b92c7bbd66cf"
+          }
+        ]
+      },
+      {
+        "id": "SQLitePCLRaw.core",
+        "license": "Apache-2.0",
+        "supplier": "Eric Sink",
+        "version": "2.1.14",
+        "url": "https://www.nuget.org/api/v2/package/SQLitePCLRaw.core/2.1.14",
+        "packageSha256": "699d899a12951f8a790cff8cfd03bc4bb4ca5b8b069f8fa3ca1e8d6a5c19360b",
+        "files": [
+          {
+            "path": "SQLitePCLRaw.core.dll",
+            "packagePath": "lib/netstandard2.0/SQLitePCLRaw.core.dll",
+            "sha256": "e60e22452ba79c306a59ecc01a97c29bafe69d9fa612f40253852ed450ad27e8"
+          }
+        ]
+      },
+      {
+        "id": "SQLitePCLRaw.provider.e_sqlite3",
+        "license": "Apache-2.0",
+        "supplier": "Eric Sink",
+        "version": "2.1.14",
+        "url": "https://www.nuget.org/api/v2/package/SQLitePCLRaw.provider.e_sqlite3/2.1.14",
+        "packageSha256": "d870df546696a372330d592e462fa48d81dccd21ba38277495112905f2147869",
+        "files": [
+          {
+            "path": "SQLitePCLRaw.provider.e_sqlite3.dll",
+            "packagePath": "lib/netstandard2.0/SQLitePCLRaw.provider.e_sqlite3.dll",
+            "sha256": "35a7fb876526e1f1de65d6fd8938f82dbc8e00efccd0ca58f364c68c26ba08a3"
+          }
+        ]
+      },
+      {
+        "id": "SQLitePCLRaw.bundle_e_sqlite3",
+        "license": "Apache-2.0",
+        "supplier": "Eric Sink",
+        "version": "2.1.14",
+        "url": "https://www.nuget.org/api/v2/package/SQLitePCLRaw.bundle_e_sqlite3/2.1.14",
+        "packageSha256": "68b2e8062a383bdce8a0bccac87d19493d2797fd5f8d2745b464644bbc076a3b",
+        "files": [
+          {
+            "path": "SQLitePCLRaw.batteries_v2.dll",
+            "packagePath": "lib/netstandard2.0/SQLitePCLRaw.batteries_v2.dll",
+            "sha256": "29c9cf3060789066682ba5fbf81dea584563e6ab60b5d9861c73ba8b29ed1142"
+          }
+        ]
+      },
+      {
+        "id": "SQLitePCLRaw.lib.e_sqlite3",
+        "license": "Apache-2.0",
+        "supplier": "Eric Sink",
+        "version": "2.1.14",
+        "sqliteVersion": "3.54.0",
+        "url": "https://www.nuget.org/api/v2/package/SQLitePCLRaw.lib.e_sqlite3/2.1.14",
+        "packageSha256": "b7e9e18df72c812df2c4769b6ab685de0447f8080f39c5a28ab11145d79a36f0",
+        "files": [
+          {
+            "path": "runtimes/win-x64/e_sqlite3.dll",
+            "packagePath": "runtimes/win-x64/native/e_sqlite3.dll",
+            "sha256": "b082e8a72ad4ce908234eac970b09b7d328d16157cec34a3ebccfd9dfe2221c6"
+          },
+          {
+            "path": "runtimes/win-arm64/e_sqlite3.dll",
+            "packagePath": "runtimes/win-arm64/native/e_sqlite3.dll",
+            "sha256": "e3d17b136b58e9e3f768f97ddb406cff3595632126371ad97546be368603bff6"
+          }
+        ]
+      }
+    ]
   },
   "powerShell": {
-    "version": "7.6.7",
-    "url": "https://github.com/PowerShell/PowerShell/releases/download/v7.6.7/PowerShell-7.6.7-win-x64.zip",
-    "sha256": "d2f952ebdbf24386cb8923553aa58e41a846db35a6155ea04c58142a4b16dbb7"
+    "version": "7.6.10",
+    "dotNetRuntimeVersion": "10.0.15",
+    "url": "https://github.com/PowerShell/PowerShell/releases/download/v7.6.10/PowerShell-7.6.10-win-x64.zip",
+    "sha256": "7d871531806eb1646264e4bbabd9f0c30c23355591bc756bb9909448c29ae166"
   }
 }

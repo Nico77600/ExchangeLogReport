@@ -47,7 +47,7 @@ foreach ($server in $settings.Servers) {
 }
 $store = Open-ExlStore -Settings $settings
 try {
-    $runId = $store.StartRun('Collect', 'SYNTHETIC', 'SYNTHETIC', '3.0.1')
+    $runId = $store.StartRun('Collect', 'SYNTHETIC', 'SYNTHETIC', '3.1.0')
     $collection = Invoke-ExlCollection -Store $store -Settings $settings -RunId $runId
     if ($collection.Errors -or $collection.Unreachable.Count) { throw 'Synthetic collection did not complete.' }
     $store.EndRun($runId, 'Completed', $collection.Files, $collection.Bytes, $collection.Lines, $collection.Kept, $collection.Noise, $null)

@@ -13,11 +13,13 @@
     -Manifest <package folder>: hashes the built folder and writes an unsigned PackageIntegrity.psd1. The owner signs it.
     -Seal <package folder>: verifies the signed manifest on the built folder and on package\ (the bytes of the
     protected files must be the ones in the repository), then writes the release ZIP and prints its SHA-256.
+    The SPDX 2.3 SBOM of the ZIP is written next to it as <zip name>.spdx.json (tools\New-Sbom.ps1).
+    Every phase checks the SQLite assemblies of lib\sqlite against the upstream SHA-256 pins of product.json (tools\Test-SqliteLibraries.ps1).
     Signing key material is never read by this script.
 
 .NOTES
     Author  : Nicolas Fabert
-    Version : 3.0.1
+    Version : 3.1.0
 #>
 [CmdletBinding(DefaultParameterSetName = 'Build')]
 param(
@@ -46,6 +48,13 @@ function Assert-OwnerSigned([string]$Path) {
         $signature.SignerCertificate.Thumbprint -cne $signer -or $null -eq $signature.TimeStamperCertificate) {
         throw "Not signed with the trusted, timestamped owner certificate ($($signature.Status)): $Path"
     }
+}
+function Assert-SqliteLibraries([string]$Package) {
+    [void](& (Join-Path $PSScriptRoot 'Test-SqliteLibraries.ps1') -PackageRoot $Package -ProductFile (Join-Path $root 'product.json'))
+}
+function Write-Sbom([string]$Package, [string]$ZipPath, [switch]$UnsignedBuild) {
+    $arguments = @{ PackageRoot = $Package; ZipPath = $ZipPath; Unsigned = $UnsignedBuild.IsPresent }
+    & (Join-Path $PSScriptRoot 'New-Sbom.ps1') @arguments
 }
 function Write-Manifest([string]$Package) {
     $entries = foreach ($relative in Get-RelativeFile $Package) {
@@ -86,6 +95,7 @@ if ($PSCmdlet.ParameterSetName -eq 'Manifest') {
     if ((Get-FileHash -LiteralPath (Join-Path $Manifest 'sqlite-tools\sqlite3.exe') -Algorithm SHA256).Hash -ne $product.sqliteTools.executableSha256) {
         throw 'The packaged SQLite tool does not match its pinned SHA256.'
     }
+    Assert-SqliteLibraries $Manifest
     $path = Write-Manifest $Manifest
     Write-Output "Unsigned manifest written: $path"
     Write-Output "Sign it, then copy the signed file to $(Join-Path $source 'PackageIntegrity.psd1') and run: .\tools\Build-Standalone.ps1 -Seal `"$Manifest`""
@@ -101,6 +111,7 @@ if ($PSCmdlet.ParameterSetName -eq 'Seal') {
     }
     $result = & (Join-Path $Seal 'src\Test-PackageIntegrity.ps1') -Root $Seal -Distribution
     if ($result.Status -cne 'Valid') { throw 'The built package is not Valid.' }
+    Assert-SqliteLibraries $Seal
     $sourceResult = & (Join-Path $source 'src\Test-PackageIntegrity.ps1') -Root $source
     if ($sourceResult.Status -notlike 'Valid*') { throw 'The repository package folder is not Valid.' }
     foreach ($relative in Get-RelativeFile $Seal) {
@@ -114,9 +125,11 @@ if ($PSCmdlet.ParameterSetName -eq 'Seal') {
     $zip = "$Seal.zip"
     if (Test-Path -LiteralPath $zip) { throw "The ZIP already exists: $zip" }
     Compress-Archive -LiteralPath $Seal -DestinationPath $zip -CompressionLevel Optimal
+    $sbom = Write-Sbom $Seal $zip
     [pscustomobject]@{
         Package = $Seal; Zip = $zip; ZipBytes = (Get-Item -LiteralPath $zip).Length
         ZipSha256 = (Get-FileHash -LiteralPath $zip -Algorithm SHA256).Hash
+        Sbom = $sbom; SbomSha256 = (Get-FileHash -LiteralPath $sbom -Algorithm SHA256).Hash
         Files = $result.Files + $result.DistributionFiles; Signed = $true; Published = $false
     } | ConvertTo-Json
     return
@@ -152,6 +165,7 @@ if ((Test-Path -LiteralPath $destination) -or (Test-Path -LiteralPath $zip)) {
     throw "Build destination already exists. Choose a new OutputRoot; existing deliveries are never overwritten: $destination"
 }
 if (-not $Unsigned) { foreach ($relative in $signedScripts) { Assert-OwnerSigned (Join-Path $source $relative) } }
+Assert-SqliteLibraries $source
 $cache = Join-Path $root '.cache'
 [void][IO.Directory]::CreateDirectory($cache)
 $sqliteTool = Join-Path $root 'lib\sqlite-tools\sqlite3.exe'
@@ -198,6 +212,7 @@ foreach ($sourceFile in $sourceFiles) {
     [void][IO.Directory]::CreateDirectory((Split-Path $target -Parent))
     Copy-Item -LiteralPath $sourceFile.FullName -Destination $target
 }
+Assert-SqliteLibraries $destination
 $config = Import-PowerShellDataFile -LiteralPath (Join-Path $destination 'config\ExchangeLogReport.config.psd1')
 if (($config.Servers.Name -join ',') -ne 'EXCH01,EXCH02' -or $config.Mail.Enabled -or $config.Mail.SmtpServer -or
     $config.Mail.From -or @($config.Mail.To).Count -or @($config.Mail.Cc).Count -or $config.Mail.CertificateThumbprint) {
@@ -234,8 +249,9 @@ if ($Unsigned) {
         Write-Warning 'package\PackageIntegrity.psd1 is not committed: this unsigned build carries no manifest.'
     }
     Compress-Archive -LiteralPath $destination -DestinationPath $zip -CompressionLevel Optimal
+    $sbom = Write-Sbom $destination $zip -UnsignedBuild
     [pscustomobject]@{
-        Package = $destination; Zip = $zip; ZipBytes = (Get-Item -LiteralPath $zip).Length
+        Package = $destination; Zip = $zip; ZipBytes = (Get-Item -LiteralPath $zip).Length; Sbom = $sbom
         Files = @(Get-ChildItem -LiteralPath $destination -Recurse -File).Count; Signed = $false; Published = $false
     } | ConvertTo-Json
     return

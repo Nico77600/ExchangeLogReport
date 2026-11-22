@@ -393,7 +393,7 @@ namespace ExchangeLogReport
             supportedSchemaVersion = SupportedSchema, requiresMigration = true, databaseBytes = 0L, coveredFrom = (string)null, coveredTo = (string)null,
             servers = new string[0], readOnly = true, mode = "Serve" }; }
         /// <summary>The version of the product, as the portal answers it.</summary>
-        internal const string ProductVersion = "3.0.1";
+        internal const string ProductVersion = "3.1.0";
         /// <summary>The IANA name of a time zone (the page does its day arithmetic with Intl), null when it has none.</summary>
         internal static string IanaZone(TimeZoneInfo zone)
         {

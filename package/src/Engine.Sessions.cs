@@ -2,7 +2,7 @@
 //  Exchange Log Report - engine, part 5: client sessions and back-end correlation
 // -----------------------------------------------------------------------------
 //  Author  : Nicolas Fabert
-//  Version : 3.0.1
+//  Version : 3.1.0
 //
 //  A client session is what one client did for one user on one day, until it
 //  stays idle longer than SessionIdleMinutes. Its key depends on the protocol:
@@ -1730,7 +1730,7 @@ first_error,last_error,backend,connections,auth_modes FROM client_session WHERE 
             {
                 offset = line.NextOffset;
                 c.Result.Lines++;
-                if (line.Length == 0) { Noise(c, "Empty line", 1); continue; }
+                if (line.Length == 0) { Noise(c, line.Oversized ? LogLine.TooLong : "Empty line", 1); continue; }
                 if (line.First == '#')
                 {
                     if (line.StartsWith("#Fields:")) { string text = line.Text(); c.Map.Load(text); c.Fields = text; bind(); }
@@ -1841,7 +1841,7 @@ first_error,last_error,backend,connections,auth_modes FROM client_session WHERE 
             {
                 offset = line.NextOffset;
                 c.Result.Lines++;
-                if (line.Length == 0) { Noise(c, "Empty line", 1); continue; }
+                if (line.Length == 0) { Noise(c, line.Oversized ? LogLine.TooLong : "Empty line", 1); continue; }
                 if (line.First == '#')
                 {
                     if (line.StartsWith("#Fields:")) { string text = line.Text(); c.Map.Load(text); c.Fields = text; bind(); }
@@ -1973,7 +1973,7 @@ first_error,last_error,backend,connections,auth_modes FROM client_session WHERE 
                 lineStart = line.NextOffset;
                 offset = line.NextOffset;
                 c.Result.Lines++;
-                if (line.Length == 0) { Noise(c, "Empty line", 1); continue; }
+                if (line.Length == 0) { Noise(c, line.Oversized ? LogLine.TooLong : "Empty line", 1); continue; }
                 if (line.First == '#')
                 {
                     if (line.StartsWith("#Fields:")) { string text = line.Text(); c.Map.Load(text); c.Fields = text; bind(); }

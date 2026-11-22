@@ -2,7 +2,7 @@
 #  Exchange Log Report - configuration file
 #  --------------------------------------------------------------------------
 #  Author  : Nicolas Fabert
-#  Version : 3.0.1
+#  Version : 3.1.0
 #
 #  This file is read by Invoke-ExchangeLogReport.ps1. It is a PowerShell data
 #  file: text between quotes, $true / $false, numbers, and @( ) for lists.
@@ -31,6 +31,8 @@
     # Account: SYSTEM on an Exchange server, or a domain account that is local administrator of
     # every Exchange server, plus View-Only Organization Management for -Mode Discover (user guide, chapter 2).
     # Replace the two example lines by your servers, one line each; delete the lines of servers you do not have.
+    # Write host names. An IP address, a UNC name, a path or a name that the last -Mode Discover did not find gives a
+    # warning at every start (nothing is refused): the logs are read from \\<Name>\c$ and the tool connects to that name.
     # ---------------------------------------------------------------------
     Servers = @(
         @{ Name = 'EXCH01' }
@@ -57,7 +59,8 @@
     # ---------------------------------------------------------------------
     # Noise: lines removed BEFORE anything is written to the database. Each removed
     # line is counted by reason (see -Mode Status). Patterns are regular expressions,
-    # case-insensitive, tested on the account name with and without domain.
+    # case-insensitive, tested on the account name with and without domain. A pattern is matched with a limit of
+    # 250 ms: a match that exceeds it counts as no match and the collection ends with a warning (exit code 2).
     # Defaults below were checked against the logs of an Exchange SE lab.
     # ---------------------------------------------------------------------
     Noise = @{
@@ -101,7 +104,7 @@
         LongRunningPatterns    = @('^Mapi\|NotificationWait\|', '^Eas\|Ping\|', '^RpcHttp\|', '^Owa\|.*(notificationchannel|/ev\.owa)', '^PowerShell\|', '^Imap4\|IDLE\|')
         # HttpProxy and the IIS front and back end are written all the time by Exchange (health probes): a newest
         # file older than N hours means that logging stopped or that the logs were moved (0 = no check).
-        # SMTP and message tracking are not checked: a server without mail flow writes nothing there.
+        # SMTP, message tracking, MAPI and POP/IMAP are not checked: a server without mail flow writes nothing there.
         StaleSourceHours       = 24
         # Log files read at the same time, every server and source together (one thread each); one more thread writes
         # the database. 0 = one per processor (2 to 16). They run at below-normal priority: on an Exchange server,
@@ -168,6 +171,7 @@
         # than this and the period ends after it (-Collect / -NoCollect decide for one run). With the hourly
         # scheduled collection, a report never waits for a collection. 0 = never on its own.
         MaxDataAgeMinutes     = 90
+        RetentionDays         = 0                # 0 = reports are never deleted; N: a report run removes the report folders this tool created more than N days ago (folders without its mark file are never removed)
         Title                 = 'Exchange Server usage and troubleshooting'
     }
 
@@ -177,6 +181,17 @@
     Logging = @{
         Path          = '.\logs'
         RetentionDays = 14
+        EventLog      = $false           # $true: security-relevant events (start and end of a run, package refused, warnings, e-mail sent, portal) in the Windows Application log, source ExchangeLogReport
+    }
+
+    # ---------------------------------------------------------------------
+    # Security. Optional section.
+    #   RequireProtectedFolder  $false: when the tool runs elevated and an account that is not an administrator can change the package
+    #                           folder, its code folders or a parent folder, a warning says which account and where (the run goes on).
+    #                           $true: the run is refused instead.
+    # ---------------------------------------------------------------------
+    Security = @{
+        RequireProtectedFolder = $false
     }
 
     # ---------------------------------------------------------------------
@@ -195,7 +210,10 @@
     #                             CredentialFile when it exists. SmtpServer must be a name
     #                             (SPN SMTPSVC/<SmtpServer>, or TargetName behind a load balancer).
     # The certificate of the server is checked (trusted chain, name = SmtpServer), unless
-    # its thumbprint is set in CertificateThumbprint (self-signed Exchange certificate).
+    # its thumbprint is set in CertificateThumbprint (self-signed Exchange certificate): the
+    # thumbprint then replaces the chain and name validation. Its revocation is not checked
+    # unless CheckRevocation is $true. Kerberos with Encryption None authenticates the account
+    # but does not encrypt the message. Every send writes its To, Cc and Bcc in the log file.
     # ---------------------------------------------------------------------
     Mail = @{
         Enabled               = $false
@@ -207,11 +225,15 @@
         CredentialScope       = 'User'             # User: readable by the account that wrote it only | Computer: by any account of this computer
         TargetName            = ''                 # Kerberos SPN when it is not SMTPSVC/<SmtpServer> (load balancer)
         CertificateThumbprint = ''                 # pin the certificate of the server instead of checking its chain
+        MinimumTls            = 'None'             # None | Tls12 | Tls13: a session that negotiates an older TLS version is refused before anything is sent (None: it is sent, with a warning below TLS 1.2)
+        CheckRevocation       = $false             # $true: also check that the certificate of the server is not revoked (needs access to its revocation lists: the send fails when the status cannot be read). Not used with CertificateThumbprint
+        AllowedRecipientDomains = @()              # e.g. @('contoso.com'): every address of To, Cc and Bcc must be in one of these domains (exact domain, any case), else the configuration is refused (empty: no restriction)
         HeloName              = ''                 # EHLO name; empty: the computer name
         From                  = ''                 # e.g. 'exchange-log-report@contoso.com'
         FromName              = 'Exchange Log Report'
         To                    = @()                # e.g. @('messaging-team@contoso.com')
         Cc                    = @()
+        Bcc                   = @()                # hidden from the other recipients; still named in the log file
         Subject               = '{Title} - {Type} report - {Period}'   # also {Range}, {Servers}, {Computer}
         Attach                = 'Html'             # Html (zipped when too large) | Zip (every file) | None
         MaxAttachmentMB       = 7                  # larger: not attached, the body gives the folder of the report

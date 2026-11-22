@@ -59,7 +59,7 @@ internal sealed record StorageAudit(string Name, string Version, bool ReadOnly, 
 
 internal static class StorageAuditTool
 {
-    private const string ToolSha256 = "1D4DBBC37396C5DE744E1A732540B8BC83CD89888F47E86365B726E5A813C5E7";
+    private const string ToolSha256 = "3627C4CE2632949EE6D795C92E0A33F68FB30235F0A55A7719F0636414D8E1D3";
     private const string Sql = """
 PRAGMA query_only=ON;
 PRAGMA temp_store=MEMORY;
@@ -91,7 +91,7 @@ SELECT sqlite_version() AS sqliteVersion,
             throw new StorageFailure("Bundled sqlite3.exe is unavailable. Install the reviewed sqlite-tools package or supply its absolute path with --sqlite-tool; PATH fallback is disabled.");
         using var toolGuard = new FileStream(tool, FileMode.Open, FileAccess.Read, FileShare.Read);
         if (Convert.ToHexString(SHA256.HashData(toolGuard)) != ToolSha256)
-            throw new StorageFailure("SQLite tool SHA-256 does not match the reviewed 3.54.0 executable. Restore the pinned package; the tool was not executed.");
+            throw new StorageFailure("SQLite tool SHA-256 does not match the reviewed 3.54.1 executable. Restore the pinned package; the tool was not executed.");
         var start = new ProcessStartInfo(tool) {
             UseShellExecute = false, RedirectStandardOutput = true, RedirectStandardError = true,
             CreateNoWindow = true, StandardOutputEncoding = new UTF8Encoding(false), StandardErrorEncoding = new UTF8Encoding(false)

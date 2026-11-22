@@ -56,7 +56,7 @@ Describe 'Packaged lossless SQLite maintenance' {
         $result.ExitCode | Should -Be 0 -Because $result.Error
         $audit = $result.Text | ConvertFrom-Json
         $audit.dbstatAvailable | Should -BeTrue
-        $audit.sqliteVersion | Should -Be '3.54.0'
+        $audit.sqliteVersion | Should -Be '3.54.1'
         $audit.objects.name | Should -Contain 'message_event'
         $audit.objects.name | Should -Contain 'ix_msg_flow'
         $audit.pageSize | Should -Be 16384

@@ -12,6 +12,8 @@
     "tests/Serve.RollupVerification.Tests.ps1",
     "tests/Serve.SmtpClients.Tests.ps1",
     "tests/Storage.Tests.ps1",
+    "tests/SupplyChain.Tests.ps1",
+    "tests/VulnerabilityWatch.Tests.ps1",
     "tests/PackageIntegrity.Tests.ps1",
     "tests/Workflow.Tests.ps1"
   ],

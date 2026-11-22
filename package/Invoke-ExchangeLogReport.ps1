@@ -144,6 +144,10 @@
     Serve mode: time budget of one scan request of the portal, 100 to 120000 milliseconds (never more than the
     request deadline). Default: 2000.
 
+.PARAMETER IdleMinutes
+    Serve mode: the portal stops, shutting down cleanly and removing its ReadyFile, after this many minutes without a
+    request. Default: 0 (no limit).
+
 .PARAMETER DevelopmentMode
     Allows a source checkout without a package manifest, and a package whose built binaries (PowerShell runtime,
     SQLite tools) are not verified. A present PackageIntegrity.psd1 is always verified
@@ -199,7 +203,7 @@
 
 .NOTES
     Author  : Nicolas Fabert
-    Version : 3.0.1
+    Version : 3.1.0
     Exit codes : 0 = success, 1 = failure, 2 = finished with warnings (a server, a folder or a file could not
                  be read, a source is stale, the IIS log folders changed since -Mode Discover, or the report
                  could not be sent by e-mail).
@@ -256,6 +260,7 @@ param(
     [ValidateRange(0, 256)][int]$MmapMB = 0,
     [ValidateRange(10000, 1000000)][int]$ClientRowsMax = 50000,
     [ValidateRange(100, 120000)][int]$ScanBudgetMs = 2000,
+    [ValidateRange(0, 10080)][double]$IdleMinutes = 0,
     [switch]$DevelopmentMode,
     [switch]$Collect,
     [switch]$NoCollect,
@@ -266,6 +271,105 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
+function Get-OwnerSignatureVerdict {
+    <#
+        Whether a PowerShell file of the package carries the owner's signature, from a Get-AuthenticodeSignature result. The same text is in
+        the verifier, the module and both entry scripts: each judges the verifier before it runs, so none can borrow the code of another.
+        Accepted when the signer is the pinned certificate, the signature is timestamped and either the status is Valid, or the status is
+        UnknownError (what Windows reports when the certificate chain cannot be built on this computer; the signature itself still verifies,
+        which Windows reports as HashMismatch otherwise) and the chain fails because the root or an intermediate certificate is missing
+        (Relaxed). Never accepted: HashMismatch, NotSigned, NotTrusted (a certificate that an administrator explicitly distrusts), another
+        signer, a missing timestamp, a chain that fails for any other reason (Revoked, NotSignatureValid, ExplicitDistrust...) or only because
+        no revocation source is reachable. Only names of enumerations are read, never message text. -ChainFlags (names of
+        X509ChainStatusFlags) replaces the chain built here.
+    #>
+    param([Parameter(Mandatory)]$Signature, [Parameter(Mandatory)][string]$Pinned, [string[]]$ChainFlags)
+    $status = [string]$Signature.Status
+    $certificate = $Signature.SignerCertificate
+    $verdict = { param([bool]$Accepted, [bool]$Relaxed, [string]$Reason) [pscustomobject]@{ Accepted = $Accepted; Relaxed = $Relaxed; Reason = $Reason; Status = $status } }
+    if ($status -cne 'Valid' -and $status -cne 'UnknownError') { return & $verdict $false $false $status }
+    if ($null -eq $certificate -or $certificate.Thumbprint -cne $Pinned) { return & $verdict $false $false 'UnknownSigner' }
+    if ($null -eq $Signature.TimeStamperCertificate) { return & $verdict $false $false 'NotTimestamped' }
+    if ($status -ceq 'Valid') { return & $verdict $true $false 'Valid' }
+    if ($null -eq $ChainFlags) {
+        # Revocation is read from what this computer already holds and no certificate is downloaded: no network wait on a server without Internet access.
+        $chain = [Security.Cryptography.X509Certificates.X509Chain]::new()
+        try {
+            $chain.ChainPolicy.RevocationMode = [Security.Cryptography.X509Certificates.X509RevocationMode]::Offline
+            $chain.ChainPolicy.DisableCertificateDownloads = $true
+            [void]$chain.Build($certificate)
+            $ChainFlags = @($chain.ChainStatus | ForEach-Object { ([string]$_.Status) -split ',\s*' } | Where-Object { $_ -and $_ -cne 'NoError' } | Select-Object -Unique)
+        }
+        finally { $chain.Dispose() }
+    }
+    $allowed = 'UntrustedRoot', 'PartialChain', 'RevocationStatusUnknown', 'OfflineRevocation', 'NotTimeValid'
+    if (-not @($ChainFlags | Where-Object { $_ -ceq 'UntrustedRoot' -or $_ -ceq 'PartialChain' }).Count -or @($ChainFlags | Where-Object { $_ -cnotin $allowed }).Count) { return & $verdict $false $false 'ChainStatus' }
+    return & $verdict $true $true 'RootNotTrusted'
+}
+function Get-PathReparseTag {
+    <#
+        The tag of the reparse point at Path, or $null when Path is not one. WIN32_FIND_DATAW.dwReserved0 holds the tag when FILE_ATTRIBUTE_REPARSE_POINT
+        is set; FindFirstFileW reads it from the directory entry without opening the item, so a cloud placeholder is not downloaded. The two calls are
+        declared with Reflection.Emit: no C# is compiled, because this runs before the engine exists. Layout of the 592-byte structure: dwFileAttributes
+        at offset 0, dwReserved0 at offset 36. The same text is in the verifier, the module and both entry scripts.
+    #>
+    param([Parameter(Mandatory)][string]$Path)
+    $api = Get-Variable -Name FindFileApi -Scope Script -ValueOnly -ErrorAction Ignore
+    if ($null -eq $api) {
+        $module = [Reflection.Emit.AssemblyBuilder]::DefineDynamicAssembly([Reflection.AssemblyName]::new('ReparseTag'), [Reflection.Emit.AssemblyBuilderAccess]::Run).DefineDynamicModule('ReparseTag')
+        $native = $module.DefineType('Native', 'Public, Abstract, Sealed')
+        foreach ($call in @(@('FindFirstFileW', [IntPtr], @([string], [IntPtr])), @('FindClose', [bool], @([IntPtr])))) {
+            $method = $native.DefinePInvokeMethod($call[0], 'kernel32.dll', $call[0], 'Public, Static, PinvokeImpl', 'Standard', $call[1], [type[]]$call[2], 'Winapi', 'Unicode')
+            $method.SetImplementationFlags('PreserveSig')
+        }
+        $api = $native.CreateType()
+        Set-Variable -Name FindFileApi -Scope Script -Value $api
+    }
+    $full = [IO.Path]::GetFullPath($Path)
+    $full = if ($full.StartsWith('\\?\', [StringComparison]::Ordinal)) { $full } elseif ($full.StartsWith('\\', [StringComparison]::Ordinal)) { '\\?\UNC\' + $full.Substring(2) } else { '\\?\' + $full }
+    $data = [Runtime.InteropServices.Marshal]::AllocHGlobal(592)
+    try {
+        $handle = $api::FindFirstFileW($full, $data)
+        if ($handle -eq [IntPtr]::new(-1)) { throw "Package integrity: the reparse tag of this path cannot be read (Windows error $([Runtime.InteropServices.Marshal]::GetLastSystemError())): $Path" }
+        [void]$api::FindClose($handle)
+        if (([Runtime.InteropServices.Marshal]::ReadInt32($data, 0) -band 0x400) -eq 0) { return $null }
+        return [uint32]([long][Runtime.InteropServices.Marshal]::ReadInt32($data, 36) -band 0xFFFFFFFFL)
+    }
+    finally { [Runtime.InteropServices.Marshal]::FreeHGlobal($data) }
+}
+function Test-ReparseTagAllowed {
+    <#
+        The rule for the tag of a reparse point, not for the bare attribute. Refused: every tag that redirects to another path, that is every tag with the
+        name-surrogate bit 0x20000000 (symbolic link 0xA000000C, junction and mount point 0xA0000003, and the others), and every tag that is not in the closed
+        list below (fail closed). Accepted, the Microsoft types that do not redirect: the cloud files of OneDrive (0x9000001A and its variants 0x9000101A to
+        0x9000F01A, that is the tag with the bits 0x0000F000 cleared), data deduplication 0x80000013 and WOF (Windows Overlay Filter, CompactOS) 0x80000017.
+        The SHA256 of the signed manifest still detects any change of content, including one made by a synchronisation.
+    #>
+    param([Parameter(Mandatory)][uint32]$Tag)
+    if ($Tag -band 0x20000000u) { return $false }
+    return (($Tag -band 0xFFFF0FFFu) -eq 0x9000001Au) -or $Tag -eq 0x80000013u -or $Tag -eq 0x80000017u
+}
+function Get-RefusedReparseTag {
+    <# $null when the item (from Get-Item -Force) is not a reparse point or its tag is accepted by Test-ReparseTagAllowed; otherwise the refused tag as eight hexadecimal digits. #>
+    param([Parameter(Mandatory)]$Item)
+    if (-not ($Item.Attributes -band [IO.FileAttributes]::ReparsePoint)) { return $null }
+    $tag = [uint32](Get-PathReparseTag $Item.FullName)
+    if (Test-ReparseTagAllowed $tag) { return $null }
+    return $tag.ToString('X8')
+}
+function Write-PackageRefusalEvent {
+    <# Event 2000 of the Windows event log when Logging.EventLog is on in the configuration file. Runs before the module exists: it reads that one setting itself and never fails. #>
+    param([string]$ConfigFile, [string]$Message)
+    try {
+        $config = Import-PowerShellDataFile -LiteralPath $ConfigFile -ErrorAction Stop
+        if ($config.Logging -isnot [hashtable] -or $config.Logging.EventLog -ne $true) { return }
+    } catch { return }
+    try {
+        $exists = try { [Diagnostics.EventLog]::SourceExists('ExchangeLogReport') } catch { $true }
+        if (-not $exists) { [Diagnostics.EventLog]::CreateEventSource('ExchangeLogReport', 'Application') }
+        [Diagnostics.EventLog]::WriteEntry('ExchangeLogReport', "Package refused: $Message", [Diagnostics.EventLogEntryType]::Error, 2000)
+    } catch { Write-Warning "Windows event log: the refusal of the package is not written ($($_.Exception.Message))." }
+}
 # -File (the launchers, a scheduled task) hands a comma-separated list over as one string: split it, as a PowerShell array would be.
 foreach ($listName in 'User', 'Server') {
     $listValue = Get-Variable -Name $listName -ValueOnly -ErrorAction SilentlyContinue
@@ -279,6 +383,9 @@ $previousCulture = [Threading.Thread]::CurrentThread.CurrentCulture
 $clock = [Diagnostics.Stopwatch]::StartNew()
 $exitCode = 1
 $runStatus = 'Failed'
+$integrityWarnings = @()
+$eventStarted = $false
+$accountSid = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
 $store = $null; $lock = $null; $runId = $null; $collection = $null
 
 try {
@@ -291,18 +398,20 @@ try {
             $integrityCursor = [IO.Path]::GetFullPath($integrityVerifier)
             while ($integrityCursor) {
                 $integrityItem = Microsoft.PowerShell.Management\Get-Item -LiteralPath $integrityCursor -Force -ErrorAction Stop
-                if ($integrityItem.Attributes -band [IO.FileAttributes]::ReparsePoint) {
-                    throw "Package integrity: reparse point: $integrityCursor"
+                $integrityRefused = Get-RefusedReparseTag $integrityItem
+                if ($integrityRefused) {
+                    throw "Package integrity: reparse point that is not accepted (tag 0x$integrityRefused): $integrityCursor"
                 }
                 $integrityCursor = [IO.Path]::GetDirectoryName($integrityCursor)
             }
             $integritySignature = Microsoft.PowerShell.Security\Get-AuthenticodeSignature -LiteralPath $integrityVerifier -ErrorAction Stop
-            if ([string]$integritySignature.Status -cne 'Valid' -or $null -eq $integritySignature.SignerCertificate -or
-                $integritySignature.SignerCertificate.Thumbprint -cne '0F28E442889F17B5F4D251E8F96E7CC6E2C9C6D6' -or
-                $null -eq $integritySignature.TimeStamperCertificate) {
+            if (-not (Get-OwnerSignatureVerdict -Signature $integritySignature -Pinned '0F28E442889F17B5F4D251E8F96E7CC6E2C9C6D6').Accepted) {
+                Write-PackageRefusalEvent -ConfigFile $ConfigPath -Message 'the signature of the verifier is not the owner signature.'
                 throw 'Package integrity: verifier must have the trusted, timestamped owner signature. Use the complete release ZIP (https://github.com/Nico77600/ExchangeLogReport/releases/latest): extract it again and unblock it. A development or CI build is started from its folder with powershell\pwsh.exe -NoLogo -NoProfile -File Invoke-ExchangeLogReport.ps1 <parameters> -DevelopmentMode.'
             }
-            if ($DevelopmentMode) { & $integrityVerifier -Root $PSScriptRoot -DevelopmentMode | Out-Null } else { & $integrityVerifier -Root $PSScriptRoot -Distribution | Out-Null }
+            $integrityResult = @(if ($DevelopmentMode) { & $integrityVerifier -Root $PSScriptRoot -DevelopmentMode -SuppressTrustWarning } else { & $integrityVerifier -Root $PSScriptRoot -Distribution -SuppressTrustWarning })
+            # One warning per run, printed with the checks of the start (the module imported below does not repeat it).
+            $integrityWarnings = @($integrityResult | ForEach-Object { $_.Warnings } | Where-Object { $_ })
         } elseif (-not $DevelopmentMode) {
             throw 'Package integrity: PackageIntegrity.psd1 is missing. Use the complete release ZIP (https://github.com/Nico77600/ExchangeLogReport/releases/latest): extract it again and unblock it. A development or CI build is started from its folder with powershell\pwsh.exe -NoLogo -NoProfile -File Invoke-ExchangeLogReport.ps1 <parameters> -DevelopmentMode.'
         } else {
@@ -313,6 +422,7 @@ try {
         Import-Module (Join-Path $PSScriptRoot 'ExchangeLogReport.psd1') -Force
 
         if ($Mode -eq 'Serve') {
+            foreach ($w in $integrityWarnings) { Write-Warning "Package integrity: $w" }
             # Only the database and the time zone settings are needed (the days of the daily tables are days of Report.TimeZone). No log,
             # lock, collection, report or mail path is entered. Without a configuration file (-DatabasePath given) the zone is the default one.
             $data = @{}
@@ -322,11 +432,18 @@ try {
                 if ($data.ContainsKey('Storage') -and $data.Storage.ContainsKey('DatabasePath')) { $DatabasePath = [string]$data.Storage.DatabasePath }
                 $DatabasePath = [IO.Path]::GetFullPath($DatabasePath, $PSScriptRoot)
             }
+            $eventLog = $data.ContainsKey('Logging') -and $data.Logging -is [hashtable] -and $data.Logging.ContainsKey('EventLog') -and $data.Logging.EventLog -eq $true
+            if ($eventLog) {
+                Set-ExlEventLog -Enabled $true
+                $eventStarted = $true
+                Write-ExlEvent 1000 Information ("Run started: mode Serve, version {0}, account {1}." -f (Get-Module ExchangeLogReport).Version.ToString(3), $accountSid)
+                foreach ($w in $integrityWarnings) { Write-ExlEvent 2002 Warning "Package integrity: $w" }
+            }
             $zoneId = 'Romance Standard Time'
             if ($data.ContainsKey('Report') -and $data.Report.ContainsKey('TimeZone') -and $data.Report.TimeZone) { $zoneId = [string]$data.Report.TimeZone }
             Start-ExlServe -DatabasePath $DatabasePath -TimeZone (Get-ExlTimeZone $zoneId) -Port $Port -NoBrowser:$NoBrowser `
                 -ReadyFile $ReadyFile -ReadyFileWithToken:$ReadyFileWithToken -RequestTimeoutSeconds $RequestTimeoutSeconds -AggregateTimeoutSeconds $AggregateTimeoutSeconds -MmapMB $MmapMB `
-                -ClientRowsMax $ClientRowsMax -ScanBudgetMs $ScanBudgetMs -DevelopmentMode:$DevelopmentMode
+                -ClientRowsMax $ClientRowsMax -ScanBudgetMs $ScanBudgetMs -IdleMinutes $IdleMinutes -EventLog:$eventLog -DevelopmentMode:$DevelopmentMode
             $exitCode = 0
             $runStatus = 'Completed'
             break
@@ -339,6 +456,8 @@ try {
         # Parameters that this mode does not use: shown after the banner with the reason, never ignored silently.
         $ignored = @(Get-ExlIgnoredParameter -Mode $Mode -Name @($PSBoundParameters.Keys))
         if (-not $ReportType) { $ReportType = $settings.Report.DefaultType }
+        $canonicalType = @('Usage', 'Detailed') | Where-Object { $_ -ieq $ReportType } | Select-Object -First 1
+        if ($canonicalType) { $ReportType = $canonicalType }
         if ($PSBoundParameters.ContainsKey('IncludeRoutingDetails')) { $settings.Report.IncludeRoutingDetails = [bool]$IncludeRoutingDetails }
         if ($PSBoundParameters.ContainsKey('IncludeSessionDetails')) { $settings.Report.IncludeSessionDetails = [bool]$IncludeSessionDetails }
         if ($OutputPath) { $settings.Report.OutputPath = [IO.Path]::GetFullPath($OutputPath, (Get-Location).Path) }
@@ -346,13 +465,23 @@ try {
         $servers = @($settings.Servers)
         if ($Server) {
             $unknown = @($Server | Where-Object { $_ -notin $servers.Name })
-            if ($unknown.Count) { throw ("Unknown server(s): {0}. Servers of the configuration: {1}." -f ($unknown -join ', '), ($servers.Name -join ', ')) }
+            if ($unknown.Count) { throw ("Unknown server(s): {0}. Servers of the configuration: {1}." -f (@($unknown | ForEach-Object { ConvertTo-ExlSafeText $_ }) -join ', '), ($servers.Name -join ', ')) }
             $servers = @($servers | Where-Object { $_.Name -in $Server })
         }
         $zone = $settings.Zone
 
-        $logPath = Start-ExlLog -Directory $settings.Logging.Path -RetentionDays $settings.Logging.RetentionDays
+        $logPath = Start-ExlLog -Directory $settings.Logging.Path -RetentionDays $settings.Logging.RetentionDays -EventLog:$settings.Logging.EventLog
         $dot = [char]0x00B7
+        if ($settings.Logging.EventLog) {
+            $eventStarted = $true
+            Write-ExlEvent 1000 Information ("Run started: mode {0}, version {1}, account {2}." -f $Mode, (Get-Module ExchangeLogReport).Version.ToString(3), $accountSid)
+            foreach ($w in $integrityWarnings) { Write-ExlEvent 2002 Warning "Package integrity: $w" }
+        }
+        # Checks made before anything is read: the configuration, and the permissions of the package folder when this run is elevated.
+        $folderNotes = @(Test-ExlPackageFolderSecurity -Root $PSScriptRoot)
+        if ($folderNotes.Count -and $settings.Security.RequireProtectedFolder) { throw ('Security.RequireProtectedFolder is $true and the package folder is not protected. ' + ($folderNotes -join ' ')) }
+        $startNotes = @($integrityWarnings | ForEach-Object { "Package integrity: $_" }) + @($settings.Warnings) + $folderNotes
+        $addNotes = { param($Values) if ($startNotes.Count) { $Values['Checks'] = @('Warn', ("{0} warning(s) at the start (see above and the log file)" -f $startNotes.Count)) } }
 
         # ---- test of the e-mail settings (no database, no log file read) ------------------------------
         if ($Mode -eq 'MailTest') {
@@ -364,7 +493,7 @@ try {
             $banner['To'] = @('People', (@($m.To) + @($m.Cc | ForEach-Object { "$_ (Cc)" }) -join ', '))
             $banner['Log'] = @('Log', $logPath)
             Write-ExlBanner -Title 'Exchange Log Report' -Subtitle "Exchange Server SE $dot test of the e-mail settings" -Details $banner
-            foreach ($n in $ignored) { Write-ExlItem Warn $n }
+            foreach ($n in @($ignored) + $startNotes) { Write-ExlItem Warn $n }
             $problems = @(Test-ExlMailReady -Settings $settings)
             if ($problems.Count) { throw ('The Mail section of the configuration is not complete: ' + ($problems -join ' ')) }
             Initialize-ExlEngine -Root $PSScriptRoot
@@ -388,6 +517,7 @@ try {
             $values['TLS'] = @($(if ($mail.Tls) { 'Ok' } else { 'Warn' }), $(if ($mail.Tls) { $mail.Tls } else { 'none: the message travels in clear' }))
             if ($mail.Certificate) { $values['Certificate'] = @('File', $mail.Certificate) }
             if ($mail.AuthenticationUsed) { $values['Account'] = @('People', $mail.AuthenticationUsed) }
+            & $addNotes $values
             if ($mail.Sent) {
                 $values['Message'] = @('Ok', ("{0} {1} {2} bytes {1} {3}" -f $mail.MessageId, $dot, (Format-ExlNumber $mail.MessageBytes), $mail.Response))
                 Write-ExlSummary -Title 'Test message sent' -Values $values -Status $(if ($mail.Refused.Count) { 'Warn' } else { 'Ok' })
@@ -411,7 +541,7 @@ try {
             $banner['Paths'] = @('File', $settings.PathsFile)
             $banner['Log'] = @('Log', $logPath)
             Write-ExlBanner -Title 'Exchange Log Report' -Subtitle "Exchange Server SE $dot discovery of the log folders" -Details $banner
-            foreach ($n in $ignored) { Write-ExlItem Warn $n }
+            foreach ($n in @($ignored) + $startNotes) { Write-ExlItem Warn $n }
             $found = Invoke-ExlDiscovery -Settings $settings -ConnectTo $ConnectTo -Credential $Credential
             $values = [ordered]@{}
             $mailbox = @($found.Found | Where-Object { $_ -notin $found.Edge })
@@ -423,6 +553,7 @@ try {
             $values['Warnings'] = @($(if ($found.Warnings.Count) { 'Warn' } else { 'Ok' }), $(if ($found.Warnings.Count) { "$($found.Warnings.Count) (see above and the log file)" } else { 'none' }))
             $values['File'] = @('File', $found.File)
             $values['Next'] = @('Info', '.\Run-Collector.cmd -Mode Collect')
+            & $addNotes $values
             Write-ExlSummary -Title 'Log paths discovered' -Values $values -Status $(if ($found.Warnings.Count -or $found.NotFound.Count) { 'Warn' } else { 'Ok' })
             $exitCode = 0; $runStatus = 'Completed'
             break
@@ -461,7 +592,7 @@ try {
         $banner['Paths'] = @('Folder', $(if ($settings.Discovery) { "found by -Mode Discover on $($settings.Discovery.When.Substring(0, [Math]::Min(16, $settings.Discovery.When.Length)).Replace('T', ' '))" } else { 'default folders (run -Mode Discover to check them)' }))
         $banner['Log'] = @('Log', $logPath)
         Write-ExlBanner -Title 'Exchange Log Report' -Subtitle "Exchange Server SE $dot usage and troubleshooting from the server logs" -Details $banner
-        foreach ($n in $ignored) { Write-ExlItem Warn $n }
+        foreach ($n in @($ignored) + $startNotes) { Write-ExlItem Warn $n }
         if ($settings.Discovery -and $settings.Discovery.Collector -and $settings.Discovery.Collector -ne [Environment]::MachineName.ToUpperInvariant()) {
             Write-ExlItem Warn "The paths file was written on $($settings.Discovery.Collector): run -Mode Discover on this computer."
         }
@@ -475,11 +606,13 @@ try {
         Write-ExlStep $step $totalSteps 'Opening the database' -Icon Database
         if (-not $collecting -and -not (Test-Path -LiteralPath $settings.Storage.DatabasePath)) {
             Write-ExlItem Info 'No database yet: the first collection (-Mode Collect) creates it.'
-            Write-ExlSummary -Title 'Ready for the first collection' -Values ([ordered]@{
-                    Config  = @('Ok', "valid $dot $($settings.Servers.Count) server(s)")
-                    Engine  = @('Ok', 'ready')
-                    Next    = @('Info', '.\Run-Collector.cmd -Mode Collect')
-                }) -Status Ok
+            $readyValues = [ordered]@{
+                Config  = @('Ok', "valid $dot $($settings.Servers.Count) server(s)")
+                Engine  = @('Ok', 'ready')
+                Next    = @('Info', '.\Run-Collector.cmd -Mode Collect')
+            }
+            & $addNotes $readyValues
+            Write-ExlSummary -Title 'Ready for the first collection' -Values $readyValues -Status Ok
             $exitCode = 0; $runStatus = 'Completed'
             break
         }
@@ -525,7 +658,7 @@ try {
             $step++
             Write-ExlStep $step $totalSteps 'Reading the new log lines' -Icon Download
             $collection = Invoke-ExlCollection -Store $store -Settings $settings -RunId $runId -Servers $servers
-            if ($collection.Errors -or $collection.Unreachable.Count -or $collection.Stale.Count) { $incomplete = $true }
+            if ($collection.Errors -or $collection.Unreachable.Count -or $collection.Stale.Count -or $collection.Warnings.Count) { $incomplete = $true }
             foreach ($s in $collection.Stale) { Write-ExlItem Warn "$s. Logging stopped, or the logs were moved: run -Mode Discover." }
             $noisePercent = if ($collection.Lines) { 100.0 * $collection.Noise / $collection.Lines } else { 0 }
             Write-ExlItem Ok ("{0} files {5} {1} read {5} {2} lines {5} {3} kept {5} noise removed {4:0.0}%" -f (Format-ExlNumber $collection.Files), (Format-ExlBytes $collection.Bytes),
@@ -542,13 +675,15 @@ try {
         if ($Mode -eq 'Collect') {
             $store.EndRun($runId, $(if ($incomplete) { 'Incomplete' } else { 'Completed' }), $collection.Files, $collection.Bytes, $collection.Lines, $collection.Kept, $collection.Noise, $null)
             $runId = $null
-            Write-ExlSummary -Title $(if ($incomplete) { 'Collection finished with warnings' } else { 'Collection complete' }) -Values ([ordered]@{
-                    Servers  = @('Server', ($servers.Name -join ', '))
-                    Read     = @('Download', ("{0} in {1} files" -f (Format-ExlBytes $collection.Bytes), (Format-ExlNumber $collection.Files)))
-                    Kept     = @('Ok', ("{0} lines of real activity {1} {2} noise lines removed" -f (Format-ExlNumber $collection.Kept), $dot, (Format-ExlNumber $collection.Noise)))
-                    Database = @('Database', (Format-ExlBytes $store.FileBytes))
-                    Duration = @('Clock', (Format-ExlDuration $clock.Elapsed.TotalSeconds))
-                }) -Status $(if ($incomplete) { 'Warn' } else { 'Ok' })
+            $collectValues = [ordered]@{
+                Servers  = @('Server', ($servers.Name -join ', '))
+                Read     = @('Download', ("{0} in {1} files" -f (Format-ExlBytes $collection.Bytes), (Format-ExlNumber $collection.Files)))
+                Kept     = @('Ok', ("{0} lines of real activity {1} {2} noise lines removed" -f (Format-ExlNumber $collection.Kept), $dot, (Format-ExlNumber $collection.Noise)))
+                Database = @('Database', (Format-ExlBytes $store.FileBytes))
+                Duration = @('Clock', (Format-ExlDuration $clock.Elapsed.TotalSeconds))
+            }
+            & $addNotes $collectValues
+            Write-ExlSummary -Title $(if ($incomplete) { 'Collection finished with warnings' } else { 'Collection complete' }) -Values $collectValues -Status $(if ($incomplete) { 'Warn' } else { 'Ok' })
             $exitCode = if ($incomplete) { 2 } else { 0 }
             $runStatus = 'Completed'
             break
@@ -570,6 +705,7 @@ try {
             $store.EndRun($runId, $(if ($incomplete) { 'Incomplete' } else { 'Completed' }), $collection.Files, $collection.Bytes, $collection.Lines, $collection.Kept, $collection.Noise, $null)
             $runId = $null
         }
+        try { Invoke-ExlReportRetention -Settings $settings } catch { Write-ExlItem Warn "Report retention: $($_.Exception.Message)" }
         $c = $report.Counts
         $edgeReport = $c.ContainsKey('smtpdestinations')
         $periodText = Format-ExlRange $period.StartMs $period.EndMs $zone
@@ -613,6 +749,7 @@ try {
         if ($report.HtmlPath) { $values['Open'] = @('Report', $report.HtmlPath) }
         if ($mail) { $values['Mail'] = @($(if ($mail.Sent) { 'Mail' } else { 'Warn' }), $(if ($mail.Sent) { 'sent to ' + ((@($settings.Mail.To) + @($settings.Mail.Cc)) -join ', ') } else { 'not sent' })) }
         $values['Duration'] = @('Clock', (Format-ExlDuration $clock.Elapsed.TotalSeconds))
+        & $addNotes $values
         $mailFailed = $mailing -and -not ($mail -and $mail.Sent -and -not @($mail.Refused).Count)
         $title = if ($collectionWarnings -and $mailFailed) { 'Report ready (collection incomplete, e-mail not sent)' } elseif ($collectionWarnings) { 'Report ready (collection incomplete)' } elseif ($mailFailed) { 'Report ready (e-mail not sent)' } else { 'Report ready' }
         Write-ExlSummary -Title $title -Values $values -Status $(if ($incomplete) { 'Warn' } else { 'Ok' })
@@ -621,7 +758,9 @@ try {
     } while ($false)
 }
 catch {
-    $message = $_.Exception.Message
+    # The module may not be loaded yet (a package refused by its verifier): the control characters are replaced here, line breaks kept.
+    $text = if (Get-Command Resolve-ExlFailureMessage -ErrorAction SilentlyContinue) { Resolve-ExlFailureMessage -Exception $_.Exception -DatabasePath $(if ($settings) { $settings.Storage.DatabasePath }) } else { $_.Exception.Message }
+    $message = [regex]::Replace($text, '[\x00-\x08\x0B\x0C\x0E-\x1F\x7F-\x9F\u2028\u2029]', '?')
     Write-Host ''
     Write-Host ("  ERROR: {0}" -f $message) -ForegroundColor Red
     try { Write-ExlLog 'ERROR' ($message + [Environment]::NewLine + $_.ScriptStackTrace) } catch { }
@@ -631,6 +770,9 @@ catch {
 finally {
     if ($store) { $store.Dispose() }
     if ($lock) { Exit-ExlLock $lock }
+    try {
+        if ($eventStarted) { Write-ExlEvent 1001 $(if ($exitCode -eq 0) { 'Information' } elseif ($exitCode -eq 2) { 'Warning' } else { 'Error' }) ("Run ended: mode {0}, exit code {1}, {2:0} s." -f $Mode, $exitCode, $clock.Elapsed.TotalSeconds) }
+    } catch { }
     try { Write-ExlLog 'INFO' ("End: {0}, exit code {1}, {2:0.0} s" -f $runStatus, $exitCode, $clock.Elapsed.TotalSeconds); Stop-ExlLog } catch { }
     [Threading.Thread]::CurrentThread.CurrentCulture = $previousCulture
 }
@@ -639,8 +781,8 @@ exit $exitCode
 # SIG # Begin signature block
 # MIImKgYJKoZIhvcNAQcCoIImGzCCJhcCAQExDzANBglghkgBZQMEAgEFADB5Bgor
 # BgEEAYI3AgEEoGswaTA0BgorBgEEAYI3AgEeMCYCAwEAAAQQH8w7YFlLCE63JNLG
-# KX7zUQIBAAIBAAIBAAIBAAIBADAxMA0GCWCGSAFlAwQCAQUABCCEk7sCoOOqwqoX
-# uh+GvJAQTY0Xfa0Bd1dUeF7EvQajzaCCDW8wggZyMIIEWqADAgECAghkM1HTxzif
+# KX7zUQIBAAIBAAIBAAIBAAIBADAxMA0GCWCGSAFlAwQCAQUABCCOGcGCT/1ZpZ7i
+# /8rzhAzVvdY5JA+HmGmf8v9j0mEObKCCDW8wggZyMIIEWqADAgECAghkM1HTxzif
 # CDANBgkqhkiG9w0BAQsFADB8MQswCQYDVQQGEwJVUzEOMAwGA1UECAwFVGV4YXMx
 # EDAOBgNVBAcMB0hvdXN0b24xGDAWBgNVBAoMD1NTTCBDb3Jwb3JhdGlvbjExMC8G
 # A1UEAwwoU1NMLmNvbSBSb290IENlcnRpZmljYXRpb24gQXV0aG9yaXR5IFJTQTAe
@@ -717,23 +859,23 @@ exit $exitCode
 # A1UEAwwrU1NMLmNvbSBDb2RlIFNpZ25pbmcgSW50ZXJtZWRpYXRlIENBIFJTQSBS
 # MQIQBof4ljXihJpmCqqt2mhAWzANBglghkgBZQMEAgEFAKCBhDAYBgorBgEEAYI3
 # AgEMMQowCKACgAChAoAAMBkGCSqGSIb3DQEJAzEMBgorBgEEAYI3AgEEMBwGCisG
-# AQQBgjcCAQsxDjAMBgorBgEEAYI3AgEVMC8GCSqGSIb3DQEJBDEiBCBakMKeNN6i
-# cwqOGvoWL7f4sk1oHbE24lloPTLNkuxJ7DANBgkqhkiG9w0BAQEFAASCAgBiFz1i
-# xntGfZwR4QUifBnxTBln4bqSXAWsByfvBGDIDyliN/5OLYCrLX/90bbLr03a9UhA
-# J19gPPx+JVkkpygcTC1JKyrqSvis3pgr3SLQ5KV1f8m6asv3+LGlc7yBH0Vd/Hbq
-# 5rQJPnezR1JNBRNSkU6W1WZWmKHVvtG71DipUebkuAlCPv6RqTiofac2tuzGpCT2
-# Nl09Q5mwbmqUq0FQRR8AJGoJr0CIJOOoyR/dTxoDvyQlnMyjNDj/PhX+AKGlxiow
-# PwABNDKQzgsfPjxUHeqatRND/cUgHfmKwhuvElTGJvUD4kgjg4MT7V4Xcs0nQIS3
-# qu95Hqh/CxDYEmoD0e0tjx+Rkbo1mmbfJiKsCh52nvpTniiKXLr0RmZGlUxeyBM7
-# InqzCYPtLbMDlC2QTxN+SgpZjrcCSU6lsrgxVIiJMacXbl/suraqzlPLtegfUorc
-# 3ix1sTig1XQA+9jxoM0BE8z6zmEsefkLbqq+RdR/N4TfwxhHdaUwwl5K8bBIn7Tn
-# 0nJhxHCOdGVoSId1BaHMFzbNotfB95D4jn1gaTJOVcbJSPb5l3c65JrPCEACeLgY
-# qDJMGdmfObiDPZc08hQ5HD5MTjRbMxAZUxALBp73oIw3G0gN8OZfn+v9K13S5B4D
-# ntpWOehbCZjl0dRMWRBXAO0z6cwGda1Vnf+IbaGCFM4wghTKBgorBgEEAYI3AwMB
+# AQQBgjcCAQsxDjAMBgorBgEEAYI3AgEVMC8GCSqGSIb3DQEJBDEiBCDSv7yeBDZ7
+# RmD8DyZoq22IbwnLdkCHPhmM98x0LNcC7jANBgkqhkiG9w0BAQEFAASCAgA6nsUR
+# akzyZ3tjRwEfkLFvne1djEm+6AhgcEcPo4YiDksvbEmi4tZCzUZU3+1Mi0xfJLce
+# UBlEiZHh9ygkpsZF0jpVQj1Whquabx3KSkIy6GkHu7CqKG00/o4OiJYttrqf6hg8
+# cwBOUnZNFdz76nKoYHJkzH2BCe0P6mzMhOY2QnJtqrhWCf0xsLkdWRzISHeh4wee
+# SzRk/BrX4NjciMrqzFnWt9FkANK8t0MIbCyxO7M3UXNvFa8HfE3ruin12xZyxnTs
+# rMnYVnB3bh321e/Bn9SJhVUBee+rjpbOtkvEDhbo/dY7XMeS/1/jksZZlTKZ4fJc
+# /4i78DxUGH2XggnpCBHHO410VybH3hY/LjGVZPulo9Qn7+cHoR6uak57CJM/27xd
+# GWhzvyv0vBDcOgTqoryt8XNkORxZ072cPUnJ/Ab2rJT0Ei+EpefpU8ewqzezg01f
+# is4JBCpRUyfm7DhTdkyY7b6QzT4IgrwBCCYn4eYnIkIO88azfxKhMevceqWB361y
+# YZDNCybwlkCDD8mpN4psc+90yN0S5Py0aY10x2QdETMfHesE4s5LXQX6HfI1NzlG
+# lToH0Ro0CZnrHWBNJP+tfqDw46183FIkJblKXVBHlS3HxCaLJkEWSQjMjXW87tDh
+# AiLjj3ODEcYZqhgLppljhGoz21ByOwg6eLSIe6GCFM4wghTKBgorBgEEAYI3AwMB
 # MYIUujCCFLYGCSqGSIb3DQEHAqCCFKcwghSjAgEDMQ0wCwYJYIZIAWUDBAIBMIGJ
 # BgsqhkiG9w0BCRABBKB6BHgwdgIBAQYMKwYBBAGCqTABAwYBMDEwDQYJYIZIAWUD
-# BAIBBQAEIN3uFi/CnVPOJfwhxx42AvtzX1STVpl8k4WQ5fjLlPxfAghdSqS0uyoA
-# lhgPMjAyNjExMTcyMTA0MzBaMAMCAQECEE3mLNSJ9dBeBaH0CKibd3ugghGnMIIE
+# BAIBBQAEIFRG4weWsFn+2Y364nOzcoJ4rcjlKvPun4HK+3JbmZxwAggVPvDq5Ycs
+# dRgPMjAyNjExMjIxMTA5MDNaMAMCAQECEFGVjHQBwVJ5CmV3h8BFlvagghGnMIIE
 # 8zCCAtugAwIBAgIQVEP4N71a7hgBhHK4XNqO4zANBgkqhkiG9w0BAQsFADByMQsw
 # CQYDVQQGEwJVUzEOMAwGA1UECAwFVGV4YXMxEDAOBgNVBAcMB0hvdXN0b24xETAP
 # BgNVBAoMCFNTTCBDb3JwMS4wLAYDVQQDDCVTU0wuY29tIFRpbWVzdGFtcGluZyBJ
@@ -832,13 +974,13 @@ exit $exitCode
 # czEQMA4GA1UEBwwHSG91c3RvbjERMA8GA1UECgwIU1NMIENvcnAxLjAsBgNVBAMM
 # JVNTTC5jb20gVGltZXN0YW1waW5nIElzc3VpbmcgUlNBIENBIDICEFRD+De9Wu4Y
 # AYRyuFzajuMwCwYJYIZIAWUDBAIBoIIBYDAaBgkqhkiG9w0BCQMxDQYLKoZIhvcN
-# AQkQAQQwHAYJKoZIhvcNAQkFMQ8XDTI2MTExNzIxMDQzMFowKAYJKoZIhvcNAQk0
-# MRswGTALBglghkgBZQMEAgGhCgYIKoZIzj0EAwIwLwYJKoZIhvcNAQkEMSIEIBT5
-# kx3PxNPx02lulH1PdGEiTWp0Kum+SzoEHviVGlz7MIHIBgsqhkiG9w0BCRACLzGB
+# AQkQAQQwHAYJKoZIhvcNAQkFMQ8XDTI2MTEyMjExMDkwM1owKAYJKoZIhvcNAQk0
+# MRswGTALBglghkgBZQMEAgGhCgYIKoZIzj0EAwIwLwYJKoZIhvcNAQkEMSIEINXJ
+# rv2VEuf7Xx0j76aPLrxKoClTp5351/5f8w2gP7AuMIHIBgsqhkiG9w0BCRACLzGB
 # uDCBtTCBsjCBrwQgV0/qF6r6XnxqK5sIyZixc15FCzhzykTmokygkw5j87AwgYow
 # dqR0MHIxCzAJBgNVBAYTAlVTMQ4wDAYDVQQIDAVUZXhhczEQMA4GA1UEBwwHSG91
 # c3RvbjERMA8GA1UECgwIU1NMIENvcnAxLjAsBgNVBAMMJVNTTC5jb20gVGltZXN0
 # YW1waW5nIElzc3VpbmcgUlNBIENBIDICEFRD+De9Wu4YAYRyuFzajuMwCgYIKoZI
-# zj0EAwIERzBFAiEA8xjkL3D0RQORF/Odl8lKOc9uYVa9CXoLzKv+VZxDcKcCIAwm
-# lY9DrSXtiSrV3+7FFbezJKfi5MDWYjJqrhpFICmB
+# zj0EAwIERzBFAiA56zjm1ki4u0Ob58bFyQYLVhpqQwMotEj/ySIhGPCLrwIhAOWV
+# JArTXM3yT1Dg4SC/0jOTrfxdNx830UND28EDKhZq
 # SIG # End signature block

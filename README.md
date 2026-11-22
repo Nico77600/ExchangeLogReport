@@ -20,16 +20,16 @@
 </p>
 
 **Author:** Nicolas Fabert  
-**Version:** 3.0.1
+**Version:** 3.1.0
 
 > [!TIP]
-> **Download the latest release.** Open the [latest release](https://github.com/Nico77600/ExchangeLogReport/releases/latest) and download **`ExchangeLogReport-3.0.1-win-x64.zip`** under *Assets* (its SHA-256 is in the release notes). That ZIP is the whole signed tool: its own PowerShell, the portal, SQLite and the guides. Nothing else is installed. Do not use the **Source code** archives or the green **Code** button: they hold the scripts only, without the PowerShell runtime or the SQLite tools.
+> **Download the latest release.** Open the [latest release](https://github.com/Nico77600/ExchangeLogReport/releases/latest) and download **`ExchangeLogReport-3.1.0-win-x64.zip`** under *Assets* (its SHA-256 is in the release notes). That ZIP is the whole signed tool: its own PowerShell, the portal, SQLite and the guides. Nothing else is installed. Do not use the **Source code** archives or the green **Code** button: they hold the scripts only, without the PowerShell runtime or the SQLite tools. Check the download before you extract it: the publisher thumbprint (`0F28E442889F17B5F4D251E8F96E7CC6E2C9C6D6`), `gh attestation verify <zip> --repo Nico77600/ExchangeLogReport` and the SBOM (`ExchangeLogReport-<version>-win-x64.zip.spdx.json`, next to the ZIP) are described in the [developer guide, 5.3](package/docs/ExchangeLogReport-Guide.md#53-verify-the-download). To hear about new releases and security advisories, watch the repository on GitHub (Watch, then Custom, then Releases and Security alerts); see [SECURITY](SECURITY.md).
 
 > [!IMPORTANT]
 > Windows marks files downloaded from the Internet. After you extract the ZIP, check the publisher first (right-click a `.ps1`, for example `Invoke-ExchangeLogReport.ps1`, Properties, Digital Signatures: `Nicolas Fabert`), then unblock the extracted folder once:
 >
 > ```powershell
-> Get-ChildItem "E:\Tools\ExchangeLogReport" -Recurse -File -Force | Unblock-File
+> Get-ChildItem "C:\Program Files\ExchangeLogReport" -Recurse -File -Force | Unblock-File
 > ```
 >
 > Replace the example path with the folder where you extracted the ZIP.
@@ -60,7 +60,7 @@ One path for everyone. Set the tool up once (**1 to 4**), then take one branch, 
 - **B · Troubleshooting**: a **Detailed report** on a user, a message or an incident, answered in minutes. For the Exchange administrators and support.
 - **C · Investigate in the browser**: the same history in **the portal** (Serve mode), read on demand without building a report first.
 
-The commands use one example — servers `EXCH01` to `EXCH04`, the package extracted in `E:\Tools\ExchangeLogReport` on EXCH01 and run as SYSTEM, `contoso.com`, `alice`. Copy them as they are and only change these names to yours; the [user guide](package/docs/ExchangeLogReport-UserGuide.md) explains each step, what you should see and what to do if not.
+The commands use one example — servers `EXCH01` to `EXCH04`, the package extracted in `C:\Program Files\ExchangeLogReport` on EXCH01 and run as SYSTEM, `contoso.com`, `alice`. Copy them as they are and only change these names to yours; the [user guide](package/docs/ExchangeLogReport-UserGuide.md) explains each step, what you should see and what to do if not.
 
 | You want to | Run, from the package folder | You get |
 |---|---|---|
@@ -75,7 +75,7 @@ The commands use one example — servers `EXCH01` to `EXCH04`, the package extra
 ```powershell
 # On EXCH01, in Windows PowerShell (the blue icon) opened as administrator, in the folder
 # of the package; the .cmd files start the PowerShell inside the package
-cd E:\Tools\ExchangeLogReport
+cd "C:\Program Files\ExchangeLogReport"
 
 # 1 · List the servers: one @{ Name = 'EXCH01' } line per server, in Servers
 notepad .\config\ExchangeLogReport.config.psd1
@@ -89,7 +89,7 @@ notepad .\config\ExchangeLogReport.config.psd1
 
 # 3 · Then every hour, as SYSTEM
 schtasks /Create /F /RU SYSTEM /RL HIGHEST /TN "Exchange Log Report - collect" `
-    /SC HOURLY /TR "E:\Tools\ExchangeLogReport\Run-Collector.cmd -Mode Collect"
+    /SC HOURLY /TR "\"C:\Program Files\ExchangeLogReport\Run-Collector.cmd\" -Mode Collect"
 
 # 4 · Check, right after the first collection: every server and every source has data
 .\Run-Collector.cmd -Mode Status
@@ -108,9 +108,9 @@ Always start the tool through `Run-Collector.cmd`, by hand and in the scheduled 
 #     the 1st of every month the last month (Usage); then a Usage report on the
 #     last 30 days, now, so that you do not wait for the 1st
 schtasks /Create /F /RU SYSTEM /RL HIGHEST /TN "Exchange Log Report - daily report" `
-    /SC DAILY /ST 07:00 /TR "E:\Tools\ExchangeLogReport\Run-Collector.cmd -Range Last24Hours -ReportType Detailed"
+    /SC DAILY /ST 07:00 /TR "\"C:\Program Files\ExchangeLogReport\Run-Collector.cmd\" -Range Last24Hours -ReportType Detailed"
 schtasks /Create /F /RU SYSTEM /RL HIGHEST /TN "Exchange Log Report - monthly report" `
-    /SC MONTHLY /D 1 /ST 07:00 /TR "E:\Tools\ExchangeLogReport\Run-Collector.cmd -Range PreviousMonth"
+    /SC MONTHLY /D 1 /ST 07:00 /TR "\"C:\Program Files\ExchangeLogReport\Run-Collector.cmd\" -Range PreviousMonth"
 .\Run-Collector.cmd -Range Last30Days
 
 # 6 · Open the newest report: an HTML file, it works offline and can be sent as is
@@ -320,22 +320,23 @@ After a recipient: `(Handed off)`, `(Sent to external)`, `(Suppressed)`, `(Expan
 | `-Mode Discover` | Runs the Exchange cmdlets in Windows PowerShell 5.1 (built into Windows Server), since they are not supported in PowerShell 7 |
 | Account | Local administrator of every Exchange server, to read the log folders over the administrative shares. On an Exchange server: SYSTEM (member of *Exchange Trusted Subsystem*), nothing to configure. On an administration server: a domain account, with *Log on as a batch job* on that server ([developer guide, 4.1](package/docs/ExchangeLogReport-Guide.md#41-where-to-run-it-and-with-which-account)) |
 | Exchange role | *View-Only Organization Management*, for `-Mode Discover` only — the collection reads files and needs no Exchange role |
-| Network | SMB (445) from the collector to every server; from an administration server, also HTTP (80) to one Exchange server for `-Mode Discover` (remote PowerShell, Kerberos) |
+| Network | SMB (445) from the collector to every server, with SMB signing required; from an administration server, also HTTP (80) to one Exchange server for `-Mode Discover` (remote PowerShell over HTTP with Kerberos, which encrypts its content; [developer guide, 4.3](package/docs/ExchangeLogReport-Guide.md#43-network-protection)) |
 | Logging | SMTP protocol logging `Verbose` on the connectors to analyse; POP/IMAP protocol logs optional. HTTP Proxy, IIS, MAPI and message tracking logs are on by default |
-| Browser | Any current desktop browser, for the HTML reports and the portal |
+| Browser | A current desktop Edge, Chrome or Firefox, for the HTML reports (they carry a Content-Security-Policy) and the portal |
+| Installation folder | Under `%ProgramFiles%` (for example `C:\Program Files\ExchangeLogReport`), writable by the administrators and SYSTEM only; `data`, `reports` and `logs` writable by the collector account only ([developer guide, 5.2](package/docs/ExchangeLogReport-Guide.md#52-lock-down-the-installation-folder)) |
 | Edge Transport | Its own copy of the tool on the Edge itself, as SYSTEM or a local administrator |
 | E-mail (optional) | SMTP (25, 587 or 465) from the collector to a receive connector that accepts it: anonymous, Basic or Kerberos |
 | SQLite | Bundled in `lib\sqlite` — nothing to install |
 
 ## Quick start
 
-1. Download `ExchangeLogReport-3.0.1-win-x64.zip` from the [latest release](https://github.com/Nico77600/ExchangeLogReport/releases/latest), extract it to an access-restricted local folder on the collector, for example `E:\Tools\ExchangeLogReport`, check the publisher and unblock the folder (see *Important* above).
+1. Download `ExchangeLogReport-3.1.0-win-x64.zip` from the [latest release](https://github.com/Nico77600/ExchangeLogReport/releases/latest), check it ([developer guide, 5.3](package/docs/ExchangeLogReport-Guide.md#53-verify-the-download)) and extract it to a local folder that only the administrators can change, preferably under `%ProgramFiles%` (`C:\Program Files\ExchangeLogReport`, the folder of every example of the guides), check the publisher and unblock the folder (see *Important* above), then lock the folder down ([developer guide, 5.2](package/docs/ExchangeLogReport-Guide.md#52-lock-down-the-installation-folder)).
 2. Open Windows PowerShell as administrator in that folder and follow *Set up once · 1 to 4* in [Get started](#get-started): list the servers, run `-Mode Discover`, run the first collection by hand with `-Mode Collect`, create the hourly task, then check with `-Mode Status`.
 3. Take branch A, B or C of [Get started](#get-started).
 
 ## Package layout
 
-The ZIP has one top folder, `ExchangeLogReport-3.0.1-win-x64`:
+The ZIP has one top folder, `ExchangeLogReport-3.1.0-win-x64`:
 
 ```text
 Run-Collector.cmd  Start-Portal.cmd  Database-Storage.cmd   launchers: verify the package, then start the bundled PowerShell
@@ -376,13 +377,23 @@ The tool was also validated on a lab of four Exchange Server SE servers (two sit
 
 **The package is checked before it runs.** Every launcher checks the files of the package against a list signed by the author; a changed or unknown file stops the tool before anything runs. Your configuration is not checked: it is yours to edit. How the check works: [developer guide, 5.1](package/docs/ExchangeLogReport-Guide.md#51-package-integrity).
 
-**The tool only reads Exchange.** It writes its database, reports and logs on the local disk of the collector. The portal runs on this computer only (`127.0.0.1`): never share its private link.
+**The tool only reads Exchange.** It writes its database, reports and logs on the local disk of the collector. The portal runs on this computer only (`127.0.0.1`, port 8765 by default): anyone who has its private link reads everything the portal shows, and the link is on the command line of the browser at launch, so never share it and start the portal in your own session ([developer guide, 15.7](package/docs/ExchangeLogReport-Guide.md#157-who-can-read-the-portal)).
+
+**The package folder is checked for who can change it.** When the tool runs elevated and an account that is not an administrator can write the package folder, a code folder or a parent folder, it warns and names the account and the folder; `Security.RequireProtectedFolder = $true` refuses to run instead. On a server that does not trust the publisher root certificate, the package is still accepted on the pinned publisher certificate and the signed file hashes, with one warning; a modified, unsigned or differently signed file is never accepted.
 
 Report e-mail is disabled in the delivered configuration. `-SendMail` or `Mail.Enabled` enables it; `-SendMail:$false` suppresses it for one report. `-Mode MailTest` sends a test message independently of `Mail.Enabled`.
 
 **What the reports contain.** Noise removal is not anonymisation. The database and reports can contain account names, e-mail and IP addresses, device identifiers, message subjects and SMTP transcripts.
 
-**Who protects them.** You do: restrict access to the database and report folders, and review the recipients before enabling e-mail. The database deletes old data by itself, but not the HTML or CSV reports you exported or sent by e-mail: protect and delete those yourself.
+**Who protects them.** You do: restrict access to the database and report folders, and review the recipients before enabling e-mail. The database and the logs delete old data by themselves, but a report is deleted only when you set `Report.RetentionDays` (default `0`: never), and an export in the download folder of the browser, a copy made by `Database-Storage.cmd` or an e-mail: protect and delete those yourself ([developer guide, 10.1](package/docs/ExchangeLogReport-Guide.md#101-personal-data-and-its-removal), with a command that prunes the reports by age).
+
+**What the e-mail protects.** `StartTls` and `Tls` encrypt the message, and `Mail.MinimumTls` sets the lowest TLS version accepted (a session below TLS 1.2 gives a warning). Kerberos with `Encryption = 'None'` proves the account but does not encrypt; the revocation of the server certificate is not checked unless `Mail.CheckRevocation` is `$true`; a pinned thumbprint replaces the chain and name validation. `Mail.AllowedRecipientDomains` limits the recipients to the domains you list, and every send logs its To, Cc and Bcc ([developer guide, 8.1](package/docs/ExchangeLogReport-Guide.md#81-sending-the-report-by-e-mail)).
+
+**For the operator.** The organisation that runs the tool is the controller of the data it stores: the database is a processing with its own purpose and retention (60 and 14 days by default), and a report about one named person is a use to agree with your data protection officer, and with staff representatives where the law requires it, before you produce it. This is information, not legal advice ([developer guide, 10.1](package/docs/ExchangeLogReport-Guide.md#101-personal-data-and-its-removal)). Removing the tool and its data: [developer guide, 5.5](package/docs/ExchangeLogReport-Guide.md#55-remove-the-tool).
+
+**Deployment checklist.** The security requirements of a deployment, gathered on one page (accounts, folder permissions, SMB signing, e-mail, clocks, volume encryption, retention, and the outbound connections of the platform; the tool itself needs no Internet access): [Annex D of the developer guide](package/docs/ExchangeLogReport-Guide.md#annex-d--deployment-security-checklist).
+
+**A verdict is not a decommissioning decision.** *No real usage* and the absence of warnings do not by themselves authorise the decommissioning of a server: SMTP, message tracking, MAPI and POP/IMAP sources have no stale check ([developer guide, chapter 9](package/docs/ExchangeLogReport-Guide.md#9-reading-the-report)).
 
 Passwords and other sign-in data of SMTP conversations are removed before the database stores them. Transcripts stored by an earlier version are masked in reports and CSV exports; the existing database content is not rewritten.
 

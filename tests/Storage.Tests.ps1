@@ -16,7 +16,7 @@ BeforeAll {
         # The JSON report is the only standard output: the unverified-source-tree warning of the import is not written there.
         'Import-Module (Join-Path $Root ''ExchangeLogReport.psd1'') -Force 3>$null',
         'Initialize-ExlEngine -Root $Root -WithStorage 3>$null',
-        'exit [ExchangeLogReport.Storage.StorageCli]::Run([string[]]@(ConvertFrom-Json -InputObject $env:EXL_STORAGE_ARGS), ''3.0.1'', $Tool)') -join "`n")
+        'exit [ExchangeLogReport.Storage.StorageCli]::Run([string[]]@(ConvertFrom-Json -InputObject $env:EXL_STORAGE_ARGS), ''3.1.0'', $Tool)') -join "`n")
     . (Join-Path $PSScriptRoot 'Storage.Fixtures.ps1')
     $marker = 'SYNTHETIC_PRIVATE_PAYLOAD_NEVER_EMIT'
     # -StatusRules: two more messages whose tracking row differs between the schema 8-11 and the schema-12 recipient rules (a SEND without DELIVER).
@@ -140,8 +140,8 @@ Describe 'Explicit copy-only SQLite storage maintenance' {
         $output = Join-Path $work 'audit.json'
         $r = Invoke-Storage @('--storage-audit', '--database', $source, '--output', $output)
         $r.Code | Should -Be 0 -Because $r.Error
-        $r.Json.sqliteVersion | Should -Be '3.54.0'
-        $r.Json.nativeSqliteVersion | Should -Be '3.53.3'
+        $r.Json.sqliteVersion | Should -Be '3.54.1'
+        $r.Json.nativeSqliteVersion | Should -Be '3.54.0'
         $r.Json.dbstatAvailable | Should -BeTrue
         $r.Json.objects.name | Should -Contain 'message_event'
         $r.Json.objects.name | Should -Contain 'ix_msg_flow'

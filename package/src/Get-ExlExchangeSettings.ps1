@@ -25,7 +25,7 @@
 
 .NOTES
     Author  : Nicolas Fabert
-    Version : 3.0.1
+    Version : 3.1.0
 #>
 [CmdletBinding()]
 param(
@@ -70,8 +70,14 @@ function Get-VersionText($Value) {
     return $text
 }
 
+function Get-ErrorId($Record) {
+    # The error id and the exception type: names that do not depend on the language of Windows.
+    return ('{0} {1}' -f $Record.FullyQualifiedErrorId, $Record.Exception.GetType().FullName)
+}
+
 $session = $null
 $exitCode = 0
+$failureId = $null
 try {
     if ($PSVersionTable.PSEdition -ne 'Desktop') { throw 'This helper must run in Windows PowerShell 5.1 (powershell.exe).' }
     $credential = $null
@@ -85,14 +91,14 @@ try {
         # ---- Edge Transport server: local Exchange Management Shell (no remote PowerShell, no RBAC) ----
         $method = 'Exchange Management Shell (Edge Transport)'
         try { Add-PSSnapin Microsoft.Exchange.Management.PowerShell.E2010 -ErrorAction Stop }
-        catch { throw ("The Exchange Management Shell of the Edge Transport server {0} could not be loaded as {1} (Add-PSSnapin Microsoft.Exchange.Management.PowerShell.E2010): the account must be a local administrator of the server. {2}" -f $env:COMPUTERNAME, [Security.Principal.WindowsIdentity]::GetCurrent().Name, $_.Exception.Message.Trim()) }
+        catch { $failureId = Get-ErrorId $_; throw ("The Exchange Management Shell of the Edge Transport server {0} could not be loaded as {1} (Add-PSSnapin Microsoft.Exchange.Management.PowerShell.E2010): the account must be a local administrator of the server. {2}" -f $env:COMPUTERNAME, [Security.Principal.WindowsIdentity]::GetCurrent().Name, $_.Exception.Message.Trim()) }
         $via = $env:COMPUTERNAME
     } elseif (-not $candidates.Count -and -not $credential -and $install -and (Test-Path -LiteralPath (Join-Path $install 'bin\RemoteExchange.ps1'))) {
         # ---- Exchange Management Shell of this server ----
         $method = 'Exchange Management Shell'
         . (Join-Path $install 'bin\RemoteExchange.ps1') *> $null
         $reason = $null
-        try { Connect-ExchangeServer -Auto -ClientApplication:ManagementShell *> $null } catch { $reason = $_.Exception.Message.Trim() }
+        try { Connect-ExchangeServer -Auto -ClientApplication:ManagementShell *> $null } catch { $reason = $_.Exception.Message.Trim(); $failureId = Get-ErrorId $_ }
         if (-not (Get-Command Get-ExchangeServer -ErrorAction SilentlyContinue)) {
             throw ("The Exchange Management Shell of {0} could not connect as {1} (Connect-ExchangeServer -Auto). The account needs View-Only Organization Management (or above).{2}" -f $env:COMPUTERNAME, [Security.Principal.WindowsIdentity]::GetCurrent().Name, $(if ($reason) { ' ' + $reason } else { '' }))
         }
@@ -225,6 +231,7 @@ try {
 }
 catch {
     [Console]::Error.WriteLine($_.Exception.Message)
+    [Console]::Error.WriteLine('ErrorId: ' + $(if ($failureId) { $failureId } else { Get-ErrorId $_ }))
     $exitCode = 1
 }
 finally {
@@ -236,8 +243,8 @@ exit $exitCode
 # SIG # Begin signature block
 # MIImKgYJKoZIhvcNAQcCoIImGzCCJhcCAQExDzANBglghkgBZQMEAgEFADB5Bgor
 # BgEEAYI3AgEEoGswaTA0BgorBgEEAYI3AgEeMCYCAwEAAAQQH8w7YFlLCE63JNLG
-# KX7zUQIBAAIBAAIBAAIBAAIBADAxMA0GCWCGSAFlAwQCAQUABCA/6V+0LeXz+UDF
-# xZWvAFKIG3RcvWyxeFBYfPInV+WO2qCCDW8wggZyMIIEWqADAgECAghkM1HTxzif
+# KX7zUQIBAAIBAAIBAAIBAAIBADAxMA0GCWCGSAFlAwQCAQUABCDNX7C4Ay9vhOM3
+# CibuYov6DyfSaMjsla+Ug93vbEkpB6CCDW8wggZyMIIEWqADAgECAghkM1HTxzif
 # CDANBgkqhkiG9w0BAQsFADB8MQswCQYDVQQGEwJVUzEOMAwGA1UECAwFVGV4YXMx
 # EDAOBgNVBAcMB0hvdXN0b24xGDAWBgNVBAoMD1NTTCBDb3Jwb3JhdGlvbjExMC8G
 # A1UEAwwoU1NMLmNvbSBSb290IENlcnRpZmljYXRpb24gQXV0aG9yaXR5IFJTQTAe
@@ -314,23 +321,23 @@ exit $exitCode
 # A1UEAwwrU1NMLmNvbSBDb2RlIFNpZ25pbmcgSW50ZXJtZWRpYXRlIENBIFJTQSBS
 # MQIQBof4ljXihJpmCqqt2mhAWzANBglghkgBZQMEAgEFAKCBhDAYBgorBgEEAYI3
 # AgEMMQowCKACgAChAoAAMBkGCSqGSIb3DQEJAzEMBgorBgEEAYI3AgEEMBwGCisG
-# AQQBgjcCAQsxDjAMBgorBgEEAYI3AgEVMC8GCSqGSIb3DQEJBDEiBCBB8UYrVc/V
-# KJGPerIcln6ETrAy2t7ynvjzNr+T6j0BRjANBgkqhkiG9w0BAQEFAASCAgAEIEgL
-# geWZ0iQQtJif0aOY0x5geuW8UTsMfguPqZk34GXYiJ5RwNJFOewxSmV1fhNX24vo
-# NwZ0vp3Xw72uHSQckPpFWVIJYWUg4m3d+qE7I9Gr0Mz75h5GvBQTzjr7Gxq+Ey2+
-# y1lQaC2dNR849LNQFo6XCfAKkrShBudQYM9TGmcH3sZCKx678AmFxL2TuZZ67t0t
-# lmNBa94N2+ez+4NKUmgtHdCRaiS2qALVWW5Q4IXvMLr9K3spVyqWppEfnrcKTt6N
-# eOF51jdTCeiu91E7GAsMRxu2ld3sUStTcSRH4JfbPr8ru2t/YMuS99TwFZqMtR6X
-# Hj2xnEZWZ80u86xlI5+6w/SDdVAykOi0Y7I3qIk2Vyly1yDFcFCDnKQ0iSyzbmeg
-# cJRapDi8Xvxwg8oreenGTYThVYaoOoDLenPveB/DGNThkbh6OwYFkQJK3ufrfozt
-# MiSEdISMNA8+OjQAVqZ/pwOC5OXA2YAbZVi3/lUg5svg2YmCWILIFdDX3Z68uyej
-# bOjzxTjnU7O00cevP7eGpQpeB/Vpd70q/tUj8x7f6Ps8479YfIl28abAGnIdqThb
-# Ei1ycN+y/MQNmiyU6xwhlMB5yhThPNaf6kQq3VlnkYVfpky8aQEC1m/VCEirR8Ss
-# 52x8AkUcC8VfIWxCHNekxCyFpW28CUvKxbmCq6GCFM4wghTKBgorBgEEAYI3AwMB
+# AQQBgjcCAQsxDjAMBgorBgEEAYI3AgEVMC8GCSqGSIb3DQEJBDEiBCDUJFTwV0eN
+# W2srw1SR6d+NEQnDLyiHa6bdqy9MWRhSIjANBgkqhkiG9w0BAQEFAASCAgBd0Z5H
+# 6iHZuQ1LVc4ErF6v8dPFxkh8dBDOLNu0wx9JFki4PGvn9X9DG4KnBUqE3cvHohNm
+# NZa3GkEablBQEZboc1p3Qu2KSER2aA1EN+OpoTTKCPKc7iRqdY/7ij31CZgh4G9h
+# ZYuemoi0aHUlcRxXfDypezVXT6Y+BzDm1i13A2vFAeMRvQoa6DPz8e25KaaQgzJ+
+# KsncIG0c+QlwopzwbIaro5VefRuy0lER+o81o+NI/HwYfu0A+iZYCf1+7u3VUlcG
+# sjzgF53hJoH2Ka1xoJsngilTQax33gDsiR5Y97OitlsEbUeovjiO+3UubNS7qG9D
+# 3zEOyW43LUqCim3xElqq3nqBDy/DRqgSJqjfQpgOI+sm3OReZGBxWBVZFyY4C2+7
+# Ss5b78bfpTVmRy2yxm0lIvzOHoUgkhhiEzaeK9cZPWRvh2M4QGbxAB6CwBJsAiIg
+# rWOSa48ng7IcfDz6K0AenxDlzHdGoGRaNtETDoIQDgrDwyU72bjvdEOkoIvbRosH
+# 3SjbJ0uJkX0uizs7C0LudujgmyUtQdldIepEYufoKin4hwyqIOaIDRsJWCXx+o6d
+# dWG5bhVnjmG8Hp36iYlCISUhDvaHW8XBOL1ZPiyQJLE3TEpq0fcUTZUPY1ytulk3
+# q/l1fF8zLvpwpWmkia/yvB0g/QHVUesNTiJO3aGCFM4wghTKBgorBgEEAYI3AwMB
 # MYIUujCCFLYGCSqGSIb3DQEHAqCCFKcwghSjAgEDMQ0wCwYJYIZIAWUDBAIBMIGJ
 # BgsqhkiG9w0BCRABBKB6BHgwdgIBAQYMKwYBBAGCqTABAwYBMDEwDQYJYIZIAWUD
-# BAIBBQAEIPT2g4QnQaGP27dYg6DJ3wFxfbrxTUOFzRHch3RXefKCAggm7g0pepg9
-# KhgPMjAyNjExMTcyMTA1MDJaMAMCAQECECVipfrSzr4WvE2HkA69ov+gghGnMIIE
+# BAIBBQAEID2r3qYK5nNganxTcaC3+5Zpo3dQ491+9xbT+xVMqSlHAggss/Y+Yl56
+# CBgPMjAyNjExMjIxMTA5MTlaMAMCAQECEFtNqCQE52RgMAFNFK/L4yqgghGnMIIE
 # 8zCCAtugAwIBAgIQVEP4N71a7hgBhHK4XNqO4zANBgkqhkiG9w0BAQsFADByMQsw
 # CQYDVQQGEwJVUzEOMAwGA1UECAwFVGV4YXMxEDAOBgNVBAcMB0hvdXN0b24xETAP
 # BgNVBAoMCFNTTCBDb3JwMS4wLAYDVQQDDCVTU0wuY29tIFRpbWVzdGFtcGluZyBJ
@@ -429,13 +436,13 @@ exit $exitCode
 # czEQMA4GA1UEBwwHSG91c3RvbjERMA8GA1UECgwIU1NMIENvcnAxLjAsBgNVBAMM
 # JVNTTC5jb20gVGltZXN0YW1waW5nIElzc3VpbmcgUlNBIENBIDICEFRD+De9Wu4Y
 # AYRyuFzajuMwCwYJYIZIAWUDBAIBoIIBYDAaBgkqhkiG9w0BCQMxDQYLKoZIhvcN
-# AQkQAQQwHAYJKoZIhvcNAQkFMQ8XDTI2MTExNzIxMDUwMlowKAYJKoZIhvcNAQk0
-# MRswGTALBglghkgBZQMEAgGhCgYIKoZIzj0EAwIwLwYJKoZIhvcNAQkEMSIEIHPP
-# w35ZCIoSoTBnoOITpN9JoK54rg261G0L8idWcMKVMIHIBgsqhkiG9w0BCRACLzGB
+# AQkQAQQwHAYJKoZIhvcNAQkFMQ8XDTI2MTEyMjExMDkxOVowKAYJKoZIhvcNAQk0
+# MRswGTALBglghkgBZQMEAgGhCgYIKoZIzj0EAwIwLwYJKoZIhvcNAQkEMSIEIO+A
+# 9IxsYf9QO1zLw3ATzSFu2a3CV1in7CfEYq/puh7MMIHIBgsqhkiG9w0BCRACLzGB
 # uDCBtTCBsjCBrwQgV0/qF6r6XnxqK5sIyZixc15FCzhzykTmokygkw5j87AwgYow
 # dqR0MHIxCzAJBgNVBAYTAlVTMQ4wDAYDVQQIDAVUZXhhczEQMA4GA1UEBwwHSG91
 # c3RvbjERMA8GA1UECgwIU1NMIENvcnAxLjAsBgNVBAMMJVNTTC5jb20gVGltZXN0
 # YW1waW5nIElzc3VpbmcgUlNBIENBIDICEFRD+De9Wu4YAYRyuFzajuMwCgYIKoZI
-# zj0EAwIERzBFAiAFj2dpEmO2DTu7HAajXVgXo6tRbllFdbXbN9XHzVrnrAIhAKSp
-# 0QFzSztvrSAyqyzLWayQcUxdvMiH0Jvti1BxZNKB
+# zj0EAwIERzBFAiBmRp1WoAx50+ltbrlimLn/1v0HWphgkNeDZz3NRlBUJgIhAOQ6
+# bs8zolvXKXtC+2RvQuqXUkvCp2LebNlL9aZhCH54
 # SIG # End signature block

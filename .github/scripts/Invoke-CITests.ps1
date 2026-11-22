@@ -34,7 +34,7 @@ if (-not $serveTests.Count) { throw 'The Serve regression tests are required bef
 $configuration = New-PesterConfiguration
 $configuration.Run.Path = @(
     foreach ($name in 'ExchangeLogReport', 'SqliteOptimization', 'Serve.Backend', 'Serve.Initialization', 'Serve.MeasurementGate', 'Serve.Performance',
-        'Serve.RollupVerification', 'Serve.SmtpClients', 'PackageIntegrity', 'Workflow') {
+        'Serve.RollupVerification', 'Serve.SmtpClients', 'SupplyChain', 'VulnerabilityWatch', 'PackageIntegrity', 'Workflow') {
         Join-Path $tests ($name + '.Tests.ps1')
     }
 )
@@ -52,7 +52,7 @@ $configuration.Run.PassThru = $true
 $configuration.Run.Exit = $false
 $configuration.Output.Verbosity = 'Normal'
 # The tests tagged Measurement measure the memory of fresh processes: they run last and alone, after every other test.
-$configuration.Filter.ExcludeTag = 'Measurement'
+$configuration.Filter.ExcludeTag = @('Measurement', 'Online')
 $result = Invoke-Pester -Configuration $configuration
 $measurement = New-PesterConfiguration
 $measurement.Run.Path = $configuration.Run.Path.Value

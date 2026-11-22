@@ -1,5 +1,11 @@
 {
   "productionSourceRoot": "package\\src",
   "requiresSqlite": true,
-  "requiresPowerShell": false
+  "requiresPowerShell": false,
+  "netAnalyzers": {
+    "package": "Microsoft.CodeAnalysis.NetAnalyzers",
+    "version": "8.0.0",
+    "url": "https://www.nuget.org/api/v2/package/Microsoft.CodeAnalysis.NetAnalyzers/8.0.0",
+    "sha256": "67a3086fd949b2460e122059477ea9c05239c167a46a3c79589bd50366bf7fd6"
+  }
 }

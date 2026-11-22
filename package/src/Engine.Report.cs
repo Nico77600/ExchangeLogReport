@@ -2,7 +2,7 @@
 //  Exchange Log Report - engine, part 4: report (SQLite -> CSV + HTML)
 // -----------------------------------------------------------------------------
 //  Author  : Nicolas Fabert
-//  Version : 3.0.1
+//  Version : 3.1.0
 //
 //  Datasets (HTML tabs: sessions, issues, users, operations, messages, smtpclients; servers and daily
 //  feed the server cards and the chart; every dataset is also a CSV file). Edge report (every server of
@@ -235,8 +235,14 @@ namespace ExchangeLogReport
             if (string.IsNullOrWhiteSpace(connector)) return true;
             if (_internal == null)
                 _internal = new System.Text.RegularExpressions.Regex(string.Join("|", _defaults.Concat(_connectors).Select(p => "(?:" + p + ")")),
-                    System.Text.RegularExpressions.RegexOptions.IgnoreCase | System.Text.RegularExpressions.RegexOptions.CultureInvariant);
-            return _internal.IsMatch(connector);
+                    System.Text.RegularExpressions.RegexOptions.IgnoreCase | System.Text.RegularExpressions.RegexOptions.CultureInvariant, TimeSpan.FromSeconds(2));
+            // A match that exceeds the time limit twice claims nothing: the connector is taken as one that stays inside.
+            for (int attempt = 0; attempt < 2; attempt++)
+            {
+                try { return _internal.IsMatch(connector); }
+                catch (System.Text.RegularExpressions.RegexMatchTimeoutException) { }
+            }
+            return true;
         }
 
         internal bool IsCollected(string peer) { return !string.IsNullOrEmpty(peer) && _servers.Contains(peer); }
@@ -901,6 +907,9 @@ namespace ExchangeLogReport
 
         // ------------------------------------------------------------------ build
 
+        /// <summary>Name of the file that marks a report folder written by this tool.</summary>
+        public const string ReportMark = ".exl-report";
+
         public static ReportResult Build(Store store, ReportRequest q)
         {
             if (q.MemoryBudgetMB < 64 || q.MemoryBudgetMB > 16384) throw new ArgumentOutOfRangeException("MemoryBudgetMB", "Report memory budget must be 64 to 16384 MB.");
@@ -911,6 +920,10 @@ namespace ExchangeLogReport
             if (!new[] { "Auto", "SingleFile", "Folder" }.Contains(q.HtmlLayout ?? "", StringComparer.OrdinalIgnoreCase)) throw new ArgumentOutOfRangeException("HtmlLayout", "Report.HtmlLayout must be 'Auto', 'SingleFile' or 'Folder'.");
             var result = new ReportResult { Folder = q.OutputFolder, Title = q.Title };
             Directory.CreateDirectory(q.OutputFolder);
+            // The mark of a folder this tool created: Report.RetentionDays removes no other folder.
+            string mark = Path.Combine(q.OutputFolder, ReportMark);
+            if (!File.Exists(mark))
+                File.WriteAllText(mark, "Exchange Log Report: report folder\r\nCreated=" + DateTimeOffset.UtcNow.ToString("yyyy-MM-ddTHH:mm:ssZ", CultureInfo.InvariantCulture) + "\r\n", new UTF8Encoding(false));
             long previousCache = L(store.Query("PRAGMA cache_size;", null).Rows[0][0]);
             _steps = new List<KeyValuePair<double, string>>();
             _transcriptReads = 0; _transcriptBytes = 0;
@@ -1861,6 +1874,15 @@ namespace ExchangeLogReport
 
         // ------------------------------------------------------------------ CSV
 
+        /// <summary>A cell that a spreadsheet would run as a formula: a formula character after any leading blanks, or a leading tab or line break.</summary>
+        internal static bool IsFormulaCell(string s)
+        {
+            int i = 0;
+            while (i < s.Length && (s[i] == ' ' || s[i] == '\t' || s[i] == '\r' || s[i] == '\n')) i++;
+            if (i == s.Length) return false;
+            return "=+-@".IndexOf(s[i]) >= 0 || s[0] == '\t' || s[0] == '\r' || s[0] == '\n';
+        }
+
         internal static string Csv(object v, string sep)
         {
             if (v == null) return "";
@@ -1868,7 +1890,7 @@ namespace ExchangeLogReport
             if (v is string) s = (string)v;
             else if (v is long || v is int || v is double) return Convert.ToString(v, CultureInfo.InvariantCulture);
             else s = Convert.ToString(v, CultureInfo.InvariantCulture);
-            if (s.Length > 0 && "=+-@\t\r".IndexOf(s[0]) >= 0) s = "'" + s;
+            if (IsFormulaCell(s)) s = "'" + s;
             if (s.IndexOf(sep, StringComparison.Ordinal) >= 0 || s.IndexOf('"') >= 0 || s.IndexOf('\n') >= 0 || s.IndexOf('\r') >= 0) s = "\"" + s.Replace("\"", "\"\"") + "\"";
             return s;
         }

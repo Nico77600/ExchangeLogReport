@@ -1,0 +1,48 @@
+name: Bug report
+description: Something does not work as documented.
+labels:
+  - bug
+body:
+  - type: markdown
+    attributes:
+      value: |
+        **Issues are public.** Before you write or attach anything, remove personal data (user names, mail addresses, IP addresses, host names), credentials and tokens, and customer configuration. Do not paste raw Exchange logs, a configuration file or a database.
+
+        **A security problem is not a bug report.** Do not describe it here: open the Security tab, then **Report a vulnerability**, to write to the maintainer privately.
+
+        This is a personal project maintained on a best-effort basis, with no guaranteed response time.
+  - type: input
+    id: version
+    attributes:
+      label: Version
+      description: The version of the release ZIP you use (for example 3.1.0).
+    validations:
+      required: true
+  - type: input
+    id: environment
+    attributes:
+      label: Environment
+      description: Windows Server version and Exchange Server version, without server names.
+    validations:
+      required: false
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened, and what did you expect
+      description: The command you ran and its error identifier or message, with sensitive values replaced by placeholders.
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      description: Minimal steps, ideally with a few synthetic log lines instead of real ones.
+    validations:
+      required: false
+  - type: checkboxes
+    id: no-sensitive-data
+    attributes:
+      label: Confirmation
+      options:
+        - label: I removed personal data, credentials and customer configuration from this report, and it does not describe a security vulnerability.
+          required: true

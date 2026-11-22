@@ -44,6 +44,8 @@ namespace ExchangeLogReport
         public int ClientRowsMax { get; set; } = 50000;
         /// <summary>Time budget of one scan request (milliseconds, 100..120,000), returned by /api/report-meta capped at the request deadline.</summary>
         public int ScanBudgetMs { get; set; } = 2000;
+        /// <summary>The portal stops after this many minutes without a request (0: no limit). Fractions of a minute are allowed.</summary>
+        public double IdleMinutes { get; set; }
     }
 
     /// <summary>
@@ -117,6 +119,9 @@ namespace ExchangeLogReport
                 ConsoleCancelEventHandler interrupt = (s,e) => { e.Cancel = true; stop.Cancel(); };
                 Console.CancelKeyPress += interrupt;
                 var running = new List<Task>();
+                // Idle limit: the ticks of the last request accepted or answered, and the requests being answered.
+                long lastActivity = Environment.TickCount64;
+                int answering = 0;
                 var tickets = new ConcurrentDictionary<string, ServeExportTicket>(StringComparer.Ordinal);
                 // Admission classes in progress: [Aggregate] the period aggregates and the exports, at most MaxConcurrency - 2 (at least one); [Exports]
                 // the exports among them, at most ExportLimit: an export has no total deadline, so another aggregate admission remains for the overview
@@ -154,6 +159,7 @@ namespace ExchangeLogReport
                             {
                                 // The admission of a request ends before its response is closed: a client that sends its next request as soon as it has
                                 // read an answer finds the worker free.
+                                Interlocked.Increment(ref answering);
                                 int released = 0;
                                 Action release = () => { if (Interlocked.Exchange(ref released, 1) == 0) { dismiss(request.Value); slots.Release(); } };
                                 try { Handle(request.Key, options, site, origin, tokenBytes, stop, cache, tickets, release, request.Value == Lists); }
@@ -166,9 +172,29 @@ namespace ExchangeLogReport
                                     Console.WriteLine("Serve: client left before the answer of " + Logged(left));
                                 }
                                 catch { stop.Cancel(); throw; }
-                                finally { release(); }
+                                finally { release(); Interlocked.Decrement(ref answering); Volatile.Write(ref lastActivity, Environment.TickCount64); }
                             }
                         }, CancellationToken.None, TaskCreationOptions.LongRunning | TaskCreationOptions.DenyChildAttach, TaskScheduler.Default));
+                    if (options.IdleMinutes > 0)
+                    {
+                        long idleMs = (long)(options.IdleMinutes * 60000);
+                        running.Add(Task.Run(async () =>
+                        {
+                            try
+                            {
+                                while (!stop.IsCancellationRequested)
+                                {
+                                    await Task.Delay((int)Math.Max(50, Math.Min(1000, idleMs / 4)), stop.Token).ConfigureAwait(false);
+                                    if (Volatile.Read(ref answering) == 0 && work.Count == 0 && Environment.TickCount64 - Volatile.Read(ref lastActivity) >= idleMs)
+                                    {
+                                        Console.WriteLine("Serve: stopped after " + options.IdleMinutes.ToString("0.##", CultureInfo.InvariantCulture) + " minute(s) without a request.");
+                                        stop.Cancel();
+                                    }
+                                }
+                            }
+                            catch (OperationCanceledException) { }
+                        }));
+                    }
                     if (options.ReadyFile != null)
                     {
                         WriteReady(options.ReadyFile, JsonSerializer.Serialize(new {
@@ -216,6 +242,7 @@ namespace ExchangeLogReport
                         HttpListenerContext context;
                         try { context = await listener.GetContextAsync().ConfigureAwait(false); }
                         catch (Exception e) when ((e is HttpListenerException || e is ObjectDisposedException) && stop.IsCancellationRequested) { break; }
+                        Volatile.Write(ref lastActivity, Environment.TickCount64);
                         // An aggregate or a request of the list layer is admitted without taking a worker beyond the share of its class; an answer the
                         // result cache holds is a light request.
                         int admission = Light;
@@ -310,6 +337,8 @@ namespace ExchangeLogReport
             response.Headers["X-Content-Type-Options"] = "nosniff";
             response.Headers["X-Frame-Options"] = "DENY";
             response.Headers["Referrer-Policy"] = "no-referrer";
+            response.Headers["Cross-Origin-Opener-Policy"] = "same-origin";
+            response.Headers["Cross-Origin-Resource-Policy"] = "same-origin";
             response.Headers["Content-Security-Policy"] = policy;
         }
         static async Task Json(HttpListenerResponse response, int status, object value, CancellationToken cancel)
@@ -940,7 +969,7 @@ namespace ExchangeLogReport
 
         internal static string Escape(string v)
         {
-            if (v.Length > 0 && "=+-@\t\r".IndexOf(v[0]) >= 0) v = "'" + v;
+            if (ReportBuilder.IsFormulaCell(v)) v = "'" + v;
             return v.IndexOfAny(new[] { '"', ';', '\r', '\n' }) >= 0 ? "\"" + v.Replace("\"", "\"\"") + "\"" : v;
         }
 
