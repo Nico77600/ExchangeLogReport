@@ -966,7 +966,7 @@ Describe 'Reparse points are judged by their tag' {
     It 'judges a path by its tag and not by the bare ReparsePoint attribute, in the four places that judge one' {
         foreach ($relative in 'src\Test-PackageIntegrity.ps1', 'ExchangeLogReport.psm1', 'Invoke-ExchangeLogReport.ps1', 'Database-Storage.ps1') {
             $text = [IO.File]::ReadAllText((Join-Path $script:Source $relative))
-            ($text -split "`r?`n" | Where-Object { $_ -match '\$\w+\.Attributes -band \[IO\.FileAttributes\]::ReparsePoint' -and $_ -notmatch '\$Item\.Attributes' }).Count | Should -Be 0 -Because $relative
+            @($text -split "`r?`n" | Where-Object { $_ -match '\$\w+\.Attributes -band \[IO\.FileAttributes\]::ReparsePoint' -and $_ -notmatch '\$Item\.Attributes' }).Count | Should -Be 0 -Because $relative
         }
     }
 

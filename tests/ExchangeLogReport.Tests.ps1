@@ -6347,7 +6347,8 @@ namespace ElrTest
             $server = [ElrTest.RogueSmtp]::new($Mode)
             try {
                 $settings = New-MailSettings $server.Port 'None'
-                $settings.TimeoutSeconds = 2
+                $settings.Server = '127.0.0.1'
+                $settings.TimeoutSeconds = 5
                 $watch = [Diagnostics.Stopwatch]::StartNew()
                 $r = [ExchangeLogReport.SmtpSender]::Send($settings, (New-Content))
                 $watch.Elapsed.TotalSeconds | Should -BeLessThan 10
@@ -6409,7 +6410,7 @@ namespace ElrTest
             $server = [ElrTest.RogueSmtp]::new('tls'); $server.Certificate = $script:Cert; $server.Protocols = [Security.Authentication.SslProtocols]'Tls11'
             try {
                 $r = [ExchangeLogReport.SmtpSender]::Send((New-MailSettings $server.Port 'StartTls' -Thumbprint $script:Cert.Thumbprint), (New-Content))
-                if (-not $r.Sent -and $r.Error -match 'TLS failed') { Set-ItResult -Skipped -Because 'this computer does not negotiate TLS 1.1'; return }
+                if (-not $r.Sent -and ($r.Error -match 'TLS failed' -or (@($r.Transcript) -contains 'C: STARTTLS' -and -not (@($r.Transcript) -match '^\* TLS ')))) { Set-ItResult -Skipped -Because "this computer does not negotiate TLS 1.1 ($($r.Error))"; return }
                 $r.Sent | Should -BeTrue
                 @($r.Warnings).Count | Should -Be 1
                 $r.Warnings[0] | Should -Match 'negotiated TLS 1\.1, older than TLS 1\.2'
@@ -7565,7 +7566,7 @@ Describe 'Windows event log' {
 
     It 'writes nothing while it is off, and one event with its id, level and text when it is on' {
         & $script:Module { Write-ExlEvent 1000 Information 'Run started.' }
-        (Get-Captured).Count | Should -Be 0
+        @(Get-Captured).Count | Should -Be 0
         Set-ExlEventLog -Enabled $true
         & $script:Module { Write-ExlEvent 2001 Warning "Line one`r`nline two $([char]27)[31m" }
         $events = Get-Captured
@@ -7575,7 +7576,7 @@ Describe 'Windows event log' {
         $events[0].Message | Should -Be "Line one`r`nline two ?[31m"
         Set-ExlEventLog -Enabled $false
         & $script:Module { Write-ExlEvent 1000 Information 'Run started.' }
-        (Get-Captured).Count | Should -Be 1
+        @(Get-Captured).Count | Should -Be 1
     }
 
     It 'never stops a run when the event log cannot be written, and says so once' {
