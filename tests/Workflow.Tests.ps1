@@ -426,17 +426,20 @@ def make_changed():
 
 assert verify(make_zip(), expected_version="3.1.0")["report_script_bytes"] == len(base[MAIN])
 assert verify(make_zip(prefix=""))["verified_files"] == len(base) - 1
+nonce_page = dict(base, **{PAGE: b'<script nonce="%%NONCE%%">var t;</script>%%CHUNKS%%<script id="report-meta" type="application/json">%%META%%</script><script nonce="%%NONCE%%">\n%%SCRIPT%%</script>'})
+assert verify(make_zip(nonce_page), expected_version="3.1.0")["report_script_bytes"] == len(base[MAIN])
 missing_script = {name: data for name, data in base.items() if name != MAIN}
 missing_page = {name: data for name, data in base.items() if name != PAGE}
 unbound_page = dict(base, **{PAGE: b"<script>var t;</script>%%CHUNKS%%%%META%%"})
 closing_script = dict(base, **{MAIN: b"document.write('</SCRIPT>');"})
+other_attribute = dict(base, **{PAGE: b'<script>var t;</script>%%CHUNKS%%<script id="report-meta" type="application/json">%%META%%</script><script defer>\n%%SCRIPT%%</script>'})
 generated_cache = dict(base, **{"bin/poisoned.dll": b"synthetic cache"})
 old_host = dict(base, **{"host/ExchangeLogReportAngular.exe": b"removed host"})
 retired_web = dict(base, **{"web/index.html": b"<app-root></app-root>"})
 cases = [
     make_zip(manifest=False), make_changed(), make_zip(extra=True),
     make_zip(traversal=True), make_zip(bad_schema=True), make_zip(duplicate=True),
-    make_zip(missing_script), make_zip(missing_page), make_zip(unbound_page), make_zip(closing_script),
+    make_zip(missing_script), make_zip(missing_page), make_zip(unbound_page), make_zip(closing_script), make_zip(other_attribute),
     make_zip(unsigned_manifest=True), make_zip(wrong_signer=True), make_zip(unix_inventory=True),
     make_zip(generated_cache), make_zip(unsigned_script=True), make_zip(wrong_version=True), make_zip(old_host), make_zip(retired_web),
 ]
@@ -452,7 +455,7 @@ except SystemExit:
     pass
 else:
     raise AssertionError("Wrong release version was accepted")
-print("2 complete bundles accepted; 19 incomplete, tampered, unsigned, unsafe, noncanonical, state-polluted, retired-folder or wrong-version bundles rejected; no network or disk fixtures")
+print("3 complete bundles accepted; 20 incomplete, tampered, unsigned, unsafe, noncanonical, state-polluted, retired-folder or wrong-version bundles rejected; no network or disk fixtures")
 '@
         $output = & $python.Source -c $test (Join-Path $script:Workflows 'attest-release.yml') 2>&1
         $LASTEXITCODE | Should -Be 0 -Because ($output -join "`n")
