@@ -333,7 +333,7 @@ jobs:
                   # The portal and the static reports are the report page: its template and its main script, inlined or served as report.js.
                   page = archive.read(files[prefix + "templates/Report.template.html"]).decode("utf-8-sig")
                   main = archive.read(files[prefix + "templates/Report.template.js"]).decode("utf-8-sig")
-                  if any(page.count(marker) != 1 for marker in ("%%META%%", "%%CHUNKS%%", "%%SCRIPT%%")) or not re.search(r"<script>\s*%%SCRIPT%%\s*</script>", page):
+                  if any(page.count(marker) != 1 for marker in ("%%META%%", "%%CHUNKS%%", "%%SCRIPT%%")) or not re.search(r'<script(?: nonce="%%NONCE%%")?>\s*%%SCRIPT%%\s*</script>', page):
                       fail("The report page template does not carry its data and main script markers")
                   if not main.strip() or "</script" in main.casefold():
                       fail("The main script of the report page is empty or cannot be inlined")
